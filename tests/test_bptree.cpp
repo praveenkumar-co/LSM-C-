@@ -4,6 +4,9 @@
 #include "index/BPTreeFormat.hpp"
 #include "index/Pager.hpp"
 #include "index/BPTree.hpp"
+#include "index/IndexRecovery.hpp"
+#include "vlog/VLogReader.hpp"
+#include "vlog/VLogWriter.hpp"
 
 #include <fcntl.h>
 #include <signal.h>
@@ -719,6 +722,226 @@ static void testB3KeyLimits(const std::string& dir) {
     std::cout << "PASS: oversize and empty keys rejected; tree and page count unchanged; 256-byte key accepted.\n";
 }
 
+// ------------------------------------------------------------------------------------------
+// B4. Persistence: clean close + reopen, crash detection, rebuild from the vLog
+// ------------------------------------------------------------------------------------------
+
+// VLogWriter that adds its byte count to the global budget when it goes out of scope.
+class TrackedWriter : public vlog::VLogWriter {
+public:
+    TrackedWriter(const std::string& dir, uint64_t local_cap = 64ULL * 1024 * 1024)
+        : vlog::VLogWriter(dir, vlog::VLogWriter::Options(64 * 1024 * 1024, std::min(local_cap, remainingBudget()))) {}
+    ~TrackedWriter() { accountBytes(getTotalBytesWritten(), "VLogWriter"); }
+};
+
+// Reference state: replay the vLog into a std::map with should_apply() (independent of the tree).
+static Oracle vlogOracle(const std::string& vlog_dir) {
+    Oracle o;
+    std::vector<uint32_t> segs = bpt::listVLogSegments(vlog_dir);
+    vlog::VLogReader reader(vlog_dir);
+    for (size_t i = 0; i < segs.size(); ++i) {
+        vlog::ScanResult sr = reader.scanSegment(segs[i], i + 1 == segs.size());
+        for (const auto& e : sr.entries) {
+            auto it = o.find(e.key);
+            bool has = it != o.end();
+            if (!vlog::should_apply(has, has ? it->second.seq : 0, e.header.seq, e.header.flags)) continue;
+            if (e.header.type == static_cast<uint8_t>(vlog::EntryType::Tombstone)) {
+                o.erase(e.key);
+            } else {
+                Ref r{};
+                r.seq = e.header.seq;
+                r.kind = 1;
+                r.vptr = e.vptr;
+                o[e.key] = r;
+            }
+        }
+    }
+    return o;
+}
+
+// Single-threaded put/erase through vLog append + tree.apply; the oracle tracks the expected index.
+static void vlogOps(vlog::VLogWriter& w, BPTree& t, Oracle& o, const std::vector<std::string>& keys,
+                    std::mt19937_64& rng, int n) {
+    std::vector<uint8_t> payload(64);
+    for (int i = 0; i < n; ++i) {
+        const std::string& k = keys[rng() % keys.size()];
+        if (rng() % 100 < 65) {
+            for (auto& b : payload) b = static_cast<uint8_t>(rng());
+            vlog::AppendResult ar = w.append(vlog::EntryType::Full, k, payload.data(), static_cast<uint32_t>(payload.size()));
+            CHECK(t.apply(k, vlog::EntryType::Full, ar.seq, 0, ar.vptr) == BPTree::ApplyResult::Applied);
+            Ref r{};
+            r.seq = ar.seq;
+            r.kind = 1;
+            r.vptr = ar.vptr;
+            o[k] = r;
+        } else {
+            vlog::AppendResult ar = w.append(vlog::EntryType::Tombstone, k, nullptr, 0);
+            CHECK(t.apply(k, vlog::EntryType::Tombstone, ar.seq, 0, ar.vptr) == BPTree::ApplyResult::Applied);
+            o.erase(k);
+        }
+    }
+}
+
+static void testB4CleanReopen(const std::string& dir) {
+    banner("B4.1 Clean close + reopen equals the oracle (T3)");
+    CHECK(mkdir(dir.c_str(), 0755) == 0);
+    const std::string path = dir + "/index.db";
+    const uint64_t seed = 401;
+    const uint64_t bytes_before = bytesWritten();
+    std::mt19937_64 rng(seed);
+    std::vector<std::string> keys = makeKeySpace(rng, 20000);
+    Oracle o;
+    uint64_t seq = 0;
+    T1Result res;
+    {
+        auto p = Pager::create(path, pagerOpts(1024));
+        BPTree t(*p);
+        runRandomOps(t, o, keys, rng, seq, 50000, 0, &res);
+        checkTree(t);
+        p->closeClean();
+    }
+    struct Round { size_t frames; int more_ops; };
+    for (Round rd : {Round{1024, 10000}, Round{64, 10000}, Round{16, 0}}) {
+        bpt::MetaBody m{};
+        CHECK(Pager::inspect(path, &m) == OpenStatus::Ok && m.clean_shutdown == 1);
+        OpenStatus st;
+        auto p = Pager::open(path, pagerOpts(rd.frames), &st);
+        CHECK(st == OpenStatus::Ok);
+        CHECK(Pager::inspect(path, &m) == OpenStatus::NotClean && m.clean_shutdown == 0);
+        BPTree t(*p);
+        BPTree::Shape sh;
+        checkTree(t, &sh);
+        checkFullEq(t, o, "after reopen");
+        std::cout << "reopen #" << p->openCount() - 1 << " with " << rd.frames << " frames: on-disk clean_shutdown 1 -> 0, "
+                  << o.size() << " keys == oracle, height " << sh.height << ", pages " << p->pageCount() << "\n";
+        if (rd.more_ops > 0) {
+            runRandomOps(t, o, keys, rng, seq, rd.more_ops, 0, &res);
+            checkFullEq(t, o, "after more ops");
+            checkTree(t);
+        }
+        p->closeClean();
+    }
+    std::cout << "bytes written by this test: " << (bytesWritten() - bytes_before) << "\n";
+    std::cout << "ops total: put " << res.puts << ", get " << res.gets << ", erase " << res.erases << ", scan "
+              << res.scans << " (seed " << seed << ")\n";
+    std::cout << "PASS: 50,000 ops + clean close; reopened with 1024, 64, 16 frames (10,000 more ops after the first "
+                 "two); every reopen matched std::map and passed checkInvariants.\n";
+}
+
+static void checkIndexEquals(const std::string& dir, const std::string& vlog_dir, Pager& p, const Oracle& o,
+                             const char* what) {
+    BPTree t(p);
+    checkTree(t);
+    checkFullEq(t, o, what);
+    Oracle ref = vlogOracle(vlog_dir);
+    checkFullEq(t, ref, what);
+    (void)dir;
+}
+
+static void testB4CrashRebuild(const std::string& dir) {
+    banner("B4.2 Crash detection and rebuild from the vLog");
+    CHECK(mkdir(dir.c_str(), 0755) == 0);
+    const std::string vdir = dir + "/vlog";
+    const std::string idx = dir + "/index.db";
+    std::mt19937_64 rng(402);
+    std::vector<std::string> keys = makeKeySpace(rng, 300);
+    Oracle o;
+    auto opts = pagerOpts(32);
+
+    // Session 1: 1,500 ops through vLog + index, then "crash": drop the pager without closeClean.
+    {
+        TrackedWriter w(vdir);
+        bpt::OpenIndexResult r = bpt::openOrRebuildIndex(dir, vdir, opts);
+        CHECK(r.initial_status == OpenStatus::Missing && r.rebuilt && r.vlog_entries_scanned == 0);
+        BPTree t(*r.pager);
+        vlogOps(w, t, o, keys, rng, 1500);
+        checkFullEq(t, o, "before crash");
+    }
+    auto reopen = [&](OpenStatus expect, bool expect_rebuild, const char* what) {
+        TrackedWriter w(vdir);
+        bpt::OpenIndexResult r = bpt::openOrRebuildIndex(dir, vdir, opts);
+        CHECK(r.initial_status == expect && r.rebuilt == expect_rebuild);
+        checkIndexEquals(dir, vdir, *r.pager, o, what);
+        BPTree t(*r.pager);
+        BPTree::Shape sh;
+        checkTree(t, &sh);
+        std::cout << what << ": first open " << bpt::toString(r.initial_status) << ", rebuilt " << (r.rebuilt ? "yes" : "no")
+                  << ", vLog entries scanned " << r.vlog_entries_scanned << ", applied " << r.vlog_entries_applied
+                  << ", rebuild " << r.rebuild_ms << " ms, keys " << sh.keys << ", height " << sh.height << ", pages "
+                  << r.pager->pageCount() << "\n";
+        r.pager->closeClean();
+    };
+    reopen(OpenStatus::NotClean, true, "after crash (no clean close)");
+    reopen(OpenStatus::Ok, false, "after clean close");
+
+    // Corrupt one bit in a non-meta page after a clean close. A child that walks the tree must abort;
+    // its open already cleared clean_shutdown, so the next open rebuilds.
+    uint64_t npages = fileSize(idx) / kPageSize;
+    flipBitInFile(idx, (npages - 1) * kPageSize + 3000, 5);
+    std::cout << "Flipped a bit in page " << npages - 1 << " of " << npages << ". Child stderr follows:\n";
+    int status = runInChild([&]() {
+        childExpectsAbort();
+        OpenStatus st;
+        auto p = Pager::open(idx, pagerOpts(32), &st);
+        CHECK(st == OpenStatus::Ok);
+        BPTree t(*p);
+        (void)t.checkInvariants();  // touches every page
+        _exit(3);
+    });
+    CHECK(diedWithSigabrt(status));
+    std::cout << "Child status: killed by SIGABRT\n";
+    reopen(OpenStatus::NotClean, true, "after page corruption");
+
+    flipBitInFile(idx, 40, 1);  // meta body
+    reopen(OpenStatus::BadMeta, true, "after meta corruption");
+
+    CHECK(unlink(idx.c_str()) == 0);
+    reopen(OpenStatus::Missing, true, "after index.db deleted");
+
+    CHECK(truncate(idx.c_str(), static_cast<off_t>(fileSize(idx) + kPageSize)) == 0);
+    accountBytes(kPageSize, "test truncate (extend by one page)");
+    reopen(OpenStatus::SizeMismatch, true, "after file size change");
+
+    // Leftover index.db.rebuild from an interrupted rebuild, plus a dirty index.db.
+    {
+        int fd = open((dir + "/index.db.rebuild").c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
+        CHECK(fd >= 0);
+        std::vector<uint8_t> junk(3 * kPageSize + 17, 0xAB);
+        CHECK(write(fd, junk.data(), junk.size()) == static_cast<ssize_t>(junk.size()));
+        accountBytes(junk.size(), "test write (junk rebuild file)");
+        CHECK(close(fd) == 0);
+        OpenStatus st;
+        auto p = Pager::open(idx, opts, &st);  // clears clean_shutdown
+        CHECK(st == OpenStatus::Ok);
+    }
+    reopen(OpenStatus::NotClean, true, "with leftover index.db.rebuild");
+    struct stat sb;
+    CHECK(stat((dir + "/index.db.rebuild").c_str(), &sb) != 0 && errno == ENOENT);
+
+    // vLog entries written after the index's clean close are applied at the next clean open.
+    {
+        TrackedWriter w(vdir);
+        std::vector<uint8_t> payload(64, 0x5A);
+        for (int i = 0; i < 20; ++i) {
+            const std::string& k = keys[rng() % keys.size()];
+            if (i % 4 == 3) {
+                w.append(vlog::EntryType::Tombstone, k, nullptr, 0);
+                o.erase(k);
+            } else {
+                vlog::AppendResult ar = w.append(vlog::EntryType::Full, k, payload.data(), 64);
+                Ref r{};
+                r.seq = ar.seq;
+                r.kind = 1;
+                r.vptr = ar.vptr;
+                o[k] = r;
+            }
+        }
+    }
+    reopen(OpenStatus::Ok, false, "after 20 vLog appends with the index closed");
+    std::cout << "PASS: every rebuilt or reopened index equals both the op oracle and an independent should_apply() "
+                 "replay of the vLog, and passes checkInvariants.\n";
+}
+
 int main() {
     std::cout << "====================================================================\n"
               << "  PHASE 2: B+TREE INDEX TESTS\n"
@@ -741,6 +964,8 @@ int main() {
     testB3Sequential(test_dir + "/b3_seq");
     testB3ScanBoundaries(test_dir + "/b3_scan");
     testB3KeyLimits(test_dir + "/b3_limits");
+    testB4CleanReopen(test_dir + "/b4_reopen");
+    testB4CrashRebuild(test_dir + "/b4_rebuild");
 
     printBudget();
     std::cout << "\n====================================================================\n"
