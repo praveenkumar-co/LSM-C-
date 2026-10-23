@@ -190,6 +190,25 @@ private:
         total_fsyncs_++;
     }
 
+    // Torn segment creation: a crash between O_CREAT|O_EXCL and the header fsync leaves a short or
+    // corrupt last segment, which scanSegment truncates to 0 bytes. Unlink it (and fsync the
+    // directory) so it never becomes a 0-byte non-last segment that blocks later restarts.
+    // Its id is not reused: the next segment gets id + 1.
+    void removeGhostSegmentLocked(uint32_t sid) {
+        std::string path = getSegmentPath(sid);
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0) {
+            throw std::runtime_error("Fatal: stat failed on " + path + ": " + std::strerror(errno));
+        }
+        if (st.st_size != 0) return;  // only an emptied segment is removed
+        if (unlink(path.c_str()) != 0) {
+            throw std::runtime_error("Fatal: unlink of empty segment failed on " + path + ": " + std::strerror(errno));
+        }
+        if (sync_directory(dir_path_) != 0) {
+            throw std::runtime_error("Fatal: directory fsync failed after unlinking " + path + ": " + std::strerror(errno));
+        }
+    }
+
     // Rule 1: Scan existing segments via VLogReader, recover max seq and max seg, then open NEW segment
     void recoverAndInitLocked() {
         DIR* dir = opendir(dir_path_.c_str());
@@ -235,6 +254,9 @@ private:
                     if (e.header.seq > max_seq) {
                         max_seq = e.header.seq;
                     }
+                }
+                if (is_last && res.truncated && res.entries.empty()) {
+                    removeGhostSegmentLocked(sid);
                 }
             }
         }

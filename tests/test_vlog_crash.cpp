@@ -990,6 +990,93 @@ void testMidCheckpointRedoTombstone(const std::string& test_dir) {
 // -------------------------------------------------------------
 // STAGE 6: Multi-Threaded Group Commit Benchmark (1, 4, 16, 64 Threads)
 // -------------------------------------------------------------
+// -------------------------------------------------------------
+// TEST D: Torn segment creation leaves no ghost segment behind
+// A crash between creating vlog_N.log (O_CREAT|O_EXCL) and its header fsync leaves a
+// short or corrupt last segment. Recovery truncates it to 0 bytes; it must also unlink it,
+// or the next restart sees a 0-byte NON-last segment and refuses to open.
+// -------------------------------------------------------------
+void testTornSegmentCreation(const std::string& test_dir) {
+    std::cout << "\n=======================================================\n";
+    std::cout << "TEST D: Torn segment creation is unlinked on recovery\n";
+    std::cout << "=======================================================\n";
+
+    struct Case { const char* name; size_t bytes; bool valid_size_bad_crc; };
+    const Case cases[] = {
+        {"short file (100 bytes < 4096)", 100, false},
+        {"empty file (0 bytes)", 0, false},
+        {"full 4096-byte block, bad header CRC", kBlockSize, true},
+    };
+    int case_no = 0;
+    for (const Case& c : cases) {
+        std::string dir = test_dir + "/case_" + std::to_string(case_no++);
+        std::filesystem::create_directories(dir);
+        {
+            TrackedWriter w(dir, budgetOpts());
+            for (int i = 1; i <= 5; ++i) {
+                std::string k = "k" + std::to_string(i);
+                CHECK(w.append(EntryType::Full, k, "v", 1).seq == static_cast<uint64_t>(i));
+            }
+        }  // segment 1 holds seqs 1..5
+        // Simulate the torn creation of segment 2.
+        std::string ghost = dir + "/vlog_00000002.log";
+        {
+            int fd = open(ghost.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
+            CHECK(fd >= 0);
+            if (c.bytes > 0) {
+                std::vector<uint8_t> junk(c.bytes, 0);
+                if (c.valid_size_bad_crc) {
+                    SegmentHeader h{};
+                    h.magic = kSegmentMagic;
+                    h.format_version = kFormatVersion;
+                    h.segment_id = 2;
+                    h.crc32c = 0xDEADBEEF;  // wrong CRC
+                    std::memcpy(junk.data(), &h, sizeof(h));
+                }
+                checkedWrite(fd, junk.data(), junk.size());
+            }
+            checkedFsync(fd);
+            checkedClose(fd);
+        }
+        // Restart 1: recovery must remove the ghost and open a fresh segment.
+        {
+            TrackedWriter w(dir, budgetOpts());
+            CHECK(w.getCurrentSeq() == 5);
+            CHECK(!std::filesystem::exists(ghost));
+            CHECK(w.append(EntryType::Full, "k6", "v", 1).seq == 6);
+        }
+        // Restart 2: before the fix this threw "Incomplete SegmentHeader in non-last segment 2".
+        {
+            TrackedWriter w(dir, budgetOpts());
+            CHECK(w.getCurrentSeq() == 6);
+            CHECK(w.append(EntryType::Full, "k7", "v", 1).seq == 7);
+        }
+        // Every entry is still readable, in order, across the remaining segments.
+        std::vector<uint32_t> ids;
+        for (const auto& e : std::filesystem::directory_iterator(dir)) {
+            std::string n = e.path().filename().string();
+            if (n.rfind("vlog_", 0) == 0) ids.push_back(static_cast<uint32_t>(std::stoul(n.substr(5, 8))));
+        }
+        std::sort(ids.begin(), ids.end());
+        VLogReader reader(dir);
+        std::vector<uint64_t> seqs;
+        for (size_t i = 0; i < ids.size(); ++i) {
+            ScanResult sr = reader.scanSegment(ids[i], i + 1 == ids.size());
+            CHECK(!sr.truncated);
+            for (const auto& e : sr.entries) {
+                const uint64_t seq = e.header.seq;  // copy: EntryHeader is packed, no reference binding
+                seqs.push_back(seq);
+            }
+        }
+        CHECK((seqs == std::vector<uint64_t>{1, 2, 3, 4, 5, 6, 7}));
+        std::string id_list;
+        for (uint32_t id : ids) id_list += (id_list.empty() ? "" : ",") + std::to_string(id);
+        std::cout << "  " << c.name << ": ghost segment 2 removed; segments now {" << id_list
+                  << "}; two restarts OK; seqs 1-7 recovered.\n";
+    }
+    std::cout << "PASS: torn segment creation (3 shapes) is unlinked on recovery; later restarts open normally.\n";
+}
+
 void testStage6Benchmark(const std::string& test_dir) {
     std::cout << "\n=======================================================\n";
     std::cout << "STAGE 6: Multi-Threaded Group Commit Benchmark (1, 4, 16, 64 Threads)\n";
@@ -1104,6 +1191,7 @@ int main() {
     testReopenNoTruncation(test_dir + "/reopen_test");
     testTornWriteFaultInjection(test_dir + "/fault_test");
     testMidCheckpointRedoTombstone(test_dir + "/mid_checkpoint_test");
+    testTornSegmentCreation(test_dir + "/torn_creation_test");
     testStage5ProcessCrash(test_dir + "/crash_50");
     testStage6Benchmark(test_dir + "/bench");
 
