@@ -1,0 +1,11 @@
+# Build outputs
+build/
+run
+run_asan
+run_tsan
+test_vlog_crash
+test_vlog_crash_asan
+test_vlog_crash_tsan
+*.dSYM/
+*.o
+.DS_Store
