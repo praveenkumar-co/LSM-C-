@@ -32,6 +32,13 @@
 
 namespace bpt {
 
+// get() could not read a valid entry for a key the index has (missing segment, CRC failure, or an
+// entry whose key/seq/type does not match the index). No bytes are returned in that case.
+class VLogReadError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 class IndexedStore {
 public:
     struct Options {
@@ -39,6 +46,7 @@ public:
         vlog::VLogWriter::Options vlog_opts{};
         std::function<void(uint64_t)> on_index_write;  // per index.db page write (tests count bytes)
         RecoveryHooks hooks;                           // crash-test hooks (rebuild, clean close)
+        std::function<bool(Pager::IoOp, page_id_t)> inject_index_failure;  // test-only, see Pager::Options
     };
 
     struct EraseResult {
@@ -55,6 +63,7 @@ public:
         Pager::Options po;
         po.num_frames = opts.cache_frames;
         po.on_write = opts.on_index_write;
+        po.inject_failure = opts.inject_index_failure;
         s->open_info_ = openOrRebuildIndex(dir, s->vlog_dir_, po, opts.hooks);
         s->pager_ = std::move(s->open_info_.pager);
         s->tree_.reset(new BPTree(*s->pager_));
@@ -70,8 +79,12 @@ public:
     // oversize document (nothing is written in that case).
     uint64_t put(std::string_view key, std::string_view doc) {
         checkKey(key);
-        if (vlog::entry_size(static_cast<uint16_t>(key.size()), 0) + doc.size() + vlog::kEntryAlign > vlog::kMaxEntryLen) {
-            throw std::invalid_argument("document too large for one vLog entry");
+        // Exact on-disk entry size, computed in 64 bits: header + padded key + padded doc.
+        const uint64_t entry_bytes = sizeof(vlog::EntryHeader) + vlog::align_up(static_cast<uint32_t>(key.size()), vlog::kEntryAlign) +
+                                     ((static_cast<uint64_t>(doc.size()) + vlog::kEntryAlign - 1) & ~uint64_t(vlog::kEntryAlign - 1));
+        if (entry_bytes > vlog::kMaxEntryLen) {
+            throw std::invalid_argument("document of " + std::to_string(doc.size()) + " bytes exceeds the " +
+                                        std::to_string(vlog::kMaxEntryLen) + "-byte vLog entry limit");
         }
         vlog::AppendResult ar = appendOrDie(vlog::EntryType::Full, key, doc.data(), static_cast<uint32_t>(doc.size()));
         applyInOrder(key, vlog::EntryType::Full, ar, nullptr);
@@ -87,6 +100,7 @@ public:
     }
 
     // Returns the document, or nullopt if the key is absent. *seq_out gets the entry's seq.
+    // Throws VLogReadError if the index references an entry that cannot be read or does not match.
     std::optional<std::string> get(std::string_view key, uint64_t* seq_out = nullptr) const {
         checkKey(key);
         std::optional<vlog::IndexValueRef> ref = tree_->get(key);
@@ -95,12 +109,16 @@ public:
         vlog::EntryHeader h;
         std::string k;
         std::vector<uint8_t> payload;
-        if (!reader.readEntry(ref->vptr, h, k, payload) || h.seq != ref->seq || k != key ||
-            h.type == static_cast<uint8_t>(vlog::EntryType::Tombstone)) {
-            errno = 0;
-            fatal("index points at a vLog entry that does not match (seq " + std::to_string(ref->seq) + ")");
+        const std::string where = "segment " + std::to_string(ref->vptr.segment_id) + " offset " +
+                                  std::to_string(ref->vptr.offset) + " (index seq " + std::to_string(ref->seq) + ")";
+        if (!reader.readEntry(ref->vptr, h, k, payload)) {
+            throw VLogReadError("vLog entry unreadable (missing segment, bad bounds, or CRC mismatch) at " + where);
         }
-        if (seq_out) *seq_out = h.seq;
+        const uint64_t entry_seq = h.seq;
+        if (entry_seq != ref->seq || k != key || h.type == static_cast<uint8_t>(vlog::EntryType::Tombstone)) {
+            throw VLogReadError("vLog entry does not match the index (seq " + std::to_string(entry_seq) + ") at " + where);
+        }
+        if (seq_out) *seq_out = entry_seq;
         return std::string(payload.begin(), payload.end());
     }
 

@@ -51,7 +51,14 @@ extern "C" inline void onAbortSignal(int) {
 // In a forked child that is expected to abort: no "[Abort] ... rm -rf" message from it.
 inline void childExpectsAbort() { CHECK(std::signal(SIGABRT, SIG_DFL) != SIG_ERR); }
 
+// make test-quick builds with -DTEST_QUICK: smaller workloads and a 20 MiB budget per binary.
+#ifdef TEST_QUICK
+constexpr bool kQuick = true;
+constexpr uint64_t kWriteBudgetBytes = 20ULL * 1024 * 1024;
+#else
+constexpr bool kQuick = false;
 constexpr uint64_t kWriteBudgetBytes = 512ULL * 1024 * 1024;
+#endif
 
 inline std::atomic<uint64_t>* g_bytes_written = nullptr;
 
@@ -124,12 +131,13 @@ struct Cleaner {
 
 inline void printBudget() {
     std::cout << "\n[Budget] Total bytes written by all stages: " << bytesWritten() << " of " << kWriteBudgetBytes
-              << " allowed (512 MiB).\n";
+              << " allowed (" << (kWriteBudgetBytes >> 20) << " MiB).\n";
 }
 
 inline void banner(const std::string& title) {
     std::cout << "\n=======================================================\n"
               << title << "\n=======================================================\n";
+    if (g_bytes_written) std::cout << "(bytes written so far in this run: " << bytesWritten() << ")\n";
 }
 
 }  // namespace testutil

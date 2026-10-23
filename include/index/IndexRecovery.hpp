@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -96,17 +97,88 @@ inline void replayVLog(const std::string& vlog_dir, BPTree& tree, uint64_t after
     }
 }
 
+// Identity of a vLog directory: id and created_unix_ns of its lowest-id segment. Recorded in the
+// index meta page; a clean index.db is only trusted with the vLog it was built from.
+// Note: once GC deletes old segments (later phase), this identity must move to the Superblock.
+struct VLogIdentity {
+    uint32_t first_segment = 0;
+    uint64_t created_ns = 0;
+};
+
+inline VLogIdentity readVLogIdentity(const std::string& vlog_dir) {
+    VLogIdentity id;
+    std::vector<uint32_t> segs = listVLogSegments(vlog_dir);
+    if (segs.empty()) return id;
+    char name[32];
+    std::snprintf(name, sizeof(name), "/vlog_%08u.log", segs[0]);
+    std::string path = vlog_dir + name;
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) fatal("open failed for " + path);
+    vlog::SegmentHeader h;
+    ssize_t r = ::pread(fd, &h, sizeof(h), 0);
+    if (r < 0) fatal("pread of segment header failed for " + path);
+    if (::close(fd) != 0) fatal("close failed for " + path);
+    if (r != static_cast<ssize_t>(sizeof(h)) || h.magic != vlog::kSegmentMagic ||
+        h.crc32c != vlog::crc32c(&h, offsetof(vlog::SegmentHeader, crc32c))) {
+        return id;  // unreadable identity: never matches a recorded one
+    }
+    id.first_segment = h.segment_id;
+    id.created_ns = h.created_unix_ns;
+    return id;
+}
+
+// Thrown when a clean index.db reflects vLog entries that the vLog no longer has
+// (acked writes missing from the vLog). index.db is left untouched, so every open fails the same way.
+class VLogBehindError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 inline OpenIndexResult openOrRebuildIndex(const std::string& dir, const std::string& vlog_dir,
                                           const Pager::Options& opts, const RecoveryHooks& hooks = {}) {
     const std::string path = dir + "/index.db";
     const std::string tmp = dir + "/index.db.rebuild";
     OpenIndexResult res;
-    OpenStatus st;
-    res.pager = Pager::open(path, opts, &st);
+    const VLogIdentity vid = readVLogIdentity(vlog_dir);
+    MetaBody m{};
+    OpenStatus st = Pager::inspect(path, &m);  // reads only; index.db is not modified yet
+    uint64_t newer = 0;
+    if (st == OpenStatus::Ok) {
+        if (m.vlog_first_segment != vid.first_segment || m.vlog_created_ns != vid.created_ns) {
+            st = OpenStatus::VLogMismatch;  // index.db was built from a different vLog: rebuild
+        } else {
+            uint64_t vlog_max = 0;
+            std::vector<uint32_t> segs = listVLogSegments(vlog_dir);
+            vlog::VLogReader reader(vlog_dir);
+            for (size_t i = 0; i < segs.size(); ++i) {
+                vlog::ScanResult sr = reader.scanSegment(segs[i], i + 1 == segs.size());
+                for (const vlog::RecoveredEntry& e : sr.entries) {
+                    const uint64_t seq = e.header.seq;
+                    vlog_max = std::max(vlog_max, seq);
+                    if (seq > m.max_applied_seq) newer++;
+                }
+            }
+            if (vlog_max < m.max_applied_seq) {
+                throw VLogBehindError("index.db is ahead of the vLog: index max_applied_seq " +
+                                      std::to_string(m.max_applied_seq) + ", vLog max seq " + std::to_string(vlog_max) +
+                                      " in " + vlog_dir + ". Acked writes are missing from the vLog. index.db was "
+                                      "not modified; restore the missing segments, or delete index.db to rebuild "
+                                      "from the vLog as it is.");
+            }
+        }
+    }
     res.initial_status = st;
     if (st == OpenStatus::Ok) {
-        BPTree tree(*res.pager);
-        replayVLog(vlog_dir, tree, res.pager->maxAppliedSeq(), RecoveryHooks{}, &res);
+        OpenStatus st2;
+        res.pager = Pager::open(path, opts, &st2);
+        if (st2 != OpenStatus::Ok) {
+            errno = 0;
+            fatal(std::string("index.db changed between inspect and open: ") + toString(st2));
+        }
+        if (newer > 0) {
+            BPTree tree(*res.pager);
+            replayVLog(vlog_dir, tree, m.max_applied_seq, RecoveryHooks{}, &res);
+        }
         return res;
     }
 
@@ -117,6 +189,7 @@ inline OpenIndexResult openOrRebuildIndex(const std::string& dir, const std::str
         std::unique_ptr<Pager> np = Pager::create(tmp, opts);
         BPTree tree(*np);
         replayVLog(vlog_dir, tree, 0, hooks, &res);
+        np->setVLogIdentity(vid.first_segment, vid.created_ns);
         np->closeClean();
     }
     if (::rename(tmp.c_str(), path.c_str()) != 0) fatal("rename " + tmp + " -> " + path + " failed");

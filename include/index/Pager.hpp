@@ -39,7 +39,7 @@ namespace bpt {
     std::abort();
 }
 
-enum class OpenStatus { Ok, Missing, BadMeta, NotClean, SizeMismatch };
+enum class OpenStatus { Ok, Missing, BadMeta, NotClean, SizeMismatch, VLogMismatch };
 
 inline const char* toString(OpenStatus s) {
     switch (s) {
@@ -48,6 +48,7 @@ inline const char* toString(OpenStatus s) {
         case OpenStatus::BadMeta:      return "BadMeta";
         case OpenStatus::NotClean:     return "NotClean";
         case OpenStatus::SizeMismatch: return "SizeMismatch";
+        case OpenStatus::VLogMismatch: return "VLogMismatch";
     }
     return "?";
 }
@@ -91,9 +92,14 @@ class Pager {
 public:
     static constexpr size_t kMinFrames = 16;
 
+    enum class IoOp { PageWrite, Fsync };
+
     struct Options {
         size_t num_frames = 1024;                  // 4 MiB of cache
         std::function<void(uint64_t)> on_write;    // called with 4096 after every page pwrite (tests count bytes)
+        // Test-only fault injection: called before each page pwrite / fsync of index.db. Returning true
+        // makes that call behave as if the syscall failed with EIO (the pager then aborts).
+        std::function<bool(IoOp, page_id_t)> inject_failure;
     };
 
     struct Stats {
@@ -263,6 +269,12 @@ public:
     void setRoot(page_id_t root, uint32_t height) { meta_.root_page_id = root; meta_.tree_height = height; }
     void setKeyCount(uint64_t n) { meta_.key_count = n; }
     void setMaxAppliedSeq(uint64_t s) { meta_.max_applied_seq = s; }
+    uint32_t vlogFirstSegment() const { return meta_.vlog_first_segment; }
+    uint64_t vlogCreatedNs() const { return meta_.vlog_created_ns; }
+    void setVLogIdentity(uint32_t first_segment, uint64_t created_ns) {
+        meta_.vlog_first_segment = first_segment;
+        meta_.vlog_created_ns = created_ns;
+    }
 
     Stats stats() const {
         std::lock_guard<std::mutex> lk(mu_);
@@ -304,7 +316,7 @@ private:
         std::memcpy(&m, page + kHeaderSize, sizeof(m));
         if (m.magic != kMetaMagic || m.format_version != kIndexFormatVersion || m.page_size != kPageSize ||
             m.page_count < 2 || m.root_page_id == kNoPage || m.root_page_id >= m.page_count ||
-            m.tree_height == 0) {
+            m.tree_height == 0 || m.reserved1 != 0) {
             return OpenStatus::BadMeta;
         }
         *out = m;
@@ -320,6 +332,10 @@ private:
     uint8_t* frameData(uint32_t f) const { return buffer_.get() + static_cast<size_t>(f) * kPageSize; }
 
     void fsyncOrDie(const std::string& what) {
+        if (opts_.inject_failure && opts_.inject_failure(IoOp::Fsync, kNoPage)) {
+            errno = EIO;
+            fatal(what + " [injected failure]");
+        }
         if (vlog::full_fsync(fd_) != 0) fatal(what);  // never retried
         stats_.fsyncs++;
     }
@@ -334,6 +350,10 @@ private:
     }
 
     void writePageBytesLocked(const uint8_t* page, page_id_t id) {
+        if (opts_.inject_failure && opts_.inject_failure(IoOp::PageWrite, id)) {
+            errno = EIO;
+            fatal("pwrite of page " + std::to_string(id) + " failed [injected failure]");
+        }
         ssize_t w = ::pwrite(fd_, page, kPageSize, static_cast<off_t>(id) * kPageSize);
         if (w != static_cast<ssize_t>(kPageSize)) {
             fatal("pwrite of page " + std::to_string(id) + " returned " + std::to_string(w));

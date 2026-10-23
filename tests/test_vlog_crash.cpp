@@ -57,7 +57,14 @@ using namespace vlog;
 // -------------------------------------------------------------
 // Global write budget: all stages together may write at most 512 MiB.
 // -------------------------------------------------------------
+// make test-quick builds with -DTEST_QUICK: fewer kill -9 iterations, shorter benchmark, 20 MiB budget.
+#ifdef TEST_QUICK
+constexpr bool kQuick = true;
+constexpr uint64_t kWriteBudgetBytes = 20ULL * 1024 * 1024;
+#else
+constexpr bool kQuick = false;
 constexpr uint64_t kWriteBudgetBytes = 512ULL * 1024 * 1024;
+#endif
 static std::atomic<uint64_t> g_bytes_written{0};
 
 void accountBytes(uint64_t n, const char* what) {
@@ -502,7 +509,7 @@ void testStage5ProcessCrash(const std::string& base_dir) {
     return;
 #endif
 
-    const int NUM_ITERATIONS = 50;
+    const int NUM_ITERATIONS = kQuick ? 10 : 50;
     const size_t MIN_ACKS_BEFORE_KILL = 200;
     std::mt19937 rng(1337);
     // Kill 5-400 ms after the 200th ack, so writes are in flight at kill time.
@@ -1121,7 +1128,7 @@ void testStage6Benchmark(const std::string& test_dir) {
         }
 
         // Run each benchmark configuration for 1.5 seconds (~6.0s total runtime, within 10s cap)
-        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        std::this_thread::sleep_for(std::chrono::milliseconds(kQuick ? 300 : 1500));
         stop_flag.store(true);
 
         for (auto& th : threads) {
@@ -1196,7 +1203,7 @@ int main() {
     testStage6Benchmark(test_dir + "/bench");
 
     std::cout << "\n[Budget] Total bytes written by all stages: " << g_bytes_written.load()
-              << " of " << kWriteBudgetBytes << " allowed (512 MiB).\n";
+              << " of " << kWriteBudgetBytes << " allowed (" << (kWriteBudgetBytes >> 20) << " MiB).\n";
 
     std::cout << "\n====================================================================\n";
     std::cout << "  ALL VLOG ENGINE DURABILITY & RECOVERY TESTS PASSED!               \n";

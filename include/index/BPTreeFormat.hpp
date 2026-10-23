@@ -23,7 +23,7 @@ using page_id_t = uint32_t;
 constexpr uint32_t  kPageSize           = 4096;
 constexpr uint32_t  kMaxKeyLen          = 256;
 constexpr uint32_t  kMinKeyLen          = 1;   // the empty key is rejected (plan Q3)
-constexpr uint32_t  kIndexFormatVersion = 1;
+constexpr uint32_t  kIndexFormatVersion = 2;  // v2: meta page records the vLog identity
 constexpr uint32_t  kPageMagic          = 0x50544250;             // "PBTP" (LE bytes)
 constexpr uint64_t  kMetaMagic          = 0x3141544D58444E49ULL;  // "INDXMTA1" (LE bytes)
 constexpr page_id_t kMetaPageId         = 0;
@@ -63,6 +63,9 @@ struct MetaBody {              // at offset 32 of page 0; rest of the page is ze
     uint64_t key_count;        // live keys
     uint64_t max_applied_seq;  // highest vLog seq reflected in this file (trusted only if clean)
     uint64_t open_count;       // incremented on every open (debug aid)
+    uint64_t vlog_created_ns;  // vLog identity: created_unix_ns of the lowest-id segment's header
+    uint32_t vlog_first_segment;  // vLog identity: id of that segment
+    uint32_t reserved1;        // must be 0
 };
 
 #pragma pack(pop)
@@ -79,7 +82,9 @@ static_assert(offsetof(PageHeader, leftmost_child) == 28);
 static_assert(sizeof(CellKeyHeader) == 2);
 static_assert(sizeof(vlog::IndexValueRef) == 24);
 static_assert(sizeof(page_id_t) == 4);
-static_assert(sizeof(MetaBody) == 56);
+static_assert(sizeof(MetaBody) == 72);
+static_assert(offsetof(MetaBody, vlog_created_ns) == 56);
+static_assert(offsetof(MetaBody, vlog_first_segment) == 64);
 static_assert(offsetof(MetaBody, clean_shutdown)  == 28);
 static_assert(offsetof(MetaBody, max_applied_seq) == 40);
 static_assert(sizeof(PageHeader) + sizeof(MetaBody) <= kPageSize);

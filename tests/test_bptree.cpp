@@ -564,8 +564,8 @@ static void runRandomOps(BPTree& t, Oracle& o, const std::vector<std::string>& k
     }
 }
 
-static void testB3RandomVsMap(const std::string& dir, uint64_t seed, size_t frames, size_t key_space) {
-    banner("B3.1 100,000 random ops vs std::map (seed " + std::to_string(seed) + ", " + std::to_string(frames) +
+static void testB3RandomVsMap(const std::string& dir, uint64_t seed, size_t frames, size_t key_space, int ops) {
+    banner("B3.1 " + std::to_string(ops) + " random ops vs std::map (seed " + std::to_string(seed) + ", " + std::to_string(frames) +
            " frames, " + std::to_string(key_space) + " keys)");
     CHECK(mkdir(dir.c_str(), 0755) == 0);
     uint64_t bytes_before = bytesWritten();
@@ -577,7 +577,7 @@ static void testB3RandomVsMap(const std::string& dir, uint64_t seed, size_t fram
     Oracle o;
     uint64_t seq = 0;
     T1Result res;
-    runRandomOps(t, o, keys, rng, seq, 100000, 10000, &res);
+    runRandomOps(t, o, keys, rng, seq, ops, std::min(ops, 10000), &res);
     BPTree::Shape sh;
     checkTree(t, &sh);
     std::string disk_err = p->verifyPagesOnDisk();
@@ -591,7 +591,7 @@ static void testB3RandomVsMap(const std::string& dir, uint64_t seed, size_t fram
     std::cout << "pager: page reads " << ps.page_reads << ", page writes " << ps.page_writes << ", evictions "
               << ps.evictions << "; bytes written by this test " << (bytesWritten() - bytes_before) << "; wall time "
               << ms << " ms\n";
-    CHECK(sh.height >= 3);
+    CHECK(sh.height >= (kQuick ? 2u : 3u));
     std::cout << "PASS: every op matched std::map; full scan + checkInvariants passed every 10,000 ops; all page "
                  "CRCs valid on disk.\n";
 }
@@ -601,7 +601,7 @@ static void testB3Sequential(const std::string& dir) {
     CHECK(mkdir(dir.c_str(), 0755) == 0);
     std::mt19937_64 rng(302);
     for (int pass = 0; pass < 2; ++pass) {
-        auto p = Pager::create(dir + (pass ? "/desc.db" : "/asc.db"), pagerOpts(64));
+        auto p = Pager::create(dir + (pass ? "/desc.db" : "/asc.db"), pagerOpts(1024));  // tree fits: no eviction writes
         BPTree t(*p);
         Oracle o;
         const int n = 20000;
@@ -691,7 +691,7 @@ static void testB3ScanBoundaries(const std::string& dir) {
 static void testB3KeyLimits(const std::string& dir) {
     banner("B3.4 Keys > 256 bytes rejected on a multi-level tree");
     CHECK(mkdir(dir.c_str(), 0755) == 0);
-    auto p = Pager::create(dir + "/index.db", pagerOpts(32));
+    auto p = Pager::create(dir + "/index.db", pagerOpts(1024));
     BPTree t(*p);
     std::mt19937_64 rng(304);
     std::vector<std::string> keys = makeKeySpace(rng, 3000);
@@ -798,12 +798,13 @@ static void testB4CleanReopen(const std::string& dir) {
     {
         auto p = Pager::create(path, pagerOpts(1024));
         BPTree t(*p);
-        runRandomOps(t, o, keys, rng, seq, 50000, 0, &res);
+        runRandomOps(t, o, keys, rng, seq, kQuick ? 10000 : 50000, 0, &res);
         checkTree(t);
         p->closeClean();
     }
     struct Round { size_t frames; int more_ops; };
-    for (Round rd : {Round{1024, 10000}, Round{64, 10000}, Round{16, 0}}) {
+    const int more = kQuick ? 1000 : 10000;
+    for (Round rd : {Round{1024, more}, Round{64, more}, Round{16, 0}}) {
         bpt::MetaBody m{};
         CHECK(Pager::inspect(path, &m) == OpenStatus::Ok && m.clean_shutdown == 1);
         OpenStatus st;
@@ -826,8 +827,8 @@ static void testB4CleanReopen(const std::string& dir) {
     std::cout << "bytes written by this test: " << (bytesWritten() - bytes_before) << "\n";
     std::cout << "ops total: put " << res.puts << ", get " << res.gets << ", erase " << res.erases << ", scan "
               << res.scans << " (seed " << seed << ")\n";
-    std::cout << "PASS: 50,000 ops + clean close; reopened with 1024, 64, 16 frames (10,000 more ops after the first "
-                 "two); every reopen matched std::map and passed checkInvariants.\n";
+    std::cout << "PASS: " << (kQuick ? 10000 : 50000) << " ops + clean close; reopened with 1024, 64, 16 frames ("
+              << more << " more ops after the first two); every reopen matched std::map and passed checkInvariants.\n";
 }
 
 static void checkIndexEquals(const std::string& dir, const std::string& vlog_dir, Pager& p, const Oracle& o,
@@ -1097,7 +1098,7 @@ struct VEntry {
 static void testB5KillDuringWrites(const std::string& base) {
     banner("B5.2 kill -9 during writes / rebuild / clean close, reopen, check every acked key");
     CHECK(mkdir(base.c_str(), 0755) == 0);
-    const int kIters = 50;
+    const int kIters = kQuick ? 10 : 50;
     std::mt19937 rng(505);
     std::uniform_int_distribution<int> delay_ms(5, 400);
     uint64_t total_acked = 0, total_unacked = 0, total_checked_keys = 0;
@@ -1387,7 +1388,7 @@ static void testB6TreeStress(const std::string& dir) {
     const uint64_t bytes_before = bytesWritten();
     auto p = Pager::create(dir + "/index.db", pagerOpts(24));
     BPTree t(*p);
-    const uint32_t kWriters = 4, kReaders = 4, kWriterOps = 3000, kReaderOps = 6000, kKeysPerWriter = 1500;
+    const uint32_t kWriters = 4, kReaders = 4, kWriterOps = kQuick ? 400 : 3000, kReaderOps = kQuick ? 2000 : 6000, kKeysPerWriter = 1500;
     std::vector<Oracle> local(kWriters);
     std::atomic<bool> failed{false};
     std::atomic<uint64_t> reads{0}, hits{0}, scanned{0};
@@ -1476,9 +1477,10 @@ int main() {
     // Seed 1 uses 32 frames (eviction + CRC-checked reload on most ops). Measured: one 32-frame
     // seed writes about 196 MB of page write-backs, so three would exceed the 512 MiB budget.
     // Seeds 2 and 3 use the default 1024 frames (the tree fits; no eviction).
-    testB3RandomVsMap(test_dir + "/b3_seed1", 31, 32, 20000);
-    testB3RandomVsMap(test_dir + "/b3_seed2", 32, 1024, 20000);
-    testB3RandomVsMap(test_dir + "/b3_seed3", 33, 1024, 20000);
+    // Quick mode: 3,000 ops on the 32-frame seed, 10,000 on the others.
+    testB3RandomVsMap(test_dir + "/b3_seed1", 31, 32, 20000, kQuick ? 3000 : 100000);
+    testB3RandomVsMap(test_dir + "/b3_seed2", 32, 1024, 20000, kQuick ? 10000 : 100000);
+    testB3RandomVsMap(test_dir + "/b3_seed3", 33, 1024, 20000, kQuick ? 10000 : 100000);
     testB3Sequential(test_dir + "/b3_seq");
     testB3ScanBoundaries(test_dir + "/b3_scan");
     testB3KeyLimits(test_dir + "/b3_limits");
