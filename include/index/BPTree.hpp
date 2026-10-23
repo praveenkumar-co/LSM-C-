@@ -217,10 +217,13 @@ public:
 
     // Redo/live apply of one vLog entry under one exclusive lock (plan section 4):
     // if should_apply(...) then Full/Delta -> put {seq, kind=1, vptr}, Tombstone -> erase.
-    ApplyResult apply(std::string_view key, vlog::EntryType type, uint64_t seq, uint8_t flags, const vlog::VPtr& vptr) {
+    // *had_key (optional) reports whether the key was in the index before this call.
+    ApplyResult apply(std::string_view key, vlog::EntryType type, uint64_t seq, uint8_t flags, const vlog::VPtr& vptr,
+                      bool* had_key = nullptr) {
         if (!validKeyLen(key.size())) return ApplyResult::InvalidKey;
         std::unique_lock<std::shared_mutex> lk(mu_);
         std::optional<Ref> cur = getLocked(key);
+        if (had_key) *had_key = cur.has_value();
         if (seq > pager_.maxAppliedSeq()) pager_.setMaxAppliedSeq(seq);
         if (!vlog::should_apply(cur.has_value(), cur ? cur->seq : 0, seq, flags)) return ApplyResult::Skipped;
         if (type == vlog::EntryType::Tombstone) {

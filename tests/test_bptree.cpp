@@ -5,6 +5,7 @@
 #include "index/Pager.hpp"
 #include "index/BPTree.hpp"
 #include "index/IndexRecovery.hpp"
+#include "index/IndexedStore.hpp"
 #include "vlog/VLogReader.hpp"
 #include "vlog/VLogWriter.hpp"
 
@@ -16,6 +17,7 @@
 
 #include <chrono>
 #include <map>
+#include <thread>
 #include <set>
 #include <random>
 #include <string>
@@ -942,6 +944,326 @@ static void testB4CrashRebuild(const std::string& dir) {
                  "replay of the vLog, and passes checkInvariants.\n";
 }
 
+// ------------------------------------------------------------------------------------------
+// B5. Engine API (IndexedStore) and kill -9
+// ------------------------------------------------------------------------------------------
+using bpt::IndexedStore;
+
+static IndexedStore::Options storeOpts(size_t frames) {
+    IndexedStore::Options o;
+    o.cache_frames = frames;
+    o.vlog_opts = vlog::VLogWriter::Options(64 * 1024 * 1024, std::min<uint64_t>(64ULL * 1024 * 1024, remainingBudget()));
+    o.on_index_write = [](uint64_t n) { accountBytes(n, "index.db page write"); };
+    return o;
+}
+
+// Closes (or drops) the store and accounts its vLog bytes.
+static void finishStore(std::unique_ptr<IndexedStore>& st, bool clean) {
+    uint64_t vb = st->vlogBytesWritten();
+    if (clean) st->close();
+    st.reset();
+    accountBytes(vb, "IndexedStore vLog writes");
+}
+
+static void testB5Api(const std::string& dir) {
+    banner("B5.1 IndexedStore API: put/get/erase through vLog + index");
+    auto st = IndexedStore::open(dir, storeOpts(64));
+    CHECK(st->openInfo().rebuilt && st->openInfo().initial_status == OpenStatus::Missing);
+    uint64_t s1 = st->put("alpha", "{\"v\":1}");
+    uint64_t s2 = st->put("beta", "{\"v\":2}");
+    uint64_t s3 = st->put("alpha", "{\"v\":3}");
+    CHECK(s1 < s2 && s2 < s3);
+    uint64_t seq = 0;
+    CHECK(st->get("alpha", &seq) == std::optional<std::string>("{\"v\":3}") && seq == s3);
+    CHECK(st->get("beta") == std::optional<std::string>("{\"v\":2}"));
+    CHECK(!st->get("gamma").has_value());
+    IndexedStore::EraseResult e1 = st->erase("beta");
+    IndexedStore::EraseResult e2 = st->erase("beta");
+    CHECK(e1.existed && !e2.existed && e1.seq < e2.seq);
+    CHECK(!st->get("beta").has_value());
+    std::string empty_doc;
+    st->put("empty-doc", empty_doc);
+    CHECK(st->get("empty-doc") == std::optional<std::string>(""));
+    // Bad keys are rejected before anything reaches the vLog.
+    uint64_t vbytes = st->vlogBytesWritten();
+    int rejected = 0;
+    for (size_t len : {0u, 257u, 5000u}) {
+        try { st->put(std::string(len, 'x'), "doc"); } catch (const std::invalid_argument&) { rejected++; }
+        try { st->erase(std::string(len, 'x')); } catch (const std::invalid_argument&) { rejected++; }
+    }
+    CHECK(rejected == 6 && st->vlogBytesWritten() == vbytes);
+    std::cout << "seqs: put alpha " << s1 << ", put beta " << s2 << ", put alpha " << s3 << ", erase beta " << e1.seq
+              << " (existed) and " << e2.seq << " (absent)\n";
+    std::cout << "6 bad-key calls rejected with std::invalid_argument; vLog bytes unchanged (" << vbytes << ")\n";
+    finishStore(st, true);
+    auto st2 = IndexedStore::open(dir, storeOpts(64));
+    CHECK(!st2->openInfo().rebuilt && st2->openInfo().initial_status == OpenStatus::Ok);
+    CHECK(st2->get("alpha") == std::optional<std::string>("{\"v\":3}") && !st2->get("beta").has_value());
+    finishStore(st2, true);
+    std::cout << "PASS: get returns the newest document read from the vLog; erase writes a tombstone; values "
+                 "survive clean close + reopen.\n";
+}
+
+#ifndef TSAN_BUILD
+// Pipe record from the child. 24 bytes < PIPE_BUF, so each write() is atomic.
+struct AckRec {
+    uint64_t seq;
+    uint32_t op;       // 1 = put acked, 2 = erase acked, 9 = child paused at a crash point
+    uint32_t key_id;
+    uint32_t writer;
+    uint32_t op_idx;
+};
+static_assert(sizeof(AckRec) == 24);
+
+static std::string b5Key(uint32_t id) { return "user:" + std::to_string(id); }
+
+static std::string b5Doc(uint32_t writer, uint32_t op_idx, uint32_t key_id) {
+    std::string d = "{\"w\":" + std::to_string(writer) + ",\"i\":" + std::to_string(op_idx) + ",\"k\":" +
+                    std::to_string(key_id) + ",\"pad\":\"";
+    d.append(40 + (op_idx * 7 + writer) % 80, static_cast<char>('a' + (op_idx + key_id) % 26));
+    return d + "\"}";
+}
+
+static void sendRec(int fd, const AckRec& r) { CHECK(write(fd, &r, sizeof(r)) == static_cast<ssize_t>(sizeof(r))); }
+
+// Reads one record; returns false on EOF.
+static bool readRec(int fd, AckRec* r) {
+    while (true) {
+        ssize_t n = read(fd, r, sizeof(*r));
+        if (n == static_cast<ssize_t>(sizeof(*r))) return true;
+        if (n == 0) return false;
+        CHECK(n < 0 && errno == EINTR);  // a short read of a 24-byte record is a bug
+    }
+}
+
+static void pauseForever() {
+    while (true) pause();
+}
+
+static uint64_t dirBytes(const std::string& dir) {
+    uint64_t total = 0;
+    std::error_code ec;
+    for (auto it = std::filesystem::recursive_directory_iterator(dir, ec); !ec && it != std::filesystem::end(it);
+         it.increment(ec)) {
+        if (it->is_regular_file()) total += it->file_size();
+    }
+    CHECK(!ec);
+    return total;
+}
+
+// Child body: 4 writer threads doing put/erase on 64 keys, acking each op after it returns.
+// stop_after_ops > 0: each thread does that many ops, then the store is clean-closed (with a hook
+// that pauses between the page fsync and the meta write).
+static void b5ChildWriters(const std::string& sdir, int wfd, uint32_t ops_per_thread, bool close_and_pause) {
+    try {
+        IndexedStore::Options o = storeOpts(32);
+        if (close_and_pause) {
+            o.hooks.on_close_after_flush = [wfd]() { sendRec(wfd, AckRec{0, 9, 0, 0, 0}); pauseForever(); };
+        }
+        auto st = IndexedStore::open(sdir, o);
+        std::vector<std::thread> th;
+        for (uint32_t w = 0; w < 4; ++w) {
+            th.emplace_back([&, w]() {
+                std::mt19937 rng(1000 + w);
+                for (uint32_t i = 0; i < ops_per_thread; ++i) {
+                    uint32_t k = rng() % 64;
+                    AckRec r{0, 0, k, w, i};
+                    if (rng() % 100 < 65) {
+                        r.seq = st->put(b5Key(k), b5Doc(w, i, k));
+                        r.op = 1;
+                    } else {
+                        r.seq = st->erase(b5Key(k)).seq;
+                        r.op = 2;
+                    }
+                    sendRec(wfd, r);
+                }
+            });
+        }
+        for (auto& t : th) t.join();
+        if (close_and_pause) st->close();  // pauses inside the hook; never returns
+    } catch (const std::exception& e) {
+        std::cerr << "[Child] exception: " << e.what() << "\n";
+        _exit(2);
+    }
+    _exit(0);
+}
+
+struct VEntry {
+    uint64_t seq;
+    uint8_t type;
+    std::vector<uint8_t> payload;
+};
+
+static void testB5KillDuringWrites(const std::string& base) {
+    banner("B5.2 kill -9 during writes / rebuild / clean close, reopen, check every acked key");
+    CHECK(mkdir(base.c_str(), 0755) == 0);
+    const int kIters = 50;
+    std::mt19937 rng(505);
+    std::uniform_int_distribution<int> delay_ms(5, 400);
+    uint64_t total_acked = 0, total_unacked = 0, total_checked_keys = 0;
+    int kinds[3] = {0, 0, 0};
+
+    for (int iter = 0; iter < kIters; ++iter) {
+        const std::string sdir = base + "/iter_" + std::to_string(iter);
+        // 0: kill during writes; 1: kill during writes, then kill the rebuilding child; 2: kill during clean close.
+        int kind = (iter % 5 == 3) ? 1 : (iter % 5 == 4) ? 2 : 0;
+        kinds[kind]++;
+        int pfd[2];
+        CHECK(pipe(pfd) == 0);
+        std::cout.flush();
+        pid_t pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            CHECK(close(pfd[0]) == 0);
+            b5ChildWriters(sdir, pfd[1], kind == 2 ? 60 : 2000, kind == 2);
+        }
+        CHECK(close(pfd[1]) == 0);
+
+        std::vector<AckRec> acks;
+        int kill_after = -1;
+        bool paused = false;
+        AckRec r;
+        if (kind == 2) {
+            while (readRec(pfd[0], &r)) {
+                if (r.op == 9) { paused = true; break; }
+                acks.push_back(r);
+            }
+            CHECK(paused && acks.size() == 240);
+        } else {
+            while (acks.size() < 200 && readRec(pfd[0], &r)) acks.push_back(r);
+            CHECK(acks.size() == 200);
+            kill_after = delay_ms(rng);
+            std::this_thread::sleep_for(std::chrono::milliseconds(kill_after));
+        }
+        CHECK(kill(pid, SIGKILL) == 0);
+        int status = 0;
+        CHECK(waitpid(pid, &status, 0) == pid);
+        CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+        while (readRec(pfd[0], &r)) { CHECK(r.op != 9); acks.push_back(r); }
+        CHECK(close(pfd[0]) == 0);
+        accountBytes(dirBytes(sdir), "B5 child files (vLog + index.db)");
+
+        bool killed_rebuild = false;
+        if (kind == 1) {
+            // A second child opens the store (rebuild), pauses after 100 applied entries, and is killed.
+            int qfd[2];
+            CHECK(pipe(qfd) == 0);
+            std::cout.flush();
+            pid_t p2 = fork();
+            CHECK(p2 >= 0);
+            if (p2 == 0) {
+                CHECK(close(qfd[0]) == 0);
+                IndexedStore::Options o = storeOpts(32);
+                o.hooks.on_rebuild_entry = [&](uint64_t n) {
+                    if (n == 100) { sendRec(qfd[1], AckRec{0, 9, 0, 0, 0}); pauseForever(); }
+                };
+                auto st = IndexedStore::open(sdir, o);
+                _exit(0);  // not reached if the hook fired
+            }
+            CHECK(close(qfd[1]) == 0);
+            CHECK(readRec(qfd[0], &r) && r.op == 9);
+            struct stat sb;
+            CHECK(stat((sdir + "/index.db.rebuild").c_str(), &sb) == 0);  // rebuild in progress
+            CHECK(kill(p2, SIGKILL) == 0);
+            CHECK(waitpid(p2, &status, 0) == p2);
+            CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+            CHECK(close(qfd[0]) == 0);
+            accountBytes(sb.st_size + 4096, "B5 killed rebuild (partial index.db.rebuild + segment header)");
+            killed_rebuild = true;
+        }
+
+        // Independent reference: the recovered vLog, read directly.
+        // (Opening the store below runs vLog recovery first; read the vLog after that.)
+        IndexedStore::Options o = storeOpts(64);
+        auto st = IndexedStore::open(sdir, o);
+        const bpt::OpenIndexResult& info = st->openInfo();
+        CHECK(info.rebuilt);
+        CHECK(info.initial_status == OpenStatus::NotClean);
+        struct stat sb;
+        CHECK(stat((sdir + "/index.db.rebuild").c_str(), &sb) != 0 && errno == ENOENT);
+
+        std::map<std::string, std::vector<VEntry>> per_key;
+        std::set<uint64_t> vlog_seqs;
+        {
+            std::vector<uint32_t> segs = bpt::listVLogSegments(st->vlogDir());
+            vlog::VLogReader reader(st->vlogDir());
+            for (size_t i = 0; i < segs.size(); ++i) {
+                vlog::ScanResult sr = reader.scanSegment(segs[i], i + 1 == segs.size());
+                for (auto& e : sr.entries) {
+                    const uint64_t seq = e.header.seq;  // copy: EntryHeader is packed, no reference binding
+                    per_key[e.key].push_back(VEntry{seq, e.header.type, e.payload});
+                    vlog_seqs.insert(seq);
+                }
+            }
+        }
+        // Check 1: index == should_apply() replay of the recovered vLog.
+        Oracle ref = vlogOracle(st->vlogDir());
+        checkFullEq(st->tree(), ref, "index vs vLog replay");
+        checkTree(st->tree());
+
+        // Check 2: every acked op is reflected. Use the newest acked op per key.
+        std::map<uint32_t, AckRec> latest;
+        for (const AckRec& a : acks) {
+            CHECK(vlog_seqs.count(a.seq) == 1);  // every acked seq is in the vLog
+            auto it = latest.find(a.key_id);
+            if (it == latest.end() || a.seq > it->second.seq) latest[a.key_id] = a;
+        }
+        for (const auto& [kid, a] : latest) {
+            std::string key = b5Key(kid);
+            uint64_t got_seq = 0;
+            std::optional<std::string> doc = st->get(key, &got_seq);
+            const auto& hist = per_key[key];
+            if (a.op == 1) {
+                if (doc) {
+                    CHECK(got_seq >= a.seq);
+                    if (got_seq == a.seq) CHECK(*doc == b5Doc(a.writer, a.op_idx, kid));  // the acked value
+                } else {
+                    // Absent only if a later tombstone (acked or not) is in the vLog.
+                    bool later_tomb = false;
+                    for (const VEntry& e : hist) {
+                        if (e.seq > a.seq && e.type == static_cast<uint8_t>(vlog::EntryType::Tombstone)) later_tomb = true;
+                    }
+                    CHECK(later_tomb);
+                }
+            } else {
+                if (doc) CHECK(got_seq > a.seq);  // re-created by a later put
+            }
+            // Whatever the store returns must be the newest vLog entry's payload for that key.
+            if (doc) {
+                const VEntry& last = hist.back();
+                CHECK(last.seq == got_seq && std::string(last.payload.begin(), last.payload.end()) == *doc);
+            }
+            total_checked_keys++;
+        }
+        uint64_t unacked = vlog_seqs.size() - acks.size();
+        total_acked += acks.size();
+        total_unacked += unacked;
+        const char* kind_name = kind == 0 ? "kill during writes" : kind == 1 ? "kill during rebuild" : "kill in clean close";
+        std::printf("Iter %2d/%d: %-19s %s acked %4zu, vLog entries %4zu (unacked %2llu), keys %2zu, rebuild %3llu ms\n",
+                    iter + 1, kIters, kind_name,
+                    kill_after >= 0 ? ("(+" + std::to_string(kill_after) + " ms),").c_str() : "",
+                    acks.size(), vlog_seqs.size(), (unsigned long long)unacked, ref.size(),
+                    (unsigned long long)info.rebuild_ms);
+        (void)killed_rebuild;
+
+        // Clean close + reopen: no rebuild, same contents.
+        finishStore(st, true);
+        auto st2 = IndexedStore::open(sdir, storeOpts(64));
+        CHECK(!st2->openInfo().rebuilt && st2->openInfo().initial_status == OpenStatus::Ok);
+        checkFullEq(st2->tree(), ref, "after clean reopen");
+        finishStore(st2, true);
+        std::error_code ec;
+        std::filesystem::remove_all(sdir, ec);
+        CHECK(!ec);
+    }
+    std::cout << "Crash points: " << kinds[0] << " during writes, " << kinds[1] << " during rebuild (after a write "
+              << "crash), " << kinds[2] << " between page fsync and meta write in clean close.\n";
+    std::cout << "PASS: " << kIters << " iterations; " << total_acked << " acked ops all present in the vLog; for "
+              << total_checked_keys << " keys the newest acked op is reflected (acked value returned, or a newer "
+              << "write); index == vLog replay every time; " << total_unacked << " recovered-but-unacked entries.\n";
+}
+#endif
+
 int main() {
     std::cout << "====================================================================\n"
               << "  PHASE 2: B+TREE INDEX TESTS\n"
@@ -966,6 +1288,12 @@ int main() {
     testB3KeyLimits(test_dir + "/b3_limits");
     testB4CleanReopen(test_dir + "/b4_reopen");
     testB4CrashRebuild(test_dir + "/b4_rebuild");
+    testB5Api(test_dir + "/b5_api");
+#ifndef TSAN_BUILD
+    testB5KillDuringWrites(test_dir + "/b5_kill");
+#else
+    std::cout << "\n[SKIP] B5.2 fork/kill -9 test skipped under ThreadSanitizer (same rule as Phase 1).\n";
+#endif
 
     printBudget();
     std::cout << "\n====================================================================\n"
