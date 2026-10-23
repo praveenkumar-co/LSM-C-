@@ -165,7 +165,7 @@ public:
     using Ref = vlog::IndexValueRef;
     using ScanResult = std::vector<std::pair<std::string, Ref>>;
 
-    enum class PutStatus { Inserted, Updated, InvalidKey, LeafFull };
+    enum class PutStatus { Inserted, Updated, InvalidKey };
     enum class ApplyResult { Applied, Skipped, InvalidKey };
 
     struct Shape {
@@ -244,6 +244,26 @@ public:
         return pager_.keyCount();
     }
 
+    // Test-only: keys of every leaf, in leaf-chain order (empty leaves included).
+    std::vector<std::vector<std::string>> leafKeysForTest() const {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        std::vector<std::vector<std::string>> out;
+        PageGuard g = pager_.fetch(pager_.rootPageId());
+        while (!Node(g.data()).isLeaf()) {
+            PageGuard c = pager_.fetch(Node(g.data()).childAt(0));
+            g = std::move(c);
+        }
+        while (true) {
+            Node n(g.data());
+            out.emplace_back();
+            for (uint32_t i = 0; i < n.count(); ++i) out.back().emplace_back(n.key(i));
+            if (n.rightSibling() == kNoPage) break;
+            PageGuard ng = pager_.fetch(n.rightSibling());
+            g = std::move(ng);
+        }
+        return out;
+    }
+
     // Test-only: walks the whole tree and checks the invariants listed in plan section 3.
     // Returns "" if all hold, else a description of the first violation.
     std::string checkInvariants(Shape* shape = nullptr) const {
@@ -299,7 +319,18 @@ private:
     }
 
     PutStatus putLocked(std::string_view key, const Ref& ref) {
-        PageGuard leaf = descendToLeaf(key);
+        // Descend, keeping every internal page on the path pinned with the child index taken.
+        std::vector<PageGuard> path;
+        std::vector<uint32_t> path_idx;
+        PageGuard leaf = pager_.fetch(pager_.rootPageId());
+        while (!Node(leaf.data()).isLeaf()) {
+            Node n(leaf.data());
+            uint32_t j = n.upperBound(key);
+            PageGuard child = pager_.fetch(n.childAt(j));
+            path.push_back(std::move(leaf));
+            path_idx.push_back(j);
+            leaf = std::move(child);
+        }
         Node n(leaf.data());
         uint32_t pos = n.lowerBound(key);
         if (pos < n.count() && compareKeys(n.key(pos), key) == 0) {
@@ -308,11 +339,129 @@ private:
             noteSeq(ref.seq);
             return PutStatus::Updated;
         }
-        if (!n.insert(pos, key, &ref)) return PutStatus::LeafFull;  // splits come in step B3
-        leaf.markDirty();
         pager_.setKeyCount(pager_.keyCount() + 1);
         noteSeq(ref.seq);
+        if (n.insert(pos, key, &ref)) {
+            leaf.markDirty();
+            return PutStatus::Inserted;
+        }
+
+        // Leaf split, then insert the separator into the parents, splitting them as needed.
+        std::string sep;
+        page_id_t new_child = splitLeaf(leaf, pos, key, ref, &sep);
+        page_id_t left_child = leaf.id();
+        leaf.release();
+        for (size_t lvl = path.size(); lvl-- > 0;) {
+            PageGuard& parent = path[lvl];
+            Node pn(parent.data());
+            uint32_t j = path_idx[lvl];
+            if (pn.childAt(j) != left_child) fatal("split: parent does not point at the split child");
+            // The new right sibling goes right after the split child: cell position j.
+            if (pn.insert(j, sep, &new_child)) {
+                parent.markDirty();
+                return PutStatus::Inserted;
+            }
+            std::string up;
+            new_child = splitInternal(parent, j, sep, new_child, &up);
+            sep = std::move(up);
+            left_child = parent.id();
+            path.pop_back();  // unpin
+        }
+        // The root split: grow the tree by one level.
+        uint32_t old_level = pager_.treeHeight() - 1;
+        if (old_level >= 254) fatal("tree height limit");
+        PageGuard root = pager_.allocate(PageType::Internal, static_cast<uint8_t>(old_level + 1));
+        Node rn(root.data());
+        rn.setLeftmostChild(left_child);
+        if (!rn.insert(0, sep, &new_child)) fatal("new root cannot hold one separator");
+        root.markDirty();
+        pager_.setRoot(root.id(), pager_.treeHeight() + 1);
         return PutStatus::Inserted;
+    }
+
+    struct Entry {
+        std::string key;
+        uint8_t value[kLeafValueSize];  // leaf: IndexValueRef; internal: first 4 bytes are the child id
+    };
+
+    static std::vector<Entry> readEntries(const Node& n) {
+        std::vector<Entry> out(n.count());
+        for (uint32_t i = 0; i < n.count(); ++i) {
+            out[i].key.assign(n.key(i));
+            std::memcpy(out[i].value, n.valuePtr(i), n.valueSize());
+        }
+        return out;
+    }
+
+    // Split index by bytes (plan 2.4 step 2): first i where the running total of (cell + slot)
+    // bytes of E[0..i) reaches half of the grand total, clamped to [lo, hi].
+    static size_t splitIndex(const std::vector<Entry>& e, uint32_t value_size, size_t lo, size_t hi) {
+        uint64_t total = 0;
+        for (const Entry& x : e) total += kSlotSize + 2 + x.key.size() + value_size;
+        uint64_t run = 0;
+        size_t i = 0;
+        while (i < e.size() && run * 2 < total) {
+            run += kSlotSize + 2 + e[i].key.size() + value_size;
+            ++i;
+        }
+        return std::min(std::max(i, lo), hi);
+    }
+
+    static void fillNode(Node& n, const std::vector<Entry>& e, size_t from, size_t to) {
+        for (size_t i = from; i < to; ++i) {
+            if (!n.insert(n.count(), e[i].key, e[i].value)) fatal("split half does not fit in a page");
+        }
+    }
+
+    // Splits a full leaf L while inserting (key, ref) at slot pos. Returns the new right leaf R;
+    // *sep = first key of R.
+    page_id_t splitLeaf(PageGuard& lg, uint32_t pos, std::string_view key, const Ref& ref, std::string* sep) {
+        Node l(lg.data());
+        std::vector<Entry> e = readEntries(l);
+        Entry ne;
+        ne.key.assign(key);
+        std::memcpy(ne.value, &ref, sizeof(ref));
+        e.insert(e.begin() + pos, std::move(ne));
+        size_t s = splitIndex(e, kLeafValueSize, 1, e.size() - 1);
+
+        PageGuard rg = pager_.allocate(PageType::Leaf, 0);
+        Node r(rg.data());
+        l.clearEntries();
+        fillNode(l, e, 0, s);
+        fillNode(r, e, s, e.size());
+        r.setRightSibling(l.rightSibling());
+        l.setRightSibling(rg.id());
+        lg.markDirty();
+        rg.markDirty();
+        *sep = e[s].key;
+        return rg.id();
+    }
+
+    // Splits a full internal page P while inserting (sep, child) at cell position j.
+    // P keeps C0 and E[0..m); P' gets leftmost child E[m].child and E[m+1..n); E[m].key moves up.
+    page_id_t splitInternal(PageGuard& pg, uint32_t j, const std::string& sep, page_id_t child, std::string* up) {
+        Node p(pg.data());
+        std::vector<Entry> e = readEntries(p);
+        Entry ne;
+        ne.key = sep;
+        std::memset(ne.value, 0, sizeof(ne.value));
+        std::memcpy(ne.value, &child, sizeof(child));
+        e.insert(e.begin() + j, std::move(ne));
+        if (e.size() < 3) fatal("internal split with fewer than 3 entries");
+        size_t m = splitIndex(e, kChildValueSize, 1, e.size() - 2);
+
+        PageGuard qg = pager_.allocate(PageType::Internal, p.level());
+        Node q(qg.data());
+        page_id_t mid_child;
+        std::memcpy(&mid_child, e[m].value, sizeof(mid_child));
+        p.clearEntries();
+        fillNode(p, e, 0, m);
+        q.setLeftmostChild(mid_child);
+        fillNode(q, e, m + 1, e.size());
+        pg.markDirty();
+        qg.markDirty();
+        *up = e[m].key;
+        return qg.id();
     }
 
     bool eraseLocked(std::string_view key) {

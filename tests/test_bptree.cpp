@@ -11,6 +11,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <map>
 #include <set>
 #include <random>
@@ -457,30 +458,265 @@ static void testB2FullLeafAndCompaction(const std::string& dir) {
     std::mt19937_64 rng(203);
     Oracle o;
     auto bigKey = [](int i) { std::string k(256, 'A'); k[0] = static_cast<char>('a' + i / 26); k[1] = static_cast<char>('a' + i % 26); return k; };
-    int i = 0;
-    while (true) {
+    BPTree::Shape sh;
+    for (int i = 0; i < 14; ++i) {
         Ref r = makeRef(i + 1, rng);
-        BPTree::PutStatus st = t.put(bigKey(i), r);
-        if (st == BPTree::PutStatus::LeafFull) break;
-        CHECK(st == BPTree::PutStatus::Inserted);
+        CHECK(t.put(bigKey(i), r) == BPTree::PutStatus::Inserted);
         o[bigKey(i)] = r;
-        ++i;
     }
-    std::cout << "256-byte keys that fit in one leaf: " << i << " (cell 282 B + slot 2 B each; 4064 usable)\n";
-    CHECK(i == 14);
-    checkFullEq(t, o, "full leaf");
-    // Erase every other key (fragmenting the cell area), then insert new 256-byte keys: needs compaction.
+    checkTree(t, &sh);
+    std::cout << "14 keys of 256 bytes (cell 282 B + slot 2 B each; 4064 usable): height " << sh.height << ", leaves "
+              << sh.leaves << "\n";
+    CHECK(sh.height == 1 && sh.leaves == 1);
+    // Erase every other key (fragmenting the cell area), then insert 7 new 256-byte keys: needs compaction.
     for (int j = 0; j < 14; j += 2) { CHECK(t.erase(bigKey(j))); o.erase(bigKey(j)); }
     for (int j = 100; j < 107; ++j) {
         Ref r = makeRef(1000 + j, rng);
         CHECK(t.put(bigKey(j), r) == BPTree::PutStatus::Inserted);
         o[bigKey(j)] = r;
     }
-    CHECK(t.put(bigKey(200), makeRef(5000, rng)) == BPTree::PutStatus::LeafFull);
+    checkTree(t, &sh);
+    CHECK(sh.height == 1 && sh.leaves == 1);
     checkFullEq(t, o, "after compaction");
-    checkTree(t);
-    std::cout << "PASS: leaf holds exactly 14 max-size entries; after 7 erases, 7 new max-size inserts succeed via "
-                 "compaction; contents match std::map.\n";
+    std::cout << "After 7 erases + 7 inserts of 256-byte keys: height " << sh.height << ", leaves " << sh.leaves
+              << " (fit by compaction, no split)\n";
+    // The 15th max-size entry does not fit: the leaf splits and a root is created.
+    Ref r = makeRef(5000, rng);
+    CHECK(t.put(bigKey(200), r) == BPTree::PutStatus::Inserted);
+    o[bigKey(200)] = r;
+    checkTree(t, &sh);
+    std::cout << "15th 256-byte key: height " << sh.height << ", leaves " << sh.leaves << ", internal "
+              << sh.internals << "\n";
+    CHECK(sh.height == 2 && sh.leaves == 2 && sh.internals == 1);
+    checkFullEq(t, o, "after first split");
+    std::cout << "PASS: one leaf holds exactly 14 max-size entries; compaction reuses erased space; the 15th entry "
+                 "splits the root leaf.\n";
+}
+
+// ------------------------------------------------------------------------------------------
+// B3. Splits
+// ------------------------------------------------------------------------------------------
+
+// T1 key space: 70% 1-32 bytes, 10% exactly 256, 10% 200-255, 10% sharing a 180-byte prefix.
+// Random bytes, so 0x00 and 0xFF occur; two keys are forced to be all-0x00 and all-0xFF.
+static std::vector<std::string> makeKeySpace(std::mt19937_64& rng, size_t n) {
+    std::vector<std::string> keys;
+    std::set<std::string> seen;
+    std::string prefix = randomBytes(rng, 180);
+    while (keys.size() < n) {
+        uint32_t d = rng() % 100;
+        std::string k;
+        if (d < 70) k = randomBytes(rng, 1 + rng() % 32);
+        else if (d < 80) k = randomBytes(rng, 256);
+        else if (d < 90) k = randomBytes(rng, 200 + rng() % 56);
+        else k = prefix + randomBytes(rng, 1 + rng() % 40);
+        if (seen.insert(k).second) keys.push_back(std::move(k));
+    }
+    keys[0] = std::string(1, '\0');
+    keys[1] = std::string(256, '\xff');
+    return keys;
+}
+
+struct T1Result {
+    uint64_t puts = 0, gets = 0, erases = 0, scans = 0, scanned = 0;
+};
+
+static void runRandomOps(BPTree& t, Oracle& o, const std::vector<std::string>& keys, std::mt19937_64& rng,
+                         uint64_t& seq, int ops, int check_every, T1Result* res) {
+    for (int op = 0; op < ops; ++op) {
+        uint32_t dice = rng() % 100;
+        const std::string& k = keys[rng() % keys.size()];
+        if (dice < 40) {
+            Ref r = makeRef(++seq, rng);
+            BPTree::PutStatus st = t.put(k, r);
+            CHECK(st == (o.count(k) ? BPTree::PutStatus::Updated : BPTree::PutStatus::Inserted));
+            o[k] = r;
+            res->puts++;
+        } else if (dice < 65) {
+            auto got = t.get(k);
+            auto it = o.find(k);
+            CHECK(got.has_value() == (it != o.end()));
+            if (got) CHECK(sameRef(*got, it->second));
+            res->gets++;
+        } else if (dice < 85) {
+            CHECK(t.erase(k) == (o.erase(k) == 1));
+            res->erases++;
+        } else {
+            // Bounds: existing keys or random byte strings (which fall between keys).
+            std::string a = (rng() % 2) ? keys[rng() % keys.size()] : randomBytes(rng, 1 + rng() % 40);
+            std::string b = (rng() % 2) ? keys[rng() % keys.size()] : randomBytes(rng, 1 + rng() % 40);
+            if (a > b) std::swap(a, b);
+            size_t limit = 1 + rng() % 500;
+            BPTree::ScanResult got = t.scan(a, b, limit);
+            checkScanEq(got, oracleScan(o, a, &b, limit), "random scan");
+            res->scans++;
+            res->scanned += got.size();
+        }
+        if (check_every > 0 && (op + 1) % check_every == 0) {
+            checkFullEq(t, o, "periodic full scan");
+            checkTree(t);
+        }
+    }
+}
+
+static void testB3RandomVsMap(const std::string& dir, uint64_t seed, size_t frames, size_t key_space) {
+    banner("B3.1 100,000 random ops vs std::map (seed " + std::to_string(seed) + ", " + std::to_string(frames) +
+           " frames, " + std::to_string(key_space) + " keys)");
+    CHECK(mkdir(dir.c_str(), 0755) == 0);
+    uint64_t bytes_before = bytesWritten();
+    auto t0 = std::chrono::steady_clock::now();
+    auto p = Pager::create(dir + "/index.db", pagerOpts(frames));
+    BPTree t(*p);
+    std::mt19937_64 rng(seed);
+    std::vector<std::string> keys = makeKeySpace(rng, key_space);
+    Oracle o;
+    uint64_t seq = 0;
+    T1Result res;
+    runRandomOps(t, o, keys, rng, seq, 100000, 10000, &res);
+    BPTree::Shape sh;
+    checkTree(t, &sh);
+    std::string disk_err = p->verifyPagesOnDisk();
+    CHECK(disk_err.empty());
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    Pager::Stats ps = p->stats();
+    std::cout << "ops: put " << res.puts << ", get " << res.gets << ", erase " << res.erases << ", scan " << res.scans
+              << " (" << res.scanned << " entries returned)\n";
+    std::cout << "final: keys " << o.size() << ", height " << sh.height << ", pages " << p->pageCount() << ", leaves "
+              << sh.leaves << " (" << sh.empty_leaves << " empty), internal " << sh.internals << "\n";
+    std::cout << "pager: page reads " << ps.page_reads << ", page writes " << ps.page_writes << ", evictions "
+              << ps.evictions << "; bytes written by this test " << (bytesWritten() - bytes_before) << "; wall time "
+              << ms << " ms\n";
+    CHECK(sh.height >= 3);
+    std::cout << "PASS: every op matched std::map; full scan + checkInvariants passed every 10,000 ops; all page "
+                 "CRCs valid on disk.\n";
+}
+
+static void testB3Sequential(const std::string& dir) {
+    banner("B3.2 Ascending and descending bulk inserts (splits at the right and left edges)");
+    CHECK(mkdir(dir.c_str(), 0755) == 0);
+    std::mt19937_64 rng(302);
+    for (int pass = 0; pass < 2; ++pass) {
+        auto p = Pager::create(dir + (pass ? "/desc.db" : "/asc.db"), pagerOpts(64));
+        BPTree t(*p);
+        Oracle o;
+        const int n = 20000;
+        for (int i = 0; i < n; ++i) {
+            int v = pass ? (n - 1 - i) : i;
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "key%08d", v);
+            Ref r = makeRef(i + 1, rng);
+            CHECK(t.put(buf, r) == BPTree::PutStatus::Inserted);
+            o[buf] = r;
+        }
+        BPTree::Shape sh;
+        checkTree(t, &sh);
+        checkFullEq(t, o, pass ? "descending" : "ascending");
+        std::cout << (pass ? "descending" : "ascending ") << ": " << n << " keys, height " << sh.height << ", leaves "
+                  << sh.leaves << ", internal " << sh.internals << ", avg keys/leaf "
+                  << (sh.keys / sh.leaves) << "\n";
+    }
+    std::cout << "PASS: both orders match std::map and pass checkInvariants.\n";
+}
+
+static void testB3ScanBoundaries(const std::string& dir) {
+    banner("B3.3 Range scans across page boundaries");
+    CHECK(mkdir(dir.c_str(), 0755) == 0);
+    auto p = Pager::create(dir + "/index.db", pagerOpts(32));
+    BPTree t(*p);
+    std::mt19937_64 rng(303);
+    Oracle o;
+    // Fixed 100-byte keys: cell 126 B + slot 2 B = 128 B, so at most 31 entries per leaf.
+    auto key = [](int i) { char b[16]; std::snprintf(b, sizeof(b), "k%06d", i); std::string k(b); k.resize(100, '.'); return k; };
+    for (int i = 0; i < 3000; i += 2) {  // even ids only, so odd ids fall between keys
+        Ref r = makeRef(i + 1, rng);
+        CHECK(t.put(key(i), r) == BPTree::PutStatus::Inserted);
+        o[key(i)] = r;
+    }
+    auto leaves = t.leafKeysForTest();
+    CHECK(leaves.size() >= 10);
+    size_t max_per_leaf = 0;
+    for (auto& l : leaves) max_per_leaf = std::max(max_per_leaf, l.size());
+    std::cout << "1500 keys of 100 bytes in " << leaves.size() << " leaves (max " << max_per_leaf << " per leaf)\n";
+    CHECK(max_per_leaf <= 31);
+
+    int checks = 0;
+    auto check = [&](const std::string& a, const std::string& b, size_t limit, const char* what) {
+        checkScanEq(t.scan(a, b, limit), oracleScan(o, a, &b, limit), what);
+        checks++;
+    };
+    const std::string top = std::string(1, '\x7f');
+    for (size_t li = 0; li + 3 < leaves.size(); ++li) {
+        const auto& L = leaves[li];
+        const auto& N = leaves[li + 1];
+        CHECK(!L.empty() && !N.empty());
+        check(L.back(), top, 3, "start at last key of a leaf");
+        check(L.front(), N.front(), 1000, "end exactly at first key of next leaf");
+        check(L.front(), top, L.size(), "limit ends exactly on a leaf boundary");
+        check(L.front(), top, L.size() + 1, "limit one past a leaf boundary");
+        check(L[L.size() / 2], leaves[li + 3].back(), 1000, "spans 4 leaves");
+    }
+    check("", top, SIZE_MAX, "whole tree");
+    check(key(1), key(9), 100, "start and end between keys");
+    check("", key(0), 100, "end at the smallest key");
+    check("", "k", 100, "range below the smallest key");
+    check(key(2998) + "x", top, 100, "start above the largest key");
+    check(key(10), key(10), 100, "start == end");
+    check(key(20), key(10), 100, "start > end");
+    check(key(10), key(500), 1, "limit 1");
+
+    // Empty one middle leaf, then scan across it.
+    size_t mid = leaves.size() / 2;
+    for (const auto& k : leaves[mid]) { CHECK(t.erase(k)); o.erase(k); }
+    BPTree::Shape sh;
+    checkTree(t, &sh);
+    CHECK(sh.empty_leaves == 1);
+    check(leaves[mid - 1].front(), leaves[mid + 1].back(), 1000, "across an empty leaf");
+    check(leaves[mid - 1].back(), top, 2, "limit 2 across an empty leaf");
+    check(leaves[mid].front(), leaves[mid].back(), 1000, "inside the empty leaf's range");
+    // Erase everything.
+    for (int i = 0; i < 3000; i += 2) { t.erase(key(i)); o.erase(key(i)); }
+    checkTree(t, &sh);
+    CHECK(sh.keys == 0 && o.empty());
+    check("", top, SIZE_MAX, "empty tree");
+    std::cout << "After erasing all keys: " << sh.leaves << " leaves (" << sh.empty_leaves
+              << " empty) remain; no merges in Phase 2.\n";
+    std::cout << "PASS: " << checks << " boundary scans matched std::map lower_bound(start)..lower_bound(end).\n";
+}
+
+static void testB3KeyLimits(const std::string& dir) {
+    banner("B3.4 Keys > 256 bytes rejected on a multi-level tree");
+    CHECK(mkdir(dir.c_str(), 0755) == 0);
+    auto p = Pager::create(dir + "/index.db", pagerOpts(32));
+    BPTree t(*p);
+    std::mt19937_64 rng(304);
+    std::vector<std::string> keys = makeKeySpace(rng, 3000);
+    Oracle o;
+    uint64_t seq = 0;
+    for (const auto& k : keys) { Ref r = makeRef(++seq, rng); CHECK(t.put(k, r) == BPTree::PutStatus::Inserted); o[k] = r; }
+    BPTree::Shape before;
+    checkTree(t, &before);
+    uint32_t pages_before = p->pageCount();
+    int rejected = 0;
+    for (size_t len : {257u, 300u, 1000u, 65535u, 70000u, 0u}) {
+        std::string k = randomBytes(rng, len);
+        CHECK(t.put(k, makeRef(++seq, rng)) == BPTree::PutStatus::InvalidKey);
+        CHECK(!t.get(k).has_value());
+        CHECK(!t.erase(k));
+        CHECK(t.apply(k, vlog::EntryType::Full, ++seq, 0, vlog::VPtr{1, 4096, 64}) == BPTree::ApplyResult::InvalidKey);
+        rejected++;
+    }
+    BPTree::Shape after;
+    checkTree(t, &after);
+    CHECK(after.keys == before.keys && p->pageCount() == pages_before);
+    checkFullEq(t, o, "after rejected keys");
+    std::string k256 = randomBytes(rng, 256);
+    Ref r = makeRef(++seq, rng);
+    CHECK(t.put(k256, r) == BPTree::PutStatus::Inserted);
+    o[k256] = r;
+    checkFullEq(t, o, "after 256-byte key");
+    std::cout << "Tree height " << before.height << ", " << before.keys << " keys. Rejected key lengths: 257, 300, "
+                 "1000, 65535, 70000, 0 (" << rejected << " cases, via put/get/erase/apply).\n";
+    std::cout << "PASS: oversize and empty keys rejected; tree and page count unchanged; 256-byte key accepted.\n";
 }
 
 int main() {
@@ -496,6 +732,15 @@ int main() {
     testB2Basics(test_dir + "/b2_basic");
     testB2RandomVsMap(test_dir + "/b2_random");
     testB2FullLeafAndCompaction(test_dir + "/b2_full");
+    // Seed 1 uses 32 frames (eviction + CRC-checked reload on most ops). Measured: one 32-frame
+    // seed writes about 196 MB of page write-backs, so three would exceed the 512 MiB budget.
+    // Seeds 2 and 3 use the default 1024 frames (the tree fits; no eviction).
+    testB3RandomVsMap(test_dir + "/b3_seed1", 31, 32, 20000);
+    testB3RandomVsMap(test_dir + "/b3_seed2", 32, 1024, 20000);
+    testB3RandomVsMap(test_dir + "/b3_seed3", 33, 1024, 20000);
+    testB3Sequential(test_dir + "/b3_seq");
+    testB3ScanBoundaries(test_dir + "/b3_scan");
+    testB3KeyLimits(test_dir + "/b3_limits");
 
     printBudget();
     std::cout << "\n====================================================================\n"
