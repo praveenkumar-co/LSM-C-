@@ -1,7 +1,7 @@
-#include "VLogFormat.hpp"
-#include "CRC32.hpp"
-#include "VLogWriter.hpp"
-#include "VLogReader.hpp"
+#include "vlog/VLogFormat.hpp"
+#include "vlog/CRC32.hpp"
+#include "vlog/VLogWriter.hpp"
+#include "vlog/VLogReader.hpp"
 
 #include <iostream>
 #include <vector>
