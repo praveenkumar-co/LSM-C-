@@ -11,8 +11,9 @@
 // Every assigned seq is either acked or the process aborts, so the sequence has no holes; for
 // that reason any exception from append() aborts the process.
 //
-// Directory layout: <dir>/vlog/vlog_%08u.log and <dir>/index.db.
-// Without close(), index.db stays marked dirty and the next open rebuilds it from the vLog.
+// Directory layout: <dir>/vlog/vlog_%08u.log, <dir>/index.db, <dir>/superblock.db.
+// close() writes back the index and commits a superblock. Without close() there is no superblock
+// (Step 1 rule, see IndexRecovery.hpp) and the next open rebuilds the index from the vLog.
 
 #include "index/BPTree.hpp"
 #include "index/IndexRecovery.hpp"
@@ -66,14 +67,18 @@ public:
         po.inject_failure = opts.inject_index_failure;
         s->open_info_ = openOrRebuildIndex(dir, s->vlog_dir_, po, opts.hooks);
         s->pager_ = std::move(s->open_info_.pager);
+        s->sbm_ = std::move(s->open_info_.sbm);
         s->tree_.reset(new BPTree(*s->pager_));
         s->next_apply_seq_ = s->writer_->getCurrentSeq() + 1;
+        s->last_applied_seq_ = s->open_info_.last_seq;
+        s->last_applied_segment_ = s->open_info_.last_segment;
+        s->last_applied_end_ = s->open_info_.last_end;
         return s;
     }
 
     IndexedStore(const IndexedStore&) = delete;
     IndexedStore& operator=(const IndexedStore&) = delete;
-    ~IndexedStore() = default;  // without close(): vLog is fsynced and closed, index.db stays dirty
+    ~IndexedStore() = default;  // without close(): vLog is fsynced and closed, no superblock is written
 
     // Returns the seq of the acked write. Throws std::invalid_argument for a bad key or an
     // oversize document (nothing is written in that case).
@@ -129,7 +134,16 @@ public:
     // Clean close: callers must have stopped all other operations.
     void close() {
         if (closed_) fatal("IndexedStore::close called twice");
-        pager_->closeClean(opts_.hooks.on_close_after_flush);
+        {
+            std::lock_guard<std::mutex> lk(seq_mu_);
+            Pager::CommitInfo ci;
+            ci.checkpoint_seq = last_applied_seq_;
+            ci.replay_segment = last_applied_segment_;
+            ci.replay_offset = last_applied_end_;
+            ci.vlog_first_segment = open_info_.vid.first_segment;
+            ci.vlog_created_ns = open_info_.vid.created_ns;
+            pager_->checkpoint(*sbm_, ci, opts_.hooks.on_close_after_flush);
+        }
         closed_ = true;
         writer_.reset();  // fsync + close of the current vLog segment
     }
@@ -169,6 +183,9 @@ private:
             fatal("live apply was not applied (seq " + std::to_string(ar.seq) + ")");
         }
         next_apply_seq_ = ar.seq + 1;
+        last_applied_seq_ = ar.seq;
+        last_applied_segment_ = ar.vptr.segment_id;
+        last_applied_end_ = ar.vptr.offset + ar.vptr.length;
         lk.unlock();
         seq_cv_.notify_all();
     }
@@ -179,12 +196,17 @@ private:
     std::unique_ptr<vlog::VLogWriter> writer_;
     OpenIndexResult open_info_;
     std::unique_ptr<Pager> pager_;
+    std::unique_ptr<SuperblockManager> sbm_;
     std::unique_ptr<BPTree> tree_;
     bool closed_ = false;
 
     std::mutex seq_mu_;
     std::condition_variable seq_cv_;
     uint64_t next_apply_seq_ = 1;
+    // Last entry applied to the index and the vLog position right after it (guarded by seq_mu_).
+    uint64_t last_applied_seq_ = 0;
+    uint32_t last_applied_segment_ = 0;
+    uint32_t last_applied_end_ = vlog::kBlockSize;
 };
 
 } // namespace bpt

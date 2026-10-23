@@ -1,6 +1,9 @@
 #pragma once
-// BPTreeFormat.hpp - On-disk format of index.db (B+Tree primary index), format v1.
+// BPTreeFormat.hpp - On-disk format of index.db (B+Tree primary index), format v3.
 // See docs/PHASE2_PLAN.md section 1.
+//
+// v3: page 0 is a static header page, written once when the file is created. Which pages form the
+// committed tree (root, page count) is recorded only in superblock.db (SuperblockManager.hpp).
 //
 // Rules (same as VLogFormat.hpp):
 //  - All integers are little-endian.
@@ -23,11 +26,11 @@ using page_id_t = uint32_t;
 constexpr uint32_t  kPageSize           = 4096;
 constexpr uint32_t  kMaxKeyLen          = 256;
 constexpr uint32_t  kMinKeyLen          = 1;   // the empty key is rejected (plan Q3)
-constexpr uint32_t  kIndexFormatVersion = 2;  // v2: meta page records the vLog identity
+constexpr uint32_t  kIndexFormatVersion = 3;  // v3: static header page; tree state lives in superblock.db
 constexpr uint32_t  kPageMagic          = 0x50544250;             // "PBTP" (LE bytes)
-constexpr uint64_t  kMetaMagic          = 0x3141544D58444E49ULL;  // "INDXMTA1" (LE bytes)
+constexpr uint64_t  kMetaMagic          = 0x3341544D58444E49ULL;  // "INDXMTA3" (LE bytes)
 constexpr page_id_t kMetaPageId         = 0;
-constexpr page_id_t kNoPage             = 0;  // page 0 is the meta page, so 0 is never a child/sibling
+constexpr page_id_t kNoPage             = 0;  // page 0 is the header page, so 0 is never a child/sibling
 
 enum class PageType : uint8_t { Meta = 1, Leaf = 2, Internal = 3 };
 
@@ -52,20 +55,12 @@ struct CellKeyHeader {         // first 2 bytes of every leaf and internal cell
     uint16_t key_len;          // kMinKeyLen..kMaxKeyLen
 };
 
-struct MetaBody {              // at offset 32 of page 0; rest of the page is zero
+struct MetaBody {              // header page body: at offset 32 of page 0; rest of the page is zero
     uint64_t magic;            // kMetaMagic
     uint32_t format_version;   // kIndexFormatVersion
     uint32_t page_size;        // must equal kPageSize
-    uint32_t root_page_id;     // never kNoPage once initialized
-    uint32_t page_count;       // pages in the file including page 0; also the next new page id
-    uint32_t tree_height;      // 1 = root is a leaf
-    uint32_t clean_shutdown;   // 1 only after a complete clean close; set to 0 at open
-    uint64_t key_count;        // live keys
-    uint64_t max_applied_seq;  // highest vLog seq reflected in this file (trusted only if clean)
-    uint64_t open_count;       // incremented on every open (debug aid)
-    uint64_t vlog_created_ns;  // vLog identity: created_unix_ns of the lowest-id segment's header
-    uint32_t vlog_first_segment;  // vLog identity: id of that segment
-    uint32_t reserved1;        // must be 0
+    uint64_t index_nonce;      // random, set at creation; superblock.db records the same value
+    uint64_t reserved1;        // must be 0
 };
 
 #pragma pack(pop)
@@ -82,11 +77,8 @@ static_assert(offsetof(PageHeader, leftmost_child) == 28);
 static_assert(sizeof(CellKeyHeader) == 2);
 static_assert(sizeof(vlog::IndexValueRef) == 24);
 static_assert(sizeof(page_id_t) == 4);
-static_assert(sizeof(MetaBody) == 72);
-static_assert(offsetof(MetaBody, vlog_created_ns) == 56);
-static_assert(offsetof(MetaBody, vlog_first_segment) == 64);
-static_assert(offsetof(MetaBody, clean_shutdown)  == 28);
-static_assert(offsetof(MetaBody, max_applied_seq) == 40);
+static_assert(sizeof(MetaBody) == 32);
+static_assert(offsetof(MetaBody, index_nonce) == 16);
 static_assert(sizeof(PageHeader) + sizeof(MetaBody) <= kPageSize);
 static_assert(kPageSize <= 65535 + 1, "cell offsets are uint16");
 

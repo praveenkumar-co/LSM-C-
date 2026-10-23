@@ -45,6 +45,12 @@ static IndexedStore::Options storeOpts(size_t frames = 256) {
     return o;
 }
 
+static bpt::SuperblockManager::Options sbOpts() {
+    bpt::SuperblockManager::Options o;
+    o.on_write = [](uint64_t n) { accountBytes(n, "superblock.db write"); };
+    return o;
+}
+
 static Pager::Options pagerOpts(size_t frames) {
     Pager::Options o;
     o.num_frames = frames;
@@ -210,7 +216,7 @@ static void case1IndexAheadOfVLog(const std::string& base) {
         for (uint32_t id : bpt::listVLogSegments(d + "/vlog")) CHECK(unlink(segPath(d + "/vlog", id).c_str()) == 0);
         std::cout << "1b vLog dir emptied: " << openMustNotServeGhosts(d) << "\n";
     }
-    // 1c: vLog max seq < meta.max_applied_seq (newest segment deleted). Must also hold on a second open.
+    // 1c: vLog max seq < superblock checkpoint_seq (newest segment deleted). Must also hold on a second open.
     {
         std::string d = base + "/behind";
         auto st = IndexedStore::open(d, storeOpts());
@@ -219,10 +225,11 @@ static void case1IndexAheadOfVLog(const std::string& base) {
         st = IndexedStore::open(d, storeOpts());
         putKeys(*st, "d", 30);  // segment 2
         finishStore(st, true);
-        bpt::MetaBody m{};
-        CHECK(Pager::inspect(d + "/index.db", &m) == OpenStatus::Ok);
+        bpt::SuperblockManager sbm(d + "/superblock.db");
+        bpt::SuperblockManager::LoadResult sl = sbm.load();
+        CHECK(sl.status == bpt::SuperblockManager::LoadResult::Status::Ok);
         CHECK(unlink(segPath(d + "/vlog", 2).c_str()) == 0);
-        std::cout << "1c newest segment deleted (index max_applied_seq " << m.max_applied_seq
+        std::cout << "1c newest segment deleted (superblock checkpoint_seq " << sl.current.sb.checkpoint_seq
                   << ", vLog max seq 30): " << openMustNotServeGhosts(d) << "\n";
         std::cout << "1c second open: " << openMustNotServeGhosts(d) << "\n";
     }
@@ -570,11 +577,13 @@ static void case8Height4(const std::string& d) {
                       << " MiB).\n";
             return;
         }
-        p->closeClean();
+        bpt::SuperblockManager sbm(d + "/superblock.db", sbOpts());
+        sbm.load();
+        p->checkpoint(sbm, Pager::CommitInfo{});
     }
-    OpenStatus st;
-    auto p = Pager::open(d + "/index.db", pagerOpts(kFrames), &st);
-    CHECK(st == OpenStatus::Ok);
+    bpt::OpenIndexResult r = bpt::openCommittedIndex(d, pagerOpts(kFrames));
+    CHECK(r.initial_status == OpenStatus::Ok);
+    Pager* p = r.pager.get();
     BPTree t(*p);
     BPTree::Shape sh;
     CHECK(t.checkInvariants(&sh).empty());
@@ -588,7 +597,7 @@ static void case8Height4(const std::string& d) {
         auto r = t.get(key(k));
         CHECK(r && r->vptr.offset == static_cast<uint32_t>(k));
     }
-    p->closeClean();
+    p->checkpoint(*r.sbm, Pager::CommitInfo{});
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     std::cout << "after clean close + reopen: height 4, all " << kKeys << " keys in order, 2000 random gets OK; "
               << "bytes written " << bytesWritten() - bytes0 << "; " << ms << " ms\n";
@@ -665,7 +674,7 @@ static void case9IoFailure(const std::string& base) {
         accountBytes(vb, "case 9 child vLog");
 
         auto st = IndexedStore::open(d, storeOpts());
-        CHECK(st->openInfo().rebuilt && st->openInfo().initial_status == OpenStatus::NotClean);
+        CHECK(st->openInfo().rebuilt && st->openInfo().initial_status == OpenStatus::NoSuperblock);
         for (const Ack& x : acks) {
             uint64_t seq = 0;
             std::optional<std::string> doc = st->get(case9Key(x.id), &seq);

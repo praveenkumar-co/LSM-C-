@@ -1,16 +1,22 @@
 #pragma once
-// Pager.hpp - fixed-size page cache over index.db. See docs/PHASE2_PLAN.md sections 1.6 and 1.7.
+// Pager.hpp - fixed-size page cache over index.db.
 //
 // - N frames, LRU eviction of unpinned frames, all frame state behind one std::mutex.
-// - Load: pread 4096 bytes, then check CRC/magic/page_id/type. Any failure aborts: after a
-//   clean open the meta page already says clean_shutdown = 0, so the next open rebuilds.
-// - Write-back: recompute CRC, pwrite 4096 bytes. No fsync on eviction (the file is only
-//   trusted after a clean close).
+// - Page 0 is a static header (magic, format version, page size, random nonce), written and
+//   fsynced once at creation and never modified.
+// - Tree state (root, height, key count, page count) is kept in memory. It becomes durable only
+//   through checkpoint(): write back dirty frames, F_FULLFSYNC index.db, then commit a
+//   superblock that names the root and page count (SuperblockManager.hpp).
+// - Load: pread 4096 bytes, then check CRC/magic/page_id/type. Any failure aborts.
+// - Write-back: recompute CRC, pwrite 4096 bytes. No fsync on eviction.
 // - Every syscall return value is checked. A failed fsync aborts and is never retried.
 
 #include "index/BPTreeFormat.hpp"
+#include "index/IndexCommon.hpp"
+#include "index/SuperblockManager.hpp"
 #include "vlog/VLogReader.hpp"  // vlog::full_fsync
 
+#include <chrono>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -19,6 +25,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -29,26 +36,31 @@
 
 namespace bpt {
 
-[[noreturn]] inline void fatal(const std::string& msg) {
-    int e = errno;
-    if (e != 0) {
-        std::fprintf(stderr, "Fatal (index): %s (errno %d: %s). Aborting.\n", msg.c_str(), e, std::strerror(e));
-    } else {
-        std::fprintf(stderr, "Fatal (index): %s. Aborting.\n", msg.c_str());
-    }
-    std::abort();
-}
-
-enum class OpenStatus { Ok, Missing, BadMeta, NotClean, SizeMismatch, VLogMismatch };
+// What opening the committed index found. Anything but Ok leads to a full rebuild from the vLog
+// (VLogBehindError is the one exception: see IndexRecovery.hpp).
+enum class OpenStatus {
+    Ok,                 // superblock, header, nonce, vLog identity, file size and tree pages all check out
+    Missing,            // index.db does not exist
+    BadHeader,          // index.db header page fails its checks
+    NoSuperblock,       // index.db exists but superblock.db does not
+    SuperblockCorrupt,  // both superblock slots invalid
+    IndexMismatch,      // superblock describes a different index.db (nonce differs)
+    VLogMismatch,       // superblock was written for a different vLog
+    SizeMismatch,       // index.db is shorter than the committed page count
+    TreeCorrupt,        // a page of the committed tree fails its CRC or structure checks
+};
 
 inline const char* toString(OpenStatus s) {
     switch (s) {
-        case OpenStatus::Ok:           return "Ok";
-        case OpenStatus::Missing:      return "Missing";
-        case OpenStatus::BadMeta:      return "BadMeta";
-        case OpenStatus::NotClean:     return "NotClean";
-        case OpenStatus::SizeMismatch: return "SizeMismatch";
-        case OpenStatus::VLogMismatch: return "VLogMismatch";
+        case OpenStatus::Ok:                return "Ok";
+        case OpenStatus::Missing:           return "Missing";
+        case OpenStatus::BadHeader:         return "BadHeader";
+        case OpenStatus::NoSuperblock:      return "NoSuperblock";
+        case OpenStatus::SuperblockCorrupt: return "SuperblockCorrupt";
+        case OpenStatus::IndexMismatch:     return "IndexMismatch";
+        case OpenStatus::VLogMismatch:      return "VLogMismatch";
+        case OpenStatus::SizeMismatch:      return "SizeMismatch";
+        case OpenStatus::TreeCorrupt:       return "TreeCorrupt";
     }
     return "?";
 }
@@ -104,85 +116,97 @@ public:
 
     struct Stats {
         uint64_t page_reads = 0;
-        uint64_t page_writes = 0;  // includes meta page writes
+        uint64_t page_writes = 0;
         uint64_t evictions = 0;
         uint64_t fsyncs = 0;
     };
 
-    // Creates a new file (O_CREAT | O_EXCL): meta page (clean_shutdown = 0) and an empty root leaf.
-    // The meta page is written and fsynced before returning; the root leaf is written at flush/close.
+    // A verified committed tree (IndexRecovery.hpp checks it before calling openCommitted).
+    struct Committed {
+        page_id_t root = kNoPage;
+        uint32_t page_count = 0;
+        uint32_t height = 0;
+        uint64_t key_count = 0;
+        uint64_t epoch = 0;
+    };
+
+    // What the next superblock records besides the tree itself.
+    struct CommitInfo {
+        uint64_t checkpoint_seq = 0;      // every vLog entry with seq <= this is reflected in the tree
+        uint32_t replay_segment = 0;      // redo scan starts here (0: from the first segment)
+        uint32_t replay_offset = vlog::kBlockSize;
+        uint32_t vlog_first_segment = 0;  // vLog identity
+        uint64_t vlog_created_ns = 0;
+    };
+
+    struct CheckpointStats {
+        uint64_t epoch = 0;
+        uint64_t pages_written = 0;   // dirty pages written back by this checkpoint
+        uint64_t bytes_written = 0;   // pages + the 4096-byte superblock slot
+        uint32_t page_count = 0;
+        page_id_t root = kNoPage;
+    };
+
+    // Creates a new file (O_CREAT | O_EXCL): header page (fsynced) and an empty root leaf
+    // (dirty in the cache; written at the first checkpoint or eviction).
     static std::unique_ptr<Pager> create(const std::string& path, Options opts) {
         int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
         if (fd < 0) fatal("open(O_CREAT|O_EXCL) failed for " + path);
         std::unique_ptr<Pager> p(new Pager(path, fd, opts));
-        p->meta_ = MetaBody{};
-        p->meta_.magic = kMetaMagic;
-        p->meta_.format_version = kIndexFormatVersion;
-        p->meta_.page_size = kPageSize;
-        p->meta_.page_count = 1;  // page 0 (meta)
-        p->meta_.tree_height = 1;
-        p->meta_.clean_shutdown = 0;
-        p->meta_.open_count = 1;
+        p->nonce_ = newNonce();
+        p->page_count_ = 1;  // page 0 (header)
+        p->height_ = 1;
+        p->writeHeaderLocked();
+        p->fsyncOrDie("F_FULLFSYNC after create of " + path);
         {
             PageGuard root = p->allocate(PageType::Leaf, 0);
-            p->meta_.root_page_id = root.id();
+            p->root_ = root.id();
         }
-        p->writeMetaLocked();
-        p->fsyncOrDie("F_FULLFSYNC after create of " + path);
         return p;
     }
 
-    // Opens an existing file for use. Returns nullptr (and sets *status) if the file is missing
-    // or not trusted. On success the meta page is rewritten with clean_shutdown = 0 and fsynced
-    // before any page can be modified.
-    static std::unique_ptr<Pager> open(const std::string& path, Options opts, OpenStatus* status) {
-        int fd = ::open(path.c_str(), O_RDWR);
-        if (fd < 0) {
-            if (errno == ENOENT) { *status = OpenStatus::Missing; return nullptr; }
-            fatal("open failed for " + path);
-        }
-        MetaBody m{};
-        OpenStatus st = readAndCheckMeta(fd, &m);
-        if (st != OpenStatus::Ok) {
-            if (::close(fd) != 0) fatal("close failed for " + path);
-            *status = st;
-            return nullptr;
-        }
-        std::unique_ptr<Pager> p(new Pager(path, fd, opts));
-        p->meta_ = m;
-        p->meta_.clean_shutdown = 0;
-        p->meta_.open_count++;
-        p->writeMetaLocked();
-        p->fsyncOrDie("F_FULLFSYNC after open of " + path);
-        *status = OpenStatus::Ok;
-        return p;
-    }
-
-    // Reads and checks the meta page of a file without opening it for use (tests, diagnostics).
-    static OpenStatus inspect(const std::string& path, MetaBody* out) {
+    // Reads and checks the header page. Does not modify the file.
+    static OpenStatus readHeader(const std::string& path, MetaBody* out) {
         int fd = ::open(path.c_str(), O_RDONLY);
         if (fd < 0) {
             if (errno == ENOENT) return OpenStatus::Missing;
             fatal("open failed for " + path);
         }
-        OpenStatus st = readAndCheckMeta(fd, out);
+        OpenStatus st = readHeaderFd(fd, out);
         if (::close(fd) != 0) fatal("close failed for " + path);
         return st;
+    }
+
+    // Opens a file whose committed tree was already verified. The header must still match.
+    static std::unique_ptr<Pager> openCommitted(const std::string& path, Options opts, const Committed& c) {
+        int fd = ::open(path.c_str(), O_RDWR);
+        if (fd < 0) fatal("open failed for " + path);
+        MetaBody m{};
+        if (readHeaderFd(fd, &m) != OpenStatus::Ok) {
+            errno = 0;
+            fatal("index.db header changed after verification: " + path);
+        }
+        std::unique_ptr<Pager> p(new Pager(path, fd, opts));
+        p->nonce_ = m.index_nonce;
+        p->root_ = c.root;
+        p->height_ = c.height;
+        p->key_count_ = c.key_count;
+        p->page_count_ = c.page_count;
+        p->epoch_ = c.epoch;
+        return p;
     }
 
     Pager(const Pager&) = delete;
     Pager& operator=(const Pager&) = delete;
 
-    // Without closeClean(), the file keeps clean_shutdown = 0 on disk, so the next open rebuilds.
     ~Pager() {
         if (fd_ >= 0 && ::close(fd_) != 0) fatal("close failed for " + path_);
     }
 
     PageGuard fetch(page_id_t id) {
         std::lock_guard<std::mutex> lk(mu_);
-        if (id == kMetaPageId || id >= meta_.page_count) {
-            fatal("fetch of invalid page id " + std::to_string(id) + " (page_count " +
-                  std::to_string(meta_.page_count) + ")");
+        if (id == kMetaPageId || id >= page_count_) {
+            fatal("fetch of invalid page id " + std::to_string(id) + " (page_count " + std::to_string(page_count_) + ")");
         }
         auto it = table_.find(id);
         if (it != table_.end()) {
@@ -209,8 +233,8 @@ public:
     // New page: id = page_count++, zeroed frame with an empty header, pinned and dirty.
     PageGuard allocate(PageType type, uint8_t level) {
         std::lock_guard<std::mutex> lk(mu_);
-        if (meta_.page_count == UINT32_MAX) fatal("index.db page id space exhausted");
-        page_id_t id = meta_.page_count++;
+        if (page_count_ == UINT32_MAX) fatal("index.db page id space exhausted");
+        page_id_t id = page_count_++;
         uint32_t f = takeVictimLocked();
         initPage(frameData(f), id, type, level);
         installLocked(f, id, /*dirty=*/true);
@@ -223,22 +247,47 @@ public:
         flushDirtyLocked();
     }
 
-    // Clean close (plan 1.7): write back dirty frames, fsync, write meta with clean_shutdown = 1,
-    // fsync, close. `after_flush` runs between the first fsync and the meta write (crash tests).
-    void closeClean(const std::function<void()>& after_flush = nullptr) {
+    // Writes back every dirty frame, then F_FULLFSYNC.
+    void flushAndSync() {
         std::lock_guard<std::mutex> lk(mu_);
-        if (fd_ < 0) fatal("closeClean on a closed pager");
-        for (const Frame& fr : frames_) {
-            if (fr.pins != 0) fatal("closeClean with a pinned page " + std::to_string(fr.page_id));
-        }
         flushDirtyLocked();
-        fsyncOrDie("F_FULLFSYNC of pages during clean close of " + path_);
-        if (after_flush) after_flush();
-        meta_.clean_shutdown = 1;
-        writeMetaLocked();
-        fsyncOrDie("F_FULLFSYNC of meta page during clean close of " + path_);
-        if (::close(fd_) != 0) fatal("close failed for " + path_);
-        fd_ = -1;
+        fsyncOrDie("F_FULLFSYNC of " + path_);
+    }
+
+    // Makes the current tree durable: write back dirty frames, F_FULLFSYNC index.db,
+    // (after_index_fsync hook), then commit superblock epoch+1. The caller must hold the tree's
+    // exclusive lock (or be the only user). No page may be pinned.
+    CheckpointStats checkpoint(SuperblockManager& sbm, const CommitInfo& ci,
+                               const std::function<void()>& after_index_fsync = nullptr) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (fd_ < 0) fatal("checkpoint on a closed pager");
+        for (const Frame& fr : frames_) {
+            if (fr.pins != 0) fatal("checkpoint with a pinned page " + std::to_string(fr.page_id));
+        }
+        const uint64_t writes0 = stats_.page_writes;
+        flushDirtyLocked();
+        fsyncOrDie("F_FULLFSYNC of index pages during checkpoint of " + path_);
+        if (after_index_fsync) after_index_fsync();
+        SuperblockRecord rec;
+        rec.sb.epoch = epoch_ + 1;
+        rec.sb.checkpoint_seq = ci.checkpoint_seq;
+        rec.sb.replay_segment_id = ci.replay_segment;
+        rec.sb.replay_offset = ci.replay_offset;
+        rec.sb.index_root_page = root_;
+        rec.sb.index_page_count = page_count_;
+        rec.sb.oldest_live_segment = ci.vlog_first_segment;
+        rec.ext.index_nonce = nonce_;
+        rec.ext.vlog_first_segment = ci.vlog_first_segment;
+        rec.ext.vlog_created_ns = ci.vlog_created_ns;
+        sbm.commit(rec);
+        epoch_++;
+        CheckpointStats cs;
+        cs.epoch = epoch_;
+        cs.pages_written = stats_.page_writes - writes0;
+        cs.bytes_written = cs.pages_written * kPageSize + kSuperSlotSize;
+        cs.page_count = page_count_;
+        cs.root = root_;
+        return cs;
     }
 
     // Test helper: writes back dirty frames, then preads every page and runs checkPage on it.
@@ -247,7 +296,7 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         flushDirtyLocked();
         std::vector<uint8_t> buf(kPageSize);
-        for (page_id_t id = 0; id < meta_.page_count; ++id) {
+        for (page_id_t id = 0; id < page_count_; ++id) {
             ssize_t r = ::pread(fd_, buf.data(), kPageSize, static_cast<off_t>(id) * kPageSize);
             if (r != static_cast<ssize_t>(kPageSize)) return "short pread of page " + std::to_string(id);
             std::string why;
@@ -256,25 +305,25 @@ public:
         return "";
     }
 
-    // Meta fields. The tree changes root/height/key_count/max_applied_seq under its exclusive lock.
-    page_id_t rootPageId() const { return meta_.root_page_id; }
-    uint32_t treeHeight() const { return meta_.tree_height; }
-    uint64_t keyCount() const { return meta_.key_count; }
-    uint64_t maxAppliedSeq() const { return meta_.max_applied_seq; }
-    uint64_t openCount() const { return meta_.open_count; }
+    // Tree state. The tree changes root/height/key_count/max_applied_seq under its exclusive lock.
+    page_id_t rootPageId() const { return root_; }
+    uint32_t treeHeight() const { return height_; }
+    uint64_t keyCount() const { return key_count_; }
+    uint64_t maxAppliedSeq() const { return max_applied_seq_; }
     uint32_t pageCount() const {
         std::lock_guard<std::mutex> lk(mu_);
-        return meta_.page_count;
+        return page_count_;
     }
-    void setRoot(page_id_t root, uint32_t height) { meta_.root_page_id = root; meta_.tree_height = height; }
-    void setKeyCount(uint64_t n) { meta_.key_count = n; }
-    void setMaxAppliedSeq(uint64_t s) { meta_.max_applied_seq = s; }
-    uint32_t vlogFirstSegment() const { return meta_.vlog_first_segment; }
-    uint64_t vlogCreatedNs() const { return meta_.vlog_created_ns; }
-    void setVLogIdentity(uint32_t first_segment, uint64_t created_ns) {
-        meta_.vlog_first_segment = first_segment;
-        meta_.vlog_created_ns = created_ns;
+    void setRoot(page_id_t root, uint32_t height) { root_ = root; height_ = height; }
+    void setKeyCount(uint64_t n) { key_count_ = n; }
+    void setMaxAppliedSeq(uint64_t s) { max_applied_seq_ = s; }
+    uint64_t nonce() const { return nonce_; }
+    uint64_t committedEpoch() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return epoch_;
     }
+    // After index.db.rebuild is renamed to index.db (the open fd stays valid).
+    void setPath(const std::string& p) { path_ = p; }
 
     Stats stats() const {
         std::lock_guard<std::mutex> lk(mu_);
@@ -294,8 +343,7 @@ private:
         std::list<uint32_t>::iterator lru_it;
     };
 
-    Pager(const std::string& path, int fd, const Options& opts)
-        : path_(path), fd_(fd), opts_(opts) {
+    Pager(const std::string& path, int fd, const Options& opts) : path_(path), fd_(fd), opts_(opts) {
         if (opts_.num_frames < kMinFrames) {
             errno = 0;
             fatal("Pager needs at least " + std::to_string(kMinFrames) + " frames");
@@ -305,27 +353,27 @@ private:
         for (size_t i = opts_.num_frames; i-- > 0;) free_frames_.push_back(static_cast<uint32_t>(i));
     }
 
-    // Validates the meta page and the file size. Does not modify the file.
-    static OpenStatus readAndCheckMeta(int fd, MetaBody* out) {
+    static uint64_t newNonce() {
+        std::random_device rd;
+        uint64_t a = (static_cast<uint64_t>(rd()) << 32) ^ rd();
+        uint64_t t = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+        uint64_t n = a ^ (t * 0x9E3779B97F4A7C15ULL) ^ static_cast<uint64_t>(::getpid());
+        return n == 0 ? 1 : n;
+    }
+
+    static OpenStatus readHeaderFd(int fd, MetaBody* out) {
         uint8_t page[kPageSize];
         ssize_t r = ::pread(fd, page, kPageSize, 0);
-        if (r < 0) fatal("pread of meta page failed");
-        if (r != static_cast<ssize_t>(kPageSize)) return OpenStatus::BadMeta;
-        if (!checkPage(page, kMetaPageId, nullptr)) return OpenStatus::BadMeta;
+        if (r < 0) fatal("pread of header page failed");
+        if (r != static_cast<ssize_t>(kPageSize)) return OpenStatus::BadHeader;
+        if (!checkPage(page, kMetaPageId, nullptr)) return OpenStatus::BadHeader;
         MetaBody m;
         std::memcpy(&m, page + kHeaderSize, sizeof(m));
         if (m.magic != kMetaMagic || m.format_version != kIndexFormatVersion || m.page_size != kPageSize ||
-            m.page_count < 2 || m.root_page_id == kNoPage || m.root_page_id >= m.page_count ||
-            m.tree_height == 0 || m.reserved1 != 0) {
-            return OpenStatus::BadMeta;
+            m.index_nonce == 0 || m.reserved1 != 0) {
+            return OpenStatus::BadHeader;
         }
         *out = m;
-        if (m.clean_shutdown != 1) return OpenStatus::NotClean;
-        struct stat st;
-        if (::fstat(fd, &st) != 0) fatal("fstat of index file failed");
-        if (static_cast<uint64_t>(st.st_size) != static_cast<uint64_t>(m.page_count) * kPageSize) {
-            return OpenStatus::SizeMismatch;
-        }
         return OpenStatus::Ok;
     }
 
@@ -340,10 +388,15 @@ private:
         stats_.fsyncs++;
     }
 
-    void writeMetaLocked() {
+    void writeHeaderLocked() {
         uint8_t page[kPageSize];
         initPage(page, kMetaPageId, PageType::Meta, 0);
-        std::memcpy(page + kHeaderSize, &meta_, sizeof(meta_));
+        MetaBody m{};
+        m.magic = kMetaMagic;
+        m.format_version = kIndexFormatVersion;
+        m.page_size = kPageSize;
+        m.index_nonce = nonce_;
+        std::memcpy(page + kHeaderSize, &m, sizeof(m));
         uint32_t crc = computePageCrc(page);
         std::memcpy(page, &crc, sizeof(crc));
         writePageBytesLocked(page, kMetaPageId);
@@ -433,9 +486,17 @@ private:
     std::string path_;
     int fd_{-1};
     Options opts_;
-    MetaBody meta_{};
+    uint64_t nonce_ = 0;
+
+    // Tree state (in memory; durable only through checkpoint()).
+    page_id_t root_ = kNoPage;
+    uint32_t height_ = 0;
+    uint64_t key_count_ = 0;
+    uint64_t max_applied_seq_ = 0;
 
     mutable std::mutex mu_;
+    uint32_t page_count_ = 0;  // guarded by mu_
+    uint64_t epoch_ = 0;       // last committed superblock epoch; guarded by mu_
     std::vector<Frame> frames_;
     std::unique_ptr<uint8_t[]> buffer_;
     std::vector<uint32_t> free_frames_;

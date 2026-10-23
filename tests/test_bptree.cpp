@@ -192,8 +192,28 @@ static void testB1PageCrcBitFlips() {
     std::cout << "PASS: all " << total_bits << " single-bit flips of a 4096-byte page fail checkPage.\n";
 }
 
+static std::unique_ptr<bpt::SuperblockManager> newSbm(const std::string& dir) {
+    bpt::SuperblockManager::Options so;
+    so.on_write = [](uint64_t n) { accountBytes(n, "superblock.db write"); };
+    auto m = std::make_unique<bpt::SuperblockManager>(dir + "/superblock.db", so);
+    m->load();
+    return m;
+}
+
+static bpt::SuperblockManager::LoadResult loadSb(const std::string& dir) {
+    bpt::SuperblockManager m(dir + "/superblock.db");
+    return m.load();
+}
+
+// Checkpoint for tree-only tests (no vLog): replay point "from the beginning".
+static Pager::CheckpointStats checkpointNoVLog(Pager& p, bpt::SuperblockManager& sbm, uint64_t seq = 0) {
+    Pager::CommitInfo ci;
+    ci.checkpoint_seq = seq;
+    return p.checkpoint(sbm, ci);
+}
+
 static void testB1MetaSurvivesReopen(const std::string& dir) {
-    banner("B1.2 Pager allocate/read/write, eviction, meta survives reopen");
+    banner("B1.2 Pager allocate/read/write, eviction, checkpoint, reopen from the superblock");
     CHECK(mkdir(dir.c_str(), 0755) == 0);
     const std::string path = dir + "/index.db";
     const uint32_t kPages = 200;  // with 16 frames: constant eviction and reload
@@ -222,126 +242,114 @@ static void testB1MetaSurvivesReopen(const std::string& dir) {
             PageGuard g = p->fetch(id);
             CHECK(checkPattern(g.data(), id, (id % 2) ? 2 : 1));
         }
-        p->setRoot(1, 1);
-        p->setKeyCount(12345);
-        p->setMaxAppliedSeq(987654321);
         std::string err = p->verifyPagesOnDisk();
         CHECK(err.empty());
         Pager::Stats s = p->stats();
         std::cout << "Session 1: pages " << p->pageCount() << ", frames 16, reads " << s.page_reads << ", writes "
                   << s.page_writes << ", evictions " << s.evictions << "\n";
         CHECK(s.evictions > 0);
-        p->closeClean();
+        auto sbm = newSbm(dir);
+        Pager::CheckpointStats cs = checkpointNoVLog(*p, *sbm, 987654321);
+        CHECK(cs.epoch == 1 && cs.page_count == 2 + kPages);
     }
 
-    bpt::MetaBody m{};
-    CHECK(Pager::inspect(path, &m) == OpenStatus::Ok);
-    std::cout << "On disk after clean close: clean_shutdown=" << m.clean_shutdown << " page_count=" << m.page_count
-              << " key_count=" << m.key_count << " max_applied_seq=" << m.max_applied_seq
-              << " open_count=" << m.open_count << " file_size=" << fileSize(path) << "\n";
-    CHECK(m.clean_shutdown == 1);
-    CHECK(m.page_count == 2 + kPages);
-    CHECK(m.key_count == 12345 && m.max_applied_seq == 987654321 && m.open_count == 1);
-    CHECK(fileSize(path) == uint64_t(m.page_count) * kPageSize);
+    bpt::SuperblockManager::LoadResult r1 = loadSb(dir);
+    CHECK(r1.status == bpt::SuperblockManager::LoadResult::Status::Ok);
+    std::cout << "superblock after checkpoint 1: slot " << r1.current_slot << ", epoch " << r1.current.sb.epoch
+              << ", root " << r1.current.sb.index_root_page << ", page_count " << r1.current.sb.index_page_count
+              << ", checkpoint_seq " << r1.current.sb.checkpoint_seq << "; index.db size " << fileSize(path) << "\n";
+    CHECK(r1.current_slot == 0 && r1.current.sb.epoch == 1 && r1.current.sb.index_root_page == 1);
+    CHECK(r1.current.sb.index_page_count == 2 + kPages && r1.current.sb.checkpoint_seq == 987654321);
+    CHECK(fileSize(path) == uint64_t(2 + kPages) * kPageSize);
 
     {
-        OpenStatus st;
-        auto p = Pager::open(path, pagerOpts(32), &st);
-        CHECK(st == OpenStatus::Ok && p != nullptr);
-        CHECK(p->pageCount() == 2 + kPages && p->keyCount() == 12345 && p->maxAppliedSeq() == 987654321);
-        CHECK(p->openCount() == 2);
-        bpt::MetaBody m2{};
-        CHECK(Pager::inspect(path, &m2) == OpenStatus::NotClean);  // clean flag cleared on disk at open
-        std::cout << "On disk right after open: clean_shutdown=" << m2.clean_shutdown << " open_count=" << m2.open_count
-                  << "\n";
-        CHECK(m2.clean_shutdown == 0 && m2.open_count == 2);
+        bpt::OpenIndexResult r = bpt::openCommittedIndex(dir, pagerOpts(32));
+        CHECK(r.initial_status == OpenStatus::Ok && r.pager != nullptr);
+        Pager& p = *r.pager;
+        CHECK(p.pageCount() == 2 + kPages && p.rootPageId() == 1 && p.keyCount() == 0 && p.committedEpoch() == 1);
+        CHECK(r.checkpoint_seq == 987654321);
         for (uint32_t id = 2; id < 2 + kPages; ++id) {
-            PageGuard g = p->fetch(id);
+            PageGuard g = p.fetch(id);
             CHECK(checkPattern(g.data(), id, (id % 2) ? 2 : 1));
         }
-        p->closeClean();
+        Pager::CheckpointStats cs = checkpointNoVLog(p, *r.sbm, 987654322);
+        CHECK(cs.epoch == 2 && cs.pages_written == 0);
     }
-    std::cout << "Reopen with 32 frames: all " << kPages << " page patterns and meta fields match.\n";
-
-    // Open, then drop the pager without closeClean (simulated crash): next open must refuse.
-    {
-        OpenStatus st;
-        auto p = Pager::open(path, pagerOpts(16), &st);
-        CHECK(st == OpenStatus::Ok);
-    }
-    {
-        OpenStatus st;
-        auto p = Pager::open(path, pagerOpts(16), &st);
-        CHECK(p == nullptr && st == OpenStatus::NotClean);
-        std::cout << "Open after a close without closeClean: " << bpt::toString(st) << "\n";
-    }
-    std::cout << "PASS: meta survives clean close + reopen; clean_shutdown is 1 after close, 0 after open; an "
-                 "unclean close is refused.\n";
+    bpt::SuperblockManager::LoadResult r2 = loadSb(dir);
+    CHECK(r2.current_slot == 1 && r2.current.sb.epoch == 2 && r2.has_older && r2.older.sb.epoch == 1);
+    std::cout << "Reopen with 32 frames: all " << kPages << " page patterns match; checkpoint 2 went to slot 1 (slot 0 "
+                 "keeps epoch 1).\n";
+    std::cout << "PASS: pages survive checkpoint + reopen; the superblock records root, page count and checkpoint seq.\n";
 }
 
-static void testB1Corruption(const std::string& dir) {
-    banner("B1.3 Corruption: flipped bit in a page, in the meta page, wrong file size");
-    CHECK(mkdir(dir.c_str(), 0755) == 0);
-    const std::string path = dir + "/index.db";
-    {
-        auto p = Pager::create(path, pagerOpts(16));
-        for (uint32_t i = 0; i < 10; ++i) {
+static void testB1Corruption(const std::string& base) {
+    banner("B1.3 Corruption: page bit flip, tree page bit flip, header bit flip, wrong size, missing files");
+    CHECK(mkdir(base.c_str(), 0755) == 0);
+    auto makeIndex = [&](const std::string& dir, uint32_t extra_pages) {
+        CHECK(mkdir(dir.c_str(), 0755) == 0);
+        auto p = Pager::create(dir + "/index.db", pagerOpts(16));
+        for (uint32_t i = 0; i < extra_pages; ++i) {
             PageGuard g = p->allocate(PageType::Leaf, 0);
             writePattern(g.data(), g.id(), 1);
             g.markDirty();
         }
-        p->closeClean();
-    }
-    // Flip one bit in the middle of page 5.
-    flipBitInFile(path, 5ULL * kPageSize + 2000, 3);
-    std::cout << "Flipped bit 3 of byte 2000 in page 5.\n";
-
-    // Meta is intact, so open succeeds. Page 4 loads; page 5 must abort in the checker.
+        auto sbm = newSbm(dir);
+        checkpointNoVLog(*p, *sbm);
+    };
+    const std::string d1 = base + "/a";
+    makeIndex(d1, 10);
+    // Flip one bit in the middle of page 5 (not part of the committed tree: the tree is root page 1).
+    flipBitInFile(d1 + "/index.db", 5ULL * kPageSize + 2000, 3);
+    std::cout << "Flipped bit 3 of byte 2000 in page 5 (outside the committed tree).\n";
     std::cout << "Child: open, fetch page 4, fetch page 5 (expected to abort). Child stderr follows:\n";
     int status = runInChild([&]() {
         childExpectsAbort();
-        OpenStatus st;
-        auto p = Pager::open(path, pagerOpts(16), &st);
-        CHECK(st == OpenStatus::Ok);
-        { PageGuard g = p->fetch(4); CHECK(checkPattern(g.data(), 4, 1)); }
-        { PageGuard g = p->fetch(5); }
+        bpt::OpenIndexResult r = bpt::openCommittedIndex(d1, pagerOpts(16));
+        CHECK(r.initial_status == OpenStatus::Ok);
+        { PageGuard g = r.pager->fetch(4); CHECK(checkPattern(g.data(), 4, 1)); }
+        { PageGuard g = r.pager->fetch(5); }
         std::cerr << "child: page 5 loaded without error (unexpected)\n";
         _exit(3);
     });
     std::cout << "Child status: " << (diedWithSigabrt(status) ? "killed by SIGABRT" : "NOT SIGABRT") << "\n";
     CHECK(diedWithSigabrt(status));
-    bpt::MetaBody m{};
-    OpenStatus st_after = Pager::inspect(path, &m);
-    std::cout << "Meta after the child's abort: " << bpt::toString(st_after) << " (clean_shutdown=" << m.clean_shutdown
-              << ")\n";
-    CHECK(st_after == OpenStatus::NotClean);  // the child's open cleared the flag, so the next open rebuilds
 
-    // Wrong file size after a clean close.
-    const std::string path2 = dir + "/index2.db";
-    {
-        auto p = Pager::create(path2, pagerOpts(16));
-        p->closeClean();
-    }
-    CHECK(Pager::inspect(path2, &m) == OpenStatus::Ok);
+    // A bit flip in a page of the committed tree is found by the open-time tree walk.
+    flipBitInFile(d1 + "/index.db", 1ULL * kPageSize + 1000, 6);
+    bpt::OpenIndexResult r = bpt::openCommittedIndex(d1, pagerOpts(16));
+    std::cout << "Flipped a bit in root page 1: " << bpt::toString(r.initial_status) << " (" << r.why << ")\n";
+    CHECK(r.pager == nullptr && r.initial_status == OpenStatus::TreeCorrupt);
+
+    const std::string d2 = base + "/b";
+    makeIndex(d2, 0);
+    const std::string path2 = d2 + "/index.db";
+    CHECK(bpt::openCommittedIndex(d2, pagerOpts(16)).initial_status == OpenStatus::Ok);
     CHECK(truncate(path2.c_str(), 3 * kPageSize) == 0);
     accountBytes(kPageSize, "test truncate (extend by one page)");
-    OpenStatus st;
-    CHECK(Pager::open(path2, pagerOpts(16), &st) == nullptr && st == OpenStatus::SizeMismatch);
-    std::cout << "File extended to 3 pages after clean close: " << bpt::toString(st) << "\n";
+    r = bpt::openCommittedIndex(d2, pagerOpts(16));
+    CHECK(r.pager == nullptr && r.initial_status == OpenStatus::SizeMismatch);
+    std::cout << "File extended to 3 pages after checkpoint: " << bpt::toString(r.initial_status) << "\n";
     CHECK(truncate(path2.c_str(), 2 * kPageSize) == 0);
-    CHECK(Pager::inspect(path2, &m) == OpenStatus::Ok);
+    CHECK(bpt::openCommittedIndex(d2, pagerOpts(16)).initial_status == OpenStatus::Ok);
 
-    // Flip one bit in the meta body.
+    // Flip one bit in the header body.
     flipBitInFile(path2, 32 + 17, 0);
-    CHECK(Pager::open(path2, pagerOpts(16), &st) == nullptr && st == OpenStatus::BadMeta);
-    std::cout << "Flipped bit in meta page: " << bpt::toString(st) << "\n";
+    r = bpt::openCommittedIndex(d2, pagerOpts(16));
+    CHECK(r.pager == nullptr && r.initial_status == OpenStatus::BadHeader);
+    std::cout << "Flipped bit in header page: " << bpt::toString(r.initial_status) << "\n";
 
-    // Missing file.
-    CHECK(Pager::open(dir + "/nope.db", pagerOpts(16), &st) == nullptr && st == OpenStatus::Missing);
-    std::cout << "PASS: page bit flip aborts the reader; meta bit flip -> BadMeta; wrong size -> SizeMismatch; "
-                 "missing -> Missing.\n";
+    const std::string d3 = base + "/c";
+    makeIndex(d3, 0);
+    CHECK(unlink((d3 + "/superblock.db").c_str()) == 0);
+    r = bpt::openCommittedIndex(d3, pagerOpts(16));
+    CHECK(r.pager == nullptr && r.initial_status == OpenStatus::NoSuperblock);
+    std::cout << "superblock.db deleted: " << bpt::toString(r.initial_status) << "\n";
+    CHECK(unlink((d3 + "/index.db").c_str()) == 0);
+    r = bpt::openCommittedIndex(d3, pagerOpts(16));
+    CHECK(r.pager == nullptr && r.initial_status == OpenStatus::Missing);
+    std::cout << "PASS: page outside the tree aborts the reader; tree page bit flip -> TreeCorrupt; header bit flip -> "
+                 "BadHeader; wrong size -> SizeMismatch; no superblock -> NoSuperblock; no index.db -> Missing.\n";
 }
-
 
 // ------------------------------------------------------------------------------------------
 // B2. Single-leaf tree
@@ -785,7 +793,7 @@ static void vlogOps(vlog::VLogWriter& w, BPTree& t, Oracle& o, const std::vector
 }
 
 static void testB4CleanReopen(const std::string& dir) {
-    banner("B4.1 Clean close + reopen equals the oracle (T3)");
+    banner("B4.1 Checkpoint + reopen equals the oracle (T3)");
     CHECK(mkdir(dir.c_str(), 0755) == 0);
     const std::string path = dir + "/index.db";
     const uint64_t seed = 401;
@@ -800,34 +808,35 @@ static void testB4CleanReopen(const std::string& dir) {
         BPTree t(*p);
         runRandomOps(t, o, keys, rng, seq, kQuick ? 10000 : 50000, 0, &res);
         checkTree(t);
-        p->closeClean();
+        auto sbm = newSbm(dir);
+        checkpointNoVLog(*p, *sbm, seq);
     }
     struct Round { size_t frames; int more_ops; };
     const int more = kQuick ? 1000 : 10000;
+    uint64_t epoch = 1;
     for (Round rd : {Round{1024, more}, Round{64, more}, Round{16, 0}}) {
-        bpt::MetaBody m{};
-        CHECK(Pager::inspect(path, &m) == OpenStatus::Ok && m.clean_shutdown == 1);
-        OpenStatus st;
-        auto p = Pager::open(path, pagerOpts(rd.frames), &st);
-        CHECK(st == OpenStatus::Ok);
-        CHECK(Pager::inspect(path, &m) == OpenStatus::NotClean && m.clean_shutdown == 0);
-        BPTree t(*p);
+        bpt::SuperblockManager::LoadResult sl = loadSb(dir);
+        CHECK(sl.status == bpt::SuperblockManager::LoadResult::Status::Ok && sl.current.sb.epoch == epoch);
+        bpt::OpenIndexResult r = bpt::openCommittedIndex(dir, pagerOpts(rd.frames));
+        CHECK(r.initial_status == OpenStatus::Ok && r.checkpoint_seq == seq);
+        BPTree t(*r.pager);
         BPTree::Shape sh;
         checkTree(t, &sh);
         checkFullEq(t, o, "after reopen");
-        std::cout << "reopen #" << p->openCount() - 1 << " with " << rd.frames << " frames: on-disk clean_shutdown 1 -> 0, "
-                  << o.size() << " keys == oracle, height " << sh.height << ", pages " << p->pageCount() << "\n";
+        std::cout << "reopen at epoch " << epoch << " with " << rd.frames << " frames: " << o.size()
+                  << " keys == oracle, height " << sh.height << ", pages " << r.pager->pageCount() << "\n";
         if (rd.more_ops > 0) {
             runRandomOps(t, o, keys, rng, seq, rd.more_ops, 0, &res);
             checkFullEq(t, o, "after more ops");
             checkTree(t);
         }
-        p->closeClean();
+        checkpointNoVLog(*r.pager, *r.sbm, seq);
+        epoch++;
     }
     std::cout << "bytes written by this test: " << (bytesWritten() - bytes_before) << "\n";
     std::cout << "ops total: put " << res.puts << ", get " << res.gets << ", erase " << res.erases << ", scan "
               << res.scans << " (seed " << seed << ")\n";
-    std::cout << "PASS: " << (kQuick ? 10000 : 50000) << " ops + clean close; reopened with 1024, 64, 16 frames ("
+    std::cout << "PASS: " << (kQuick ? 10000 : 50000) << " ops + checkpoint; reopened with 1024, 64, 16 frames ("
               << more << " more ops after the first two); every reopen matched std::map and passed checkInvariants.\n";
 }
 
@@ -851,7 +860,7 @@ static void testB4CrashRebuild(const std::string& dir) {
     Oracle o;
     auto opts = pagerOpts(32);
 
-    // Session 1: 1,500 ops through vLog + index, then "crash": drop the pager without closeClean.
+    // Session 1: 1,500 ops through vLog + index, then "crash": drop the pager without a checkpoint.
     {
         TrackedWriter w(vdir);
         bpt::OpenIndexResult r = bpt::openOrRebuildIndex(dir, vdir, opts);
@@ -872,31 +881,19 @@ static void testB4CrashRebuild(const std::string& dir) {
                   << ", vLog entries scanned " << r.vlog_entries_scanned << ", applied " << r.vlog_entries_applied
                   << ", rebuild " << r.rebuild_ms << " ms, keys " << sh.keys << ", height " << sh.height << ", pages "
                   << r.pager->pageCount() << "\n";
-        r.pager->closeClean();
+        r.pager->checkpoint(*r.sbm, r.commitInfo());
     };
-    reopen(OpenStatus::NotClean, true, "after crash (no clean close)");
+    reopen(OpenStatus::NoSuperblock, true, "after crash (no clean close)");
     reopen(OpenStatus::Ok, false, "after clean close");
 
-    // Corrupt one bit in a non-meta page after a clean close. A child that walks the tree must abort;
-    // its open already cleared clean_shutdown, so the next open rebuilds.
+    // Corrupt one bit in a page of the committed tree after a clean close: the open-time tree walk finds it.
     uint64_t npages = fileSize(idx) / kPageSize;
     flipBitInFile(idx, (npages - 1) * kPageSize + 3000, 5);
-    std::cout << "Flipped a bit in page " << npages - 1 << " of " << npages << ". Child stderr follows:\n";
-    int status = runInChild([&]() {
-        childExpectsAbort();
-        OpenStatus st;
-        auto p = Pager::open(idx, pagerOpts(32), &st);
-        CHECK(st == OpenStatus::Ok);
-        BPTree t(*p);
-        (void)t.checkInvariants();  // touches every page
-        _exit(3);
-    });
-    CHECK(diedWithSigabrt(status));
-    std::cout << "Child status: killed by SIGABRT\n";
-    reopen(OpenStatus::NotClean, true, "after page corruption");
+    std::cout << "Flipped a bit in page " << npages - 1 << " of " << npages << ".\n";
+    reopen(OpenStatus::TreeCorrupt, true, "after page corruption");
 
-    flipBitInFile(idx, 40, 1);  // meta body
-    reopen(OpenStatus::BadMeta, true, "after meta corruption");
+    flipBitInFile(idx, 40, 1);  // header body (format_version)
+    reopen(OpenStatus::BadHeader, true, "after header corruption");
 
     CHECK(unlink(idx.c_str()) == 0);
     reopen(OpenStatus::Missing, true, "after index.db deleted");
@@ -905,7 +902,7 @@ static void testB4CrashRebuild(const std::string& dir) {
     accountBytes(kPageSize, "test truncate (extend by one page)");
     reopen(OpenStatus::SizeMismatch, true, "after file size change");
 
-    // Leftover index.db.rebuild from an interrupted rebuild, plus a dirty index.db.
+    // Leftover index.db.rebuild from an interrupted rebuild, plus no superblock (as after a crash).
     {
         int fd = open((dir + "/index.db.rebuild").c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
         CHECK(fd >= 0);
@@ -913,11 +910,9 @@ static void testB4CrashRebuild(const std::string& dir) {
         CHECK(write(fd, junk.data(), junk.size()) == static_cast<ssize_t>(junk.size()));
         accountBytes(junk.size(), "test write (junk rebuild file)");
         CHECK(close(fd) == 0);
-        OpenStatus st;
-        auto p = Pager::open(idx, opts, &st);  // clears clean_shutdown
-        CHECK(st == OpenStatus::Ok);
+        CHECK(unlink((dir + "/superblock.db").c_str()) == 0);
     }
-    reopen(OpenStatus::NotClean, true, "with leftover index.db.rebuild");
+    reopen(OpenStatus::NoSuperblock, true, "with leftover index.db.rebuild");
     struct stat sb;
     CHECK(stat((dir + "/index.db.rebuild").c_str(), &sb) != 0 && errno == ENOENT);
 
@@ -1053,8 +1048,8 @@ static uint64_t dirBytes(const std::string& dir) {
 }
 
 // Child body: 4 writer threads doing put/erase on 64 keys, acking each op after it returns.
-// stop_after_ops > 0: each thread does that many ops, then the store is clean-closed (with a hook
-// that pauses between the page fsync and the meta write).
+// close_and_pause: after the ops, the store is clean-closed with a hook that pauses between the
+// index fsync and the superblock write.
 static void b5ChildWriters(const std::string& sdir, int wfd, uint32_t ops_per_thread, bool close_and_pause) {
     try {
         IndexedStore::Options o = storeOpts(32);
@@ -1179,7 +1174,7 @@ static void testB5KillDuringWrites(const std::string& base) {
         auto st = IndexedStore::open(sdir, o);
         const bpt::OpenIndexResult& info = st->openInfo();
         CHECK(info.rebuilt);
-        CHECK(info.initial_status == OpenStatus::NotClean);
+        CHECK(info.initial_status == OpenStatus::NoSuperblock);
         struct stat sb;
         CHECK(stat((sdir + "/index.db.rebuild").c_str(), &sb) != 0 && errno == ENOENT);
 
@@ -1258,7 +1253,7 @@ static void testB5KillDuringWrites(const std::string& base) {
         CHECK(!ec);
     }
     std::cout << "Crash points: " << kinds[0] << " during writes, " << kinds[1] << " during rebuild (after a write "
-              << "crash), " << kinds[2] << " between page fsync and meta write in clean close.\n";
+              << "crash), " << kinds[2] << " between index fsync and superblock write in clean close.\n";
     std::cout << "PASS: " << kIters << " iterations; " << total_acked << " acked ops all present in the vLog; for "
               << total_checked_keys << " keys the newest acked op is reflected (acked value returned, or a newer "
               << "write); index == vLog replay every time; " << total_unacked << " recovered-but-unacked entries.\n";
