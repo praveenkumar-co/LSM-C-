@@ -1264,6 +1264,202 @@ static void testB5KillDuringWrites(const std::string& base) {
 }
 #endif
 
+// ------------------------------------------------------------------------------------------
+// B6. Concurrency
+// ------------------------------------------------------------------------------------------
+// 100-byte keys, so 256 keys span several leaves and splits happen while the threads run.
+static std::string b6Key(uint32_t id) { std::string k = "acct:" + std::to_string(id); k.resize(100, '.'); return k; }
+
+static void testB6StoreMixed(const std::string& dir) {
+    banner("B6.1 IndexedStore: 8 threads, mixed put/erase/get/scan; final state == vLog replay");
+    const uint32_t kThreads = 8, kOps = 500, kKeys = 256;
+    auto st = IndexedStore::open(dir, storeOpts(64));
+
+    struct Obs { std::string key; uint64_t seq; std::string doc; };
+    struct WriteRec { uint64_t seq; std::string key; bool is_put; std::string doc; };
+    std::vector<std::vector<Obs>> observed(kThreads);
+    std::vector<std::vector<WriteRec>> writes(kThreads);
+    std::atomic<uint64_t> n_put{0}, n_erase{0}, n_get{0}, n_get_hit{0}, n_scan{0}, n_scanned{0};
+    std::atomic<bool> failed{false};
+
+    auto worker = [&](uint32_t tid) {
+        std::mt19937 rng(600 + tid);
+        std::map<std::string, uint64_t> last_seen;  // per key: highest seq this thread has observed or written
+        for (uint32_t i = 0; i < kOps && !failed.load(); ++i) {
+            uint32_t d = rng() % 100;
+            std::string key = b6Key(rng() % kKeys);
+            if (d < 35) {
+                std::string doc = "{\"t\":" + std::to_string(tid) + ",\"i\":" + std::to_string(i) + ",\"key\":\"" + key + "\"}";
+                uint64_t seq = st->put(key, doc);
+                writes[tid].push_back(WriteRec{seq, key, true, doc});
+                last_seen[key] = std::max(last_seen[key], seq);
+                n_put++;
+            } else if (d < 50) {
+                uint64_t seq = st->erase(key).seq;
+                writes[tid].push_back(WriteRec{seq, key, false, ""});
+                last_seen[key] = std::max(last_seen[key], seq);
+                n_erase++;
+            } else if (d < 80) {
+                uint64_t seq = 0;
+                std::optional<std::string> doc = st->get(key, &seq);
+                n_get++;
+                if (doc) {
+                    n_get_hit++;
+                    if (seq < last_seen[key]) { std::cerr << "seq went backwards for " << key << "\n"; failed = true; }
+                    last_seen[key] = seq;
+                    observed[tid].push_back(Obs{key, seq, *doc});
+                }
+            } else {
+                std::string a = b6Key(rng() % kKeys), b = b6Key(rng() % kKeys);
+                if (a > b) std::swap(a, b);
+                size_t limit = 1 + rng() % 64;
+                BPTree::ScanResult r = st->scan(a, b, limit);
+                if (r.size() > limit) failed = true;
+                for (size_t j = 0; j < r.size(); ++j) {
+                    if (r[j].first < a || r[j].first >= b) failed = true;
+                    if (j > 0 && r[j - 1].first >= r[j].first) failed = true;
+                }
+                n_scan++;
+                n_scanned += r.size();
+            }
+        }
+    };
+    auto t0 = std::chrono::steady_clock::now();
+    std::vector<std::thread> th;
+    for (uint32_t t = 0; t < kThreads; ++t) th.emplace_back(worker, t);
+    for (auto& t : th) t.join();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(!failed.load());
+
+    // Every document a reader saw is exactly what a writer wrote with that seq for that key.
+    std::map<uint64_t, const WriteRec*> by_seq;
+    for (auto& v : writes) for (auto& w : v) CHECK(by_seq.emplace(w.seq, &w).second);
+    uint64_t n_obs = 0;
+    for (auto& v : observed) {
+        for (auto& o : v) {
+            auto it = by_seq.find(o.seq);
+            CHECK(it != by_seq.end() && it->second->is_put && it->second->key == o.key && it->second->doc == o.doc);
+            n_obs++;
+        }
+    }
+    // Seqs are dense: every assigned seq was acked to some thread.
+    CHECK(!by_seq.empty() && by_seq.begin()->first == 1 && by_seq.rbegin()->first == by_seq.size());
+
+    // Final state == replay of the acked writes in seq order == should_apply() replay of the vLog.
+    Oracle from_writes;
+    for (auto& [seq, w] : by_seq) {
+        if (w->is_put) {
+            Ref r{};
+            r.seq = seq;
+            from_writes[w->key] = r;
+        } else {
+            from_writes.erase(w->key);
+        }
+    }
+    Oracle ref = vlogOracle(st->vlogDir());
+    checkFullEq(st->tree(), ref, "index vs vLog replay");
+    CHECK(ref.size() == from_writes.size());
+    for (auto& [k, r] : ref) CHECK(from_writes.count(k) && from_writes[k].seq == r.seq);
+    for (auto& [k, r] : ref) {
+        uint64_t seq = 0;
+        std::optional<std::string> doc = st->get(k, &seq);
+        CHECK(doc && seq == r.seq && *doc == by_seq[seq]->doc);
+    }
+    BPTree::Shape sh;
+    checkTree(st->tree(), &sh);
+    std::cout << "ops: put " << n_put << ", erase " << n_erase << ", get " << n_get << " (" << n_get_hit << " hits), scan "
+              << n_scan << " (" << n_scanned << " entries); " << ms << " ms; final keys " << ref.size() << ", height "
+              << sh.height << "\n";
+    std::cout << n_obs << " documents read by get() matched the acked write with the same seq; seqs 1.."
+              << by_seq.size() << " all acked.\n";
+    finishStore(st, true);
+    auto st2 = IndexedStore::open(dir, storeOpts(64));
+    CHECK(!st2->openInfo().rebuilt);
+    checkFullEq(st2->tree(), ref, "after clean reopen");
+    finishStore(st2, true);
+    std::cout << "PASS: final index == replay of acked writes in seq order == should_apply() replay of the vLog; "
+                 "scans sorted and in bounds; per-thread seqs never went backwards.\n";
+}
+
+static void testB6TreeStress(const std::string& dir) {
+    banner("B6.2 BPTree: 4 writers (own key ranges) + 4 readers, 24-frame cache (evictions under readers)");
+    CHECK(mkdir(dir.c_str(), 0755) == 0);
+    const uint64_t bytes_before = bytesWritten();
+    auto p = Pager::create(dir + "/index.db", pagerOpts(24));
+    BPTree t(*p);
+    const uint32_t kWriters = 4, kReaders = 4, kWriterOps = 3000, kReaderOps = 6000, kKeysPerWriter = 1500;
+    std::vector<Oracle> local(kWriters);
+    std::atomic<bool> failed{false};
+    std::atomic<uint64_t> reads{0}, hits{0}, scanned{0};
+    // Key layout: "w<writer>/<id>" padded to 60 bytes. seq = (writer << 40) | per-writer counter.
+    auto key = [](uint32_t w, uint32_t id) { std::string k = "w" + std::to_string(w) + "/" + std::to_string(id); k.resize(60, '#'); return k; };
+
+    auto writer = [&](uint32_t w) {
+        std::mt19937_64 rng(700 + w);
+        uint64_t counter = 0;
+        for (uint32_t i = 0; i < kWriterOps; ++i) {
+            std::string k = key(w, static_cast<uint32_t>(rng() % kKeysPerWriter));
+            if (rng() % 100 < 70) {
+                Ref r = makeRef((uint64_t(w) << 40) | ++counter, rng);
+                t.put(k, r);
+                local[w][k] = r;
+            } else {
+                bool had = t.erase(k);
+                if (had != (local[w].erase(k) == 1)) failed = true;
+            }
+        }
+    };
+    auto reader = [&](uint32_t rid) {
+        std::mt19937_64 rng(800 + rid);
+        std::map<std::string, uint64_t> last;  // monotonic reads per key (one writer per key)
+        for (uint32_t i = 0; i < kReaderOps; ++i) {
+            uint32_t w = static_cast<uint32_t>(rng() % kWriters);
+            std::string k = key(w, static_cast<uint32_t>(rng() % kKeysPerWriter));
+            if (rng() % 100 < 70) {
+                auto r = t.get(k);
+                reads++;
+                if (r) {
+                    hits++;
+                    if ((r->seq >> 40) != w) failed = true;
+                    if (r->seq < last[k]) failed = true;
+                    last[k] = r->seq;
+                }
+            } else {
+                std::string a = key(w, 0), b = key(w, static_cast<uint32_t>(rng() % kKeysPerWriter));
+                if (a > b) std::swap(a, b);
+                BPTree::ScanResult res = t.scan(a, b, 1 + rng() % 100);
+                for (size_t j = 0; j < res.size(); ++j) {
+                    if (res[j].first < a || res[j].first >= b) failed = true;
+                    if (j > 0 && res[j - 1].first >= res[j].first) failed = true;
+                }
+                scanned += res.size();
+            }
+        }
+    };
+    auto t0 = std::chrono::steady_clock::now();
+    std::vector<std::thread> th;
+    for (uint32_t w = 0; w < kWriters; ++w) th.emplace_back(writer, w);
+    for (uint32_t r = 0; r < kReaders; ++r) th.emplace_back(reader, r);
+    for (auto& x : th) x.join();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(!failed.load());
+    Oracle all;
+    for (auto& o : local) all.insert(o.begin(), o.end());
+    checkFullEq(t, all, "after concurrent stress");
+    BPTree::Shape sh;
+    checkTree(t, &sh);
+    CHECK(p->verifyPagesOnDisk().empty());
+    Pager::Stats ps = p->stats();
+    std::cout << "writer ops " << kWriters * kWriterOps << ", reader ops " << kReaders * kReaderOps << " (gets " << reads
+              << ", hits " << hits << ", scanned entries " << scanned << "); " << ms << " ms\n";
+    std::cout << "final keys " << all.size() << ", height " << sh.height << ", pages " << p->pageCount()
+              << "; page reads " << ps.page_reads << ", page writes " << ps.page_writes << ", evictions " << ps.evictions
+              << "; bytes written by this test " << (bytesWritten() - bytes_before) << "\n";
+    CHECK(ps.evictions > 0);
+    std::cout << "PASS: final tree == union of writer oracles; reads were per-key monotonic and in the right key "
+                 "range; checkInvariants and on-disk CRCs pass.\n";
+}
+
 int main() {
     std::cout << "====================================================================\n"
               << "  PHASE 2: B+TREE INDEX TESTS\n"
@@ -1294,6 +1490,9 @@ int main() {
 #else
     std::cout << "\n[SKIP] B5.2 fork/kill -9 test skipped under ThreadSanitizer (same rule as Phase 1).\n";
 #endif
+
+    testB6StoreMixed(test_dir + "/b6_store");
+    testB6TreeStress(test_dir + "/b6_tree");
 
     printBudget();
     std::cout << "\n====================================================================\n"
