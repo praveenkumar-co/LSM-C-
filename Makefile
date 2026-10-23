@@ -14,7 +14,7 @@ LDFLAGS  := -pthread
 
 TEST_SRCS := $(wildcard tests/*.cpp)
 TEST_NAMES := $(notdir $(basename $(TEST_SRCS)))
-HEADERS := $(wildcard include/vlog/*.hpp include/index/*.hpp)
+HEADERS := $(wildcard include/vlog/*.hpp include/index/*.hpp tests/*.hpp)
 
 FLAGS_test := -O2
 FLAGS_asan := -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all
