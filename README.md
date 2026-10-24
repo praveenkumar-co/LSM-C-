@@ -2,7 +2,8 @@
 
 A C++17 storage engine: documents go to an append-only value log (vLog), a disk-based B+Tree maps
 each key to the location of its newest document, and checkpoints plus a two-slot superblock make
-crash recovery replay only the tail of the log.
+crash recovery replay only the tail of the log. `update()` appends a small Delta entry (the changed
+fields) instead of rewriting the whole document.
 
 ## The problem
 
@@ -17,13 +18,19 @@ This engine separates keys from values, in the style of WiscKey:
 - the index holds only small fixed-size references (`seq`, segment, offset, length), so index pages
   change far less data than the documents themselves.
 
-Write amplification of the two designs has not been measured yet (see Known limitations).
+For a small change to a large document, `put()` still rewrites the whole document. `update(key,
+ops)` writes only the changed paths as a Delta entry that points at the previous version; reads
+follow the chain back to a full copy. Measured on one machine, this cuts bytes written per update
+by 3.7x (1 KB documents) to 4.8x (8 KB documents); see Measured results.
 
 ## Design
 
 ```
 put(key, doc) --> vLog append (group commit, F_FULLFSYNC) --> apply to B+Tree in seq order --> ack
+update(key, ops) --> stripe lock --> read current version --> apply ops in memory
+                  --> vLog append of a Delta (or a consolidated Full entry) --> apply --> ack
 get(key)      --> B+Tree lookup --> vLog read at (segment, offset), CRC checked
+                  (a Delta: follow its chain to the Full entry, apply the ops oldest first)
 checkpoint    --> write dirty index pages --> F_FULLFSYNC --> superblock (other slot) --> F_FULLFSYNC
 recovery      --> superblock --> open tree at its root --> replay vLog from its replay point
 ```
@@ -60,6 +67,27 @@ recovery      --> superblock --> open tree at its root --> replay vLog from its 
   superblock write leaves the previous checkpoint fully usable.
 - Automatic checkpoints run every 4 MiB of vLog writes or 30 s, and on clean close.
 
+**Delta updates** (`include/doc/`, `IndexedStore::update`)
+- `include/doc/Json.hpp`: strict RFC 8259 parser (duplicate keys, NaN/Inf, bad escapes, lone
+  surrogates, invalid UTF-8, integers outside int64 and depth > 64 are rejected) and a canonical
+  serializer (keys in insertion order, shortest round-trip doubles, so the same tree always gives
+  the same bytes).
+- `include/doc/Update.hpp`: `$set`, `$unset`, `$inc` on dotted paths (`"profile.score"`,
+  `"items.0"`). `$set`/`$inc` create missing objects; overlapping paths in one update, type
+  mismatches, int64 overflow and out-of-range indexes are errors, and an error writes nothing.
+- A Delta entry uses the existing vLog format: `DeltaPrefix` (base seq, base VPtr, chain depth)
+  followed by the ops. When a chain would exceed `delta_chain_cap` (default and maximum 4), or the
+  delta is more than half the document, `update()` writes a Full entry flagged consolidated. An
+  update that changes nothing writes nothing.
+- 1024 stripe locks: `put`, `erase` and `update` hold their key's stripe from reading the current
+  version until the index is updated, so a Delta's base is always the key's current version.
+  Checkpoints, `get` and `scan` take no stripe.
+- `get()` returns a Full entry byte for byte; for a chain it checks every hop (CRC, key, seq,
+  depth), applies the ops to the Full base and returns canonical JSON.
+- Replay rule for a Delta: skip if the index seq is already >= its seq; if the key is absent or
+  its seq is not the Delta's base seq, open fails with `VLogCorruptError` and changes no file;
+  otherwise the key moves to the Delta.
+
 **Recovery**
 1. Check `index.db` header, the superblock, nonce, vLog identity, and every page of the committed
    tree (CRC + structure), before the vLog writer opens.
@@ -76,12 +104,14 @@ store), the index is rebuilt from the whole vLog. If the replay point is missing
 
 ```
 include/vlog/    value log: on-disk format, CRC32C, writer, reader
-include/index/   B+Tree: page format, pager, tree, superblock, recovery, IndexedStore
+include/index/   B+Tree: page format, pager, tree, superblock, recovery, Delta codec, IndexedStore
+include/doc/     JSON value/parser/serializer and update ops
 tests/           test binaries (built and run by the Makefile)
+bench/           delta-update benchmark (make bench)
 legacy/          earlier MongoLite engine (not built)
 ```
 
-`include/vlog/` never includes `include/index/` or `legacy/`; `make` checks this.
+`include/vlog/` and `include/doc/` include nothing from the layers above them; `make` checks this.
 
 ## Build and test
 
@@ -93,6 +123,7 @@ make test-quick  # optimized, smaller workloads, under 20 MiB written in total
 make test        # optimized, full workloads
 make asan        # AddressSanitizer + UndefinedBehaviorSanitizer
 make tsan        # ThreadSanitizer (fork + kill -9 tests are skipped)
+make bench       # delta-update benchmark; not part of the test modes, writes about 180 MB
 make clean
 ```
 
@@ -109,6 +140,8 @@ budget as it writes (512 MiB in total for `test`/`asan`/`tsan`, 20 MiB for `test
 | `test_superblock` | slot CRCs, ping-pong writes, one or both slots corrupt, torn slot writes |
 | `test_cow` | committed pages never modified, copy cascade, delayed page reuse, free list rebuilt at open |
 | `test_checkpoint` | checkpoint contents and triggers, tail-only recovery, fallback rebuilds, page reuse safety, corrupt newest slot, 50 x kill -9 at random points |
+| `test_doc` | JSON parsing and serialization edge cases, paths, `$set`/`$unset`/`$inc` semantics and errors (P4.A-C) |
+| `test_delta` | `update()` errors write nothing, chains and consolidation, mixed put/erase/update, concurrent updates, kill -9 during updates, replay rule, corrupt or missing chain entries (P4.C-G) |
 
 ## Measured results
 
@@ -149,6 +182,38 @@ writes per second by batching more acks per flush.
   and the superblock write, and during recovery; 11,715 acked operations reflected, and the index
   equalled a full vLog replay every time.
 
+**Delta updates** (`make bench`, same machine, 2026-10-25): one key, one small field
+(`$inc profile.score`) changed 10,000 times; `put` rewrites the whole document each time. Default
+checkpoint triggers; index bytes include checkpoints and the close.
+
+| Document | Method | vLog bytes/update | index bytes/update | Total | vs put |
+|---|---|---:|---:|---:|---:|
+| 1 KB | put | 1,072 | 2.5 | 1,074 | 1.00x |
+| 1 KB | update, cap 2 | 421 | 1.6 | 423 | 2.54x |
+| 1 KB | update, cap 4 | 291 | 1.6 | 293 | 3.67x |
+| 2 KB | put | 2,096 | 4.1 | 2,100 | 1.00x |
+| 2 KB | update, cap 2 | 763 | 1.6 | 764 | 2.75x |
+| 2 KB | update, cap 4 | 496 | 1.6 | 498 | 4.22x |
+| 8 KB | put | 8,240 | 16.4 | 8,257 | 1.00x |
+| 8 KB | update, cap 2 | 2,810 | 5.7 | 2,816 | 2.93x |
+| 8 KB | update, cap 4 | 1,725 | 4.1 | 1,729 | 4.78x |
+
+A Delta entry for this update is about 96 bytes. With cap 4, 8,000 of the 10,000 updates wrote a
+Delta and 2,000 wrote a consolidated Full entry (cap 2: 6,667 and 3,333), so the full copy every
+(cap + 1)-th update dominates the total.
+
+get() latency by chain depth (cap 4, 5,000 gets per depth, page cache warm, p50 / p99 in µs):
+
+| Document | depth 0 | depth 1 | depth 2 | depth 3 | depth 4 |
+|---|---|---|---|---|---|
+| 1 KB | 15.4 / 16.9 | 38.2 / 46.8 | 54.0 / 83.6 | 69.0 / 83.7 | 84.1 / 95.9 |
+| 2 KB | 15.5 / 19.0 | 44.8 / 54.8 | 60.0 / 69.5 | 75.2 / 85.8 | 90.3 / 100.9 |
+| 8 KB | 17.4 / 20.5 | 101.2 / 182.2 | 112.8 / 151.2 | 129.1 / 163.1 | 138.5 / 158.4 |
+
+Depth d reads d + 1 vLog entries. Depth 0 returns the stored bytes without parsing; from depth 1
+on, get() also parses the base, applies the ops and serializes the result, which is most of the
+jump from depth 0 to 1 for 8 KB documents.
+
 **Tree shape**: 200,000 sequential 32-byte keys give a height-4 tree of 5,999 pages (24 MB).
 
 These are single runs on one machine, not averaged benchmarks.
@@ -157,9 +222,16 @@ These are single runs on one machine, not averaged benchmarks.
 
 - **No vLog garbage collection.** The log only grows. The vLog identity check uses the lowest
   segment, which has to move into the superblock once old segments can be deleted.
-- **Write amplification is not measured** for this engine or the legacy one.
-- **Only full documents are written.** The format defines delta entries and an LZ4 flag; the store
-  does not use them yet.
+- **Write amplification is measured only at the engine level** (bytes the engine writes), only for
+  delta vs full updates of one field, and not for the legacy engine or at the device level.
+- **Delta savings are capped by the chain length**: at most 4 Deltas per chain
+  (`kMaxDeltaChain`), so one update in five rewrites the document.
+- **Reading a chained document costs more**: up to 5 vLog reads plus a parse and serialize.
+- **After an update, get() returns canonical JSON**, not the bytes originally put.
+- **Object keys containing '.' cannot be addressed** by update paths.
+- **Writes to one key are serialized** across the group commit (stripe lock), so one key takes at
+  most about one write per `F_FULLFSYNC`.
+- **LZ4 is not used**, although the format has a flag for it.
 - **Checkpoints stall the store** for the duration of two `F_FULLFSYNC` calls (about 10 ms here).
 - **Open reads every page of the committed tree** to check CRCs, so open time grows with index size.
 - **Lost vLog data before the replay point is not detected** unless the replay segment itself is

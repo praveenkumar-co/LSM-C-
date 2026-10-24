@@ -3,6 +3,7 @@
 #   make asan        AddressSanitizer + UndefinedBehaviorSanitizer
 #   make tsan        ThreadSanitizer (defines TSAN_BUILD)
 #   make test-quick  optimized build with -DTEST_QUICK: smaller workloads, under 20 MiB written
+#   make bench       delta-update benchmark (not part of any test mode; about 180 MB written)
 #   make clean
 #
 # Each test binary prints one "[PASS] ..." line per test (TEST_VERBOSE=1 adds measurements) and
@@ -31,7 +32,7 @@ LIMIT_asan  := 536870912
 LIMIT_tsan  := 536870912
 LIMIT_quick := 20971520
 
-.PHONY: test asan tsan quick test-quick clean check-deps
+.PHONY: test asan tsan quick test-quick bench clean check-deps
 
 # vlog/ and doc/ are bottom layers: vlog/ must not depend on index/, doc/ or legacy/, and doc/
 # (JSON and update ops) must not depend on vlog/, index/ or legacy/.
@@ -67,6 +68,13 @@ $(eval $(call MODE_RULES,tsan))
 $(eval $(call MODE_RULES,quick))
 
 test-quick: quick
+
+build/bench/bench_delta: bench/bench_delta.cpp $(HEADERS) Makefile
+	@mkdir -p build/bench
+	$(CXX) $(CXXSTD) $(WARN) -O2 $(INCLUDES) $(LDFLAGS) $< -o $@
+
+bench: check-deps build/bench/bench_delta
+	./build/bench/bench_delta
 
 clean:
 	rm -rf build
