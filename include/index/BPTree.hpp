@@ -188,7 +188,7 @@ public:
     using ScanResult = std::vector<std::pair<std::string, Ref>>;
 
     enum class PutStatus { Inserted, Updated, InvalidKey };
-    enum class ApplyResult { Applied, Skipped, InvalidKey };
+    enum class ApplyResult { Applied, Skipped, InvalidKey, DeltaBaseMismatch };
 
     struct Shape {
         uint32_t height = 0;
@@ -238,18 +238,31 @@ public:
         return out;
     }
 
-    // Redo/live apply of one vLog entry under one exclusive lock:
-    // if should_apply(...) then Full/Delta -> put {seq, kind=1, vptr}, Tombstone -> erase.
+    // Redo/live apply of one vLog entry under one exclusive lock.
+    //   Full / Tombstone: if should_apply(...) then put {seq, kind=1, vptr} / erase.
+    //   Delta (delta_base_seq = the DeltaPrefix's base_seq), in this order:
+    //     key present and index seq >= seq     -> Skipped (already applied)
+    //     key absent or index seq != base_seq  -> DeltaBaseMismatch (corruption; nothing changed)
+    //     else                                 -> put {seq, kind=1, vptr}
     // *had_key (optional) reports whether the key was in the index before this call.
     ApplyResult apply(std::string_view key, vlog::EntryType type, uint64_t seq, uint8_t flags,
-                      const vlog::VPtr& vptr, bool* had_key = nullptr) {
+                      const vlog::VPtr& vptr, bool* had_key = nullptr,
+                      uint64_t delta_base_seq = 0) {
         if (!validKeyLen(key.size())) return ApplyResult::InvalidKey;
         std::unique_lock<std::shared_mutex> lk(mu_);
         std::optional<Ref> cur = getLocked(key);
         if (had_key) *had_key = cur.has_value();
-        if (seq > pager_.maxAppliedSeq()) pager_.setMaxAppliedSeq(seq);
-        if (!vlog::should_apply(cur.has_value(), cur ? cur->seq : 0, seq, flags))
+        if (type == vlog::EntryType::Delta) {
+            if (cur && cur->seq >= seq) {
+                if (seq > pager_.maxAppliedSeq()) pager_.setMaxAppliedSeq(seq);
+                return ApplyResult::Skipped;
+            }
+            if (!cur || cur->seq != delta_base_seq) return ApplyResult::DeltaBaseMismatch;
+        } else if (!vlog::should_apply(cur.has_value(), cur ? cur->seq : 0, seq, flags)) {
+            if (seq > pager_.maxAppliedSeq()) pager_.setMaxAppliedSeq(seq);
             return ApplyResult::Skipped;
+        }
+        if (seq > pager_.maxAppliedSeq()) pager_.setMaxAppliedSeq(seq);
         if (type == vlog::EntryType::Tombstone) {
             eraseLocked(key);
         } else {

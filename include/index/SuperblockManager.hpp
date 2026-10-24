@@ -229,8 +229,9 @@ public:
         commits_++;
     }
 
-    // Deletes superblock.db (if present) and fsyncs the directory. Used before a full rebuild,
-    // so a crash during the rebuild always leads to another rebuild.
+    // Deletes superblock.db (if present) and fsyncs the directory. A full rebuild calls it once
+    // the rebuilt index is durable and before it replaces index.db, so a crash from then on
+    // always leads to another rebuild.
     void remove() {
         if (::unlink(path_.c_str()) != 0) {
             if (errno != ENOENT) fatal("unlink failed for " + path_);

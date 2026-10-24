@@ -14,21 +14,28 @@
 //     The plan gives the writer its tail-scan start: (replay_segment_id, replay_offset).
 //   openIndexFromPlan (after the writer opened): ftruncate index.db to index_page_count (drops
 //     pages written after the checkpoint), open the tree at index_root_page, rebuild the free
-//     list, and replay the vLog from the replay point with should_apply().
+//     list, and replay the vLog from the replay point (should_apply(); Delta entries follow the
+//     delta rule in BPTree::apply). Before replaying, a read-only pass checks every Delta's base
+//     against the committed tree plus the tail, so a bad Delta fails the open (VLogCorruptError)
+//     before anything is written.
 // Copy-on-write (Pager.hpp) keeps the committed tree's pages unchanged until the next superblock
 // commits, so after a crash the superblock still names an intact tree.
 //
 // Rebuild (any check fails):
-//   1. delete superblock.db (directory fsynced), so a crash during the rebuild rebuilds again
-//   2. unlink a leftover index.db.rebuild, create it (O_CREAT | O_EXCL)
-//   3. apply every vLog entry, in file order, through BPTree::apply (should_apply)
-//   4. write back all pages, F_FULLFSYNC
+//   1. unlink a leftover index.db.rebuild, create it (O_CREAT | O_EXCL)
+//   2. apply every vLog entry, in file order, through BPTree::apply
+//   3. write back all pages, F_FULLFSYNC
+//   4. delete superblock.db (directory fsynced)
 //   5. rename index.db.rebuild -> index.db, fsync the directory
 //   6. commit superblock epoch 1 (creates superblock.db, fsyncs the directory)
+// A crash before step 4 leaves the old files, which fail the same check and rebuild again; a
+// crash after it leaves no superblock, which also rebuilds. If step 2 finds a bad Delta, the temp
+// file is removed and VLogCorruptError is thrown with superblock.db and index.db untouched.
 //
 // The caller must have opened the vLog first (VLogWriter's constructor truncates a torn tail).
 
 #include "index/BPTree.hpp"
+#include "index/DeltaCodec.hpp"
 #include "index/IndexCommon.hpp"
 #include "index/Pager.hpp"
 #include "index/SuperblockManager.hpp"
@@ -39,7 +46,9 @@
 #include <chrono>
 #include <cstdio>
 #include <functional>
+#include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -143,6 +152,14 @@ inline VLogIdentity readVLogIdentity(const std::string& vlog_dir) {
 // (acked writes missing from the vLog). Index files are left untouched, so every open fails the
 // same way.
 class VLogBehindError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+// Thrown by open when a Delta entry does not fit the key's history (its base_seq is not the
+// key's current seq, the key is absent, or its prefix is unreadable). The store's files are left
+// as they were before the open.
+class VLogCorruptError : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
 };
@@ -337,6 +354,64 @@ inline OpenIndexResult openCommittedIndex(const std::string& dir, const Pager::O
     return res;
 }
 
+// base_seq of a Delta entry; VLogCorruptError if the payload cannot hold a DeltaPrefix.
+inline uint64_t deltaBaseSeq(const vlog::RecoveredEntry& e) {
+    vlog::DeltaPrefix p;
+    if (!readDeltaPrefix(e.payload, &p))
+        throw VLogCorruptError("Delta entry too short for its prefix at segment " +
+                               std::to_string(e.vptr.segment_id) + " offset " +
+                               std::to_string(e.vptr.offset));
+    return p.base_seq;
+}
+
+inline std::string deltaMismatchMessage(const vlog::RecoveredEntry& e, uint64_t base_seq,
+                                        bool has_key, uint64_t index_seq) {
+    const uint64_t seq = e.header.seq;
+    return "Delta entry for key \"" + e.key + "\" (seq " + std::to_string(seq) + ", segment " +
+           std::to_string(e.vptr.segment_id) + " offset " + std::to_string(e.vptr.offset) +
+           ") has base seq " + std::to_string(base_seq) + ", but the key is " +
+           (has_key ? "at seq " + std::to_string(index_seq) : std::string("absent")) +
+           ". Nothing was modified.";
+}
+
+// Read-only pass over the same entries replayVLogFrom would apply: tracks the key -> seq changes
+// in memory on top of the tree and throws VLogCorruptError at the first Delta whose base does
+// not match. Writes nothing (the tree is only read).
+inline void checkDeltaBases(const std::string& vlog_dir, BPTree& tree, uint32_t from_segment,
+                            uint32_t from_offset, uint64_t after_seq) {
+    std::map<std::string, std::optional<uint64_t>> overlay; // nullopt: key absent
+    std::vector<uint32_t> segs = listVLogSegments(vlog_dir);
+    vlog::VLogReader reader(vlog_dir);
+    for (size_t i = 0; i < segs.size(); ++i) {
+        if (segs[i] < from_segment) continue;
+        uint32_t start = segs[i] == from_segment ? from_offset : vlog::kBlockSize;
+        vlog::ScanResult sr = reader.scanSegment(segs[i], i + 1 == segs.size(), start);
+        for (const vlog::RecoveredEntry& e : sr.entries) {
+            const uint64_t seq = e.header.seq;
+            if (seq <= after_seq) continue;
+            std::optional<uint64_t> cur;
+            auto it = overlay.find(e.key);
+            if (it != overlay.end()) {
+                cur = it->second;
+            } else if (std::optional<vlog::IndexValueRef> r = tree.get(e.key)) {
+                cur = r->seq;
+            }
+            const auto type = static_cast<vlog::EntryType>(e.header.type);
+            if (type == vlog::EntryType::Delta) {
+                const uint64_t base_seq = deltaBaseSeq(e);
+                if (cur && *cur >= seq) continue;
+                if (!cur || *cur != base_seq)
+                    throw VLogCorruptError(
+                        deltaMismatchMessage(e, base_seq, cur.has_value(), cur ? *cur : 0));
+                overlay[e.key] = seq;
+            } else if (vlog::should_apply(cur.has_value(), cur ? *cur : 0, seq, e.header.flags)) {
+                overlay[e.key] = type == vlog::EntryType::Tombstone ? std::nullopt
+                                                                    : std::optional<uint64_t>(seq);
+            }
+        }
+    }
+}
+
 // Applies vLog entries at or after (from_segment, from_offset) with seq > after_seq, in file order.
 // from_segment == 0: from the first segment. When expect_next is true, the first entry found must
 // have seq after_seq + 1 (the replay point is the position right after entry after_seq).
@@ -371,8 +446,15 @@ inline void replayVLogFrom(const std::string& vlog_dir, BPTree& tree, uint32_t f
             res->last_segment = e.vptr.segment_id;
             res->last_end = e.vptr.offset + e.vptr.length;
             if (seq <= after_seq) continue;
-            BPTree::ApplyResult ar = tree.apply(e.key, static_cast<vlog::EntryType>(e.header.type),
-                                                seq, e.header.flags, e.vptr);
+            const auto type = static_cast<vlog::EntryType>(e.header.type);
+            const uint64_t base_seq = type == vlog::EntryType::Delta ? deltaBaseSeq(e) : 0;
+            BPTree::ApplyResult ar =
+                tree.apply(e.key, type, seq, e.header.flags, e.vptr, nullptr, base_seq);
+            if (ar == BPTree::ApplyResult::DeltaBaseMismatch) {
+                std::optional<vlog::IndexValueRef> cur = tree.get(e.key);
+                throw VLogCorruptError(
+                    deltaMismatchMessage(e, base_seq, cur.has_value(), cur ? cur->seq : 0));
+            }
             if (ar == BPTree::ApplyResult::InvalidKey) {
                 errno = 0;
                 fatal("vLog holds a key the index cannot store (length " +
@@ -459,6 +541,8 @@ inline OpenIndexResult openIndexFromPlan(IndexOpenPlan plan, const std::string& 
         res.pager =
             Pager::openCommitted(path, opts, plan.bc.committed); // ftruncates to index_page_count
         BPTree tree(*res.pager);
+        checkDeltaBases(vlog_dir, tree, plan.replay_segment, plan.replay_offset,
+                        plan.checkpoint_seq);
         replayVLogFrom(vlog_dir, tree, plan.replay_segment, plan.replay_offset, plan.checkpoint_seq,
                        /*expect_next=*/true, hooks, &res);
         return res;
@@ -468,15 +552,20 @@ inline OpenIndexResult openIndexFromPlan(IndexOpenPlan plan, const std::string& 
     res.rebuilt = true;
     res.vid =
         readVLogIdentity(vlog_dir); // after the writer opened (it may have removed a ghost segment)
-    res.sbm->remove();
     if (::unlink(tmp.c_str()) != 0 && errno != ENOENT)
         fatal("unlink of leftover " + tmp + " failed");
     std::unique_ptr<Pager> np = Pager::create(tmp, opts);
-    {
+    try {
         BPTree tree(*np);
         replayVLogFrom(vlog_dir, tree, 0, vlog::kBlockSize, 0, /*expect_next=*/false, hooks, &res);
+    } catch (const VLogCorruptError&) {
+        np.reset();
+        if (::unlink(tmp.c_str()) != 0) fatal("unlink of " + tmp + " failed");
+        if (vlog::sync_directory(dir) != 0) fatal("fsync of directory " + dir + " failed");
+        throw;
     }
     np->flushAndSync();
+    res.sbm->remove(); // after the rebuilt index is durable; see the header comment
     if (::rename(tmp.c_str(), path.c_str()) != 0)
         fatal("rename " + tmp + " -> " + path + " failed");
     if (vlog::sync_directory(dir) != 0) fatal("fsync of directory " + dir + " failed after rename");

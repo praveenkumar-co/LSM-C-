@@ -103,7 +103,7 @@ static void checkIndexEqualsVLog(IndexedStore& st, const char* what) {
     CHECK(err.empty());
 }
 
-static std::string doc(uint64_t i, size_t len) {
+static std::string makeDoc(uint64_t i, size_t len) {
     std::string d = "{\"i\":" + std::to_string(i) + ",\"pad\":\"";
     d.append(len, static_cast<char>('a' + i % 26));
     return d + "\"}";
@@ -134,7 +134,7 @@ static void testCP1Fields(const std::string& dir) {
              << " MiB of vLog or " << defaults.checkpoint_interval_ms / 1000 << " s\n";
     auto st = IndexedStore::open(dir, storeOpts());
     uint64_t last = 0;
-    for (int i = 0; i < 200; ++i) last = st->put("k" + std::to_string(i % 50), doc(i, 40));
+    for (int i = 0; i < 200; ++i) last = st->put("k" + std::to_string(i % 50), makeDoc(i, 40));
     st->erase("k3");
     last++;
     CheckpointReport r = st->checkpoint();
@@ -177,7 +177,7 @@ static void testCP2BytesTrigger(const std::string& dir) {
     o.checkpoint_interval_ms = 3600 * 1000;
     auto st = IndexedStore::open(dir, o);
     const int n = 400; // about 600 bytes per entry: about 240 KB of vLog
-    for (int i = 0; i < n; ++i) st->put("key" + std::to_string(i % 120), doc(i, 560));
+    for (int i = 0; i < n; ++i) st->put("key" + std::to_string(i % 120), makeDoc(i, 560));
     // The checkpointer runs in the background: wait for it to catch up (bounded).
     for (int w = 0; w < 200 && st->checkpointReports().size() < 3; ++w)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -205,7 +205,7 @@ static void testCP3TimerTrigger(const std::string& dir) {
     const int kPuts = 35;
     int i = 0;
     for (; i < kPuts; ++i) {
-        st->put("t" + std::to_string(i % 20), doc(i, 30));
+        st->put("t" + std::to_string(i % 20), makeDoc(i, 30));
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(250)); // let the last interval pass
@@ -240,7 +240,7 @@ static void testCP4Concurrent(const std::string& dir) {
             std::mt19937 rng(40 + w);
             for (uint32_t i = 0; i < kOps; ++i) {
                 uint32_t id = w * 1000 + rng() % 80; // each writer owns its keys
-                std::string d = doc(w * 100000 + i, 50 + rng() % 200);
+                std::string d = makeDoc(w * 100000 + i, 50 + rng() % 200);
                 uint64_t s = st->put("c" + std::to_string(id), d);
                 acked[w][id] = {s, d};
                 puts_done++;
@@ -356,7 +356,7 @@ static void testCP5FastRecovery(const std::string& dir) {
         auto st = IndexedStore::open(dir, smallSegOpts(16));
         for (int i = 0; i < kTotal; ++i) {
             std::string k = "f" + std::to_string(i % (kQuick ? 500 : 700)),
-                        d = doc(i, 100 + i % 50);
+                        d = makeDoc(i, 100 + i % 50);
             k.resize(120, '_');
             acked[k] = {st->put(k, d), d};
             if (i == kTotal - kTail - 1) last_cp_seq = st->checkpoint().checkpoint_seq;
@@ -455,7 +455,7 @@ static void testCP6OldLayout(const std::string& dir) {
         auto st = IndexedStore::open(dir, storeOpts());
         for (int i = 0; i < 300; ++i) {
             std::string k = "o" + std::to_string(i % 90);
-            want[k] = doc(i, 30);
+            want[k] = makeDoc(i, 30);
             st->put(k, want[k]);
         }
         finishStore(st, true);
@@ -491,7 +491,7 @@ static void testCP7TreePageCrc(const std::string& dir) {
         for (int i = 0; i < 1500; ++i) {
             std::string k = "p" + std::to_string(i % 600);
             k.resize(60, '-');
-            want[k] = doc(i, 20);
+            want[k] = makeDoc(i, 20);
             st->put(k, want[k]);
         }
         finishStore(st, true);
@@ -562,7 +562,7 @@ static void testCP8UnappliedReplayed(const std::string& dir) {
             if (!armed.exchange(false)) return;
             for (int t = 0; t < kLate; ++t)
                 late.emplace_back(
-                    [sp, t] { sp->put("late" + std::to_string(t), doc(1000 + t, 40)); });
+                    [sp, t] { sp->put("late" + std::to_string(t), makeDoc(1000 + t, 40)); });
             for (int w = 0; w < 5000 && sp->vlogLastSeq() < seq0 + kLate; ++w)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             std::this_thread::sleep_for(
@@ -570,7 +570,7 @@ static void testCP8UnappliedReplayed(const std::string& dir) {
         };
         auto st = IndexedStore::open(dir, o);
         sp = st.get();
-        for (int i = 0; i < kBase; ++i) st->put("base" + std::to_string(i), doc(i, 40));
+        for (int i = 0; i < kBase; ++i) st->put("base" + std::to_string(i), makeDoc(i, 40));
         seq0 = st->vlogLastSeq();
         armed = true;
         CheckpointReport r = st->checkpoint();
@@ -595,7 +595,7 @@ static void testCP8UnappliedReplayed(const std::string& dir) {
     CHECK(info.initial_status == OpenStatus::Ok && info.checkpoint_seq == rec[0]);
     CHECK(newer == static_cast<uint64_t>(kLate) && info.vlog_entries_applied == newer);
     for (int t = 0; t < kLate; ++t)
-        CHECK(st->get("late" + std::to_string(t)) == std::optional<std::string>(doc(1000 + t, 40)));
+        CHECK(st->get("late" + std::to_string(t)) == std::optional<std::string>(makeDoc(1000 + t, 40)));
     checkIndexEqualsVLog(*st, "CP8");
     finishStore(st, true);
     pass("CP8 entries appended during a checkpoint are replayed after a crash",
@@ -671,7 +671,7 @@ static void testCP9PageReuse(const std::string& dir) {
             std::string k = "r" + std::to_string(rng() % 400);
             k.resize(80, '=');
             if (rng() % 100 < 70)
-                st->put(k, doc(i, 20));
+                st->put(k, makeDoc(i, 20));
             else
                 st->erase(k);
         }
@@ -703,7 +703,7 @@ static void testCP10CorruptNewest(const std::string& dir) {
                 std::string k = "n" + std::to_string(rng() % 300);
                 k.resize(80, '+');
                 if (rng() % 100 < 75) {
-                    std::string d = doc(round * 1000 + i, 30);
+                    std::string d = makeDoc(round * 1000 + i, 30);
                     acked[k] = {st->put(k, d), d};
                 } else {
                     acked.erase(k);
@@ -715,7 +715,7 @@ static void testCP10CorruptNewest(const std::string& dir) {
         for (int i = 0; i < 100; ++i) {
             std::string k = "n" + std::to_string(rng() % 300);
             k.resize(80, '+');
-            std::string d = doc(9000 + i, 30);
+            std::string d = makeDoc(9000 + i, 30);
             acked[k] = {st->put(k, d), d};
         }
         finishStore(st, false); // crash

@@ -29,8 +29,10 @@
 #include "vlog/VLogReader.hpp"
 #include "vlog/VLogWriter.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -118,10 +120,18 @@ public:
         //    everything). It truncates a torn tail before the index replays the vLog.
         vlog::VLogWriter::Options wo = opts.vlog_opts;
         plan.applyToWriterOptions(&wo);
+        const std::vector<uint32_t> segments_before = listVLogSegments(s->vlog_dir_);
         s->writer_.reset(new vlog::VLogWriter(s->vlog_dir_, wo));
         if (vlog::sync_directory(dir) != 0) fatal("fsync of directory " + dir + " failed");
         // 3. Open the index at the superblock and replay from the replay point, or rebuild.
-        s->open_info_ = openIndexFromPlan(std::move(plan), dir, s->vlog_dir_, po, opts.hooks);
+        try {
+            s->open_info_ = openIndexFromPlan(std::move(plan), dir, s->vlog_dir_, po, opts.hooks);
+        } catch (const VLogCorruptError&) {
+            // Leave the files as they were: drop the empty segment the writer created on open.
+            s->writer_.reset();
+            s->removeSegmentsCreatedByOpen(segments_before);
+            throw;
+        }
         s->pager_ = std::move(s->open_info_.pager);
         s->sbm_ = std::move(s->open_info_.sbm);
         s->tree_.reset(new BPTree(*s->pager_));
@@ -297,6 +307,24 @@ public:
 private:
     IndexedStore(const std::string& dir, const Options& opts)
         : dir_(dir), vlog_dir_(dir + "/vlog"), opts_(opts) {}
+
+    // Unlinks segments that did not exist before open and hold only their 4 KiB header.
+    void removeSegmentsCreatedByOpen(const std::vector<uint32_t>& before) {
+        bool removed = false;
+        for (uint32_t id : listVLogSegments(vlog_dir_)) {
+            if (std::find(before.begin(), before.end(), id) != before.end()) continue;
+            char name[32];
+            std::snprintf(name, sizeof(name), "/vlog_%08u.log", id);
+            const std::string path = vlog_dir_ + name;
+            struct stat st;
+            if (::stat(path.c_str(), &st) != 0) fatal("stat failed for " + path);
+            if (static_cast<uint64_t>(st.st_size) != vlog::kBlockSize) continue;
+            if (::unlink(path.c_str()) != 0) fatal("unlink failed for " + path);
+            removed = true;
+        }
+        if (removed && vlog::sync_directory(vlog_dir_) != 0)
+            fatal("fsync of directory " + vlog_dir_ + " failed");
+    }
 
     static void checkKey(std::string_view key) {
         if (!validKeyLen(key.size())) {
