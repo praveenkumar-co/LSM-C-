@@ -98,14 +98,20 @@ public:
     static std::unique_ptr<IndexedStore> open(const std::string& dir, Options opts) {
         if (::mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) fatal("mkdir failed for " + dir);
         std::unique_ptr<IndexedStore> s(new IndexedStore(dir, opts));
-        // vLog first: its recovery truncates a torn tail before the index is opened or rebuilt.
-        s->writer_.reset(new vlog::VLogWriter(s->vlog_dir_, opts.vlog_opts));
-        if (vlog::sync_directory(dir) != 0) fatal("fsync of directory " + dir + " failed");
         Pager::Options po;
         po.num_frames = opts.cache_frames;
         po.on_write = opts.on_index_write;
         po.inject_failure = opts.inject_index_failure;
-        s->open_info_ = openOrRebuildIndex(dir, s->vlog_dir_, po, opts.hooks);
+        // 1. Read-only checks of superblock + index (may throw VLogBehindError; nothing modified).
+        IndexOpenPlan plan = planIndexOpen(dir, s->vlog_dir_, po);
+        // 2. vLog writer: its tail scan starts at the superblock's replay point (a rebuild scans
+        //    everything). It truncates a torn tail before the index replays the vLog.
+        vlog::VLogWriter::Options wo = opts.vlog_opts;
+        plan.applyToWriterOptions(&wo);
+        s->writer_.reset(new vlog::VLogWriter(s->vlog_dir_, wo));
+        if (vlog::sync_directory(dir) != 0) fatal("fsync of directory " + dir + " failed");
+        // 3. Open the index at the superblock and replay from the replay point, or rebuild.
+        s->open_info_ = openIndexFromPlan(std::move(plan), dir, s->vlog_dir_, po, opts.hooks);
         s->pager_ = std::move(s->open_info_.pager);
         s->sbm_ = std::move(s->open_info_.sbm);
         s->tree_.reset(new BPTree(*s->pager_));
@@ -251,6 +257,7 @@ public:
     BPTree& tree() { return *tree_; }
     Pager& pager() { return *pager_; }
     uint64_t vlogBytesWritten() const { return writer_ ? writer_->getTotalBytesWritten() : 0; }
+    uint64_t writerRecoveryEntriesScanned() const { return writer_ ? writer_->getRecoveryEntriesScanned() : 0; }
     const std::string& vlogDir() const { return vlog_dir_; }
     uint64_t lastAppliedSeq() {
         std::lock_guard<std::mutex> lk(seq_mu_);

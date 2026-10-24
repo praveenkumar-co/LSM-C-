@@ -245,7 +245,7 @@ static void testCP4Concurrent(const std::string& dir) {
     std::thread cp([&] {
         while (!stop.load()) {
             reps.push_back(st->checkpoint());
-            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+            std::this_thread::sleep_for(std::chrono::milliseconds(kQuick ? 30 : 15));
         }
     });
     for (uint32_t w = 0; w < kWriters; ++w) th[w].join();
@@ -282,6 +282,200 @@ static void testCP4Concurrent(const std::string& dir) {
                  "its acked value.\n";
 }
 
+// ------------------------------------------------------------------------------------------
+// Step 4: fast recovery
+// ------------------------------------------------------------------------------------------
+static uint64_t dirFileBytes(const std::string& path) {
+    struct stat st;
+    CHECK(stat(path.c_str(), &st) == 0);
+    return static_cast<uint64_t>(st.st_size);
+}
+
+static void xorByte(const std::string& path, uint64_t off, uint8_t mask) {
+    int fd = open(path.c_str(), O_RDWR);
+    CHECK(fd >= 0);
+    uint8_t b = 0;
+    CHECK(pread(fd, &b, 1, static_cast<off_t>(off)) == 1);
+    b ^= mask;
+    CHECK(pwrite(fd, &b, 1, static_cast<off_t>(off)) == 1);
+    accountBytes(1, "test pwrite (bit flip)");
+    CHECK(vlog::full_fsync(fd) == 0);
+    CHECK(close(fd) == 0);
+}
+
+// Store with small segments (64 KiB), so the vLog has many segments.
+static IndexedStore::Options smallSegOpts(size_t frames) {
+    IndexedStore::Options o = storeOpts(frames);
+    o.vlog_opts.segment_size_limit = 64 * 1024;
+    return o;
+}
+
+static void testCP5FastRecovery(const std::string& dir) {
+    banner("CP5 Fast recovery: replay and writer tail scan start at the replay point, not at segment 1");
+    const int kTotal = kQuick ? 1200 : 6000, kTail = kQuick ? 150 : 200;
+    std::map<std::string, std::pair<uint64_t, std::string>> acked;
+    uint64_t last_cp_seq = 0;
+    {
+        // 16 frames and 120-byte keys: the tree does not fit in the cache, so evictions write pages
+        // past the committed page count before the crash.
+        auto st = IndexedStore::open(dir, smallSegOpts(16));
+        for (int i = 0; i < kTotal; ++i) {
+            std::string k = "f" + std::to_string(i % (kQuick ? 500 : 700)), d = doc(i, 100 + i % 50);
+            k.resize(120, '_');
+            acked[k] = {st->put(k, d), d};
+            if (i == kTotal - kTail - 1) last_cp_seq = st->checkpoint().checkpoint_seq;
+        }
+        std::cout << "wrote " << kTotal << " entries in " << bpt::listVLogSegments(st->vlogDir()).size()
+                  << " segments; checkpoint at seq " << last_cp_seq << "; then " << kTail
+                  << " more entries; crash. index.db " << dirFileBytes(dir + "/index.db") / 4096 << " pages\n";
+        finishStore(st, false);
+    }
+    bpt::SuperblockManager m(dir + "/superblock.db");
+    bpt::SuperblockManager::LoadResult sl = m.load();
+    CHECK(sl.status == bpt::SuperblockManager::LoadResult::Status::Ok && sl.current.sb.checkpoint_seq == last_cp_seq);
+    const uint64_t committed_pages = sl.current.sb.index_page_count;
+    auto t0 = std::chrono::steady_clock::now();
+    auto st = IndexedStore::open(dir, smallSegOpts(256));
+    auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const bpt::OpenIndexResult& info = st->openInfo();
+    const uint64_t total_entries = readVLog(st->vlogDir()).size();
+    std::cout << "recovery from superblock epoch " << sl.current.sb.epoch << " (replay point segment "
+              << sl.current.sb.replay_segment_id << ", offset " << sl.current.sb.replay_offset << "):\n"
+              << "  vLog entries in total:            " << total_entries << "\n"
+              << "  writer tail scan read:            " << st->writerRecoveryEntriesScanned() << "\n"
+              << "  index replay read:                " << info.vlog_entries_scanned << " (applied "
+              << info.vlog_entries_applied << ")\n"
+              << "  index.db pages truncated at open: " << st->pager().truncatedPagesAtOpen() << " (committed page count "
+              << committed_pages << ")\n"
+              << "  open time:                        " << ms << " ms\n";
+    CHECK(info.initial_status == OpenStatus::Ok && !info.rebuilt);
+    CHECK(sl.current.sb.replay_segment_id > 1);
+    CHECK(info.vlog_entries_scanned == static_cast<uint64_t>(kTail));
+    CHECK(st->writerRecoveryEntriesScanned() == static_cast<uint64_t>(kTail));
+    CHECK(info.vlog_entries_scanned * 5 < total_entries);
+    CHECK(st->pager().truncatedPagesAtOpen() > 0 && dirFileBytes(dir + "/index.db") == committed_pages * 4096);
+    checkIndexEqualsVLog(*st, "CP5");
+    for (const auto& [k, sd] : acked) {
+        uint64_t s = 0;
+        CHECK(st->get(k, &s) == std::optional<std::string>(sd.second) && s == sd.first);
+    }
+    finishStore(st, false);
+    // For comparison: the same vLog through a full rebuild.
+    CHECK(unlink((dir + "/superblock.db").c_str()) == 0);
+    st = IndexedStore::open(dir, smallSegOpts(256));
+    std::cout << "  for comparison, a full rebuild (superblock.db deleted) read " << st->openInfo().vlog_entries_scanned
+              << " entries (writer tail scan " << st->writerRecoveryEntriesScanned() << ")\n";
+    CHECK(st->openInfo().rebuilt && st->openInfo().vlog_entries_scanned == total_entries);
+    finishStore(st, true);
+    std::cout << "PASS: recovery read " << kTail << " of " << total_entries << " vLog entries (writer and index), "
+                 "truncated uncommitted index pages, and every acked key returns its acked value.\n";
+}
+
+// Writes an index.db in the Phase 2 (format v2) layout: a meta page with clean_shutdown = 1.
+static void writePhase2IndexDb(const std::string& path) {
+    std::vector<uint8_t> page(bpt::kPageSize, 0);
+    bpt::initPage(page.data(), 0, bpt::PageType::Meta, 0);
+    struct V2Meta {  // Phase 2 MetaBody, format v2 (72 bytes)
+        uint64_t magic; uint32_t format_version, page_size, root_page_id, page_count, tree_height, clean_shutdown;
+        uint64_t key_count, max_applied_seq, open_count, vlog_created_ns;
+        uint32_t vlog_first_segment, reserved1;
+    } __attribute__((packed)) m{};
+    static_assert(sizeof(V2Meta) == 72);
+    m.magic = 0x3141544D58444E49ULL;  // "INDXMTA1"
+    m.format_version = 2;
+    m.page_size = bpt::kPageSize;
+    m.root_page_id = 1;
+    m.page_count = 2;
+    m.tree_height = 1;
+    m.clean_shutdown = 1;
+    m.max_applied_seq = 999999;
+    std::memcpy(page.data() + bpt::kHeaderSize, &m, sizeof(m));
+    uint32_t crc = bpt::computePageCrc(page.data());
+    std::memcpy(page.data(), &crc, 4);
+    std::vector<uint8_t> leaf(bpt::kPageSize, 0);
+    bpt::initPage(leaf.data(), 1, bpt::PageType::Leaf, 0);
+    crc = bpt::computePageCrc(leaf.data());
+    std::memcpy(leaf.data(), &crc, 4);
+    int fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    CHECK(fd >= 0);
+    CHECK(write(fd, page.data(), page.size()) == static_cast<ssize_t>(page.size()));
+    CHECK(write(fd, leaf.data(), leaf.size()) == static_cast<ssize_t>(leaf.size()));
+    accountBytes(2 * bpt::kPageSize, "test write (Phase 2 index.db)");
+    CHECK(vlog::full_fsync(fd) == 0);
+    CHECK(close(fd) == 0);
+}
+
+static void testCP6OldLayout(const std::string& dir) {
+    banner("CP6 index.db without superblock.db (Phase 2 layout) -> full rebuild from the vLog");
+    std::map<std::string, std::string> want;
+    {
+        auto st = IndexedStore::open(dir, storeOpts());
+        for (int i = 0; i < 300; ++i) { std::string k = "o" + std::to_string(i % 90); want[k] = doc(i, 30); st->put(k, want[k]); }
+        finishStore(st, true);
+    }
+    auto verify = [&](OpenStatus expect, const char* what) {
+        auto st = IndexedStore::open(dir, storeOpts());
+        const bpt::OpenIndexResult& info = st->openInfo();
+        std::cout << "  " << what << ": first check " << bpt::toString(info.initial_status) << ", rebuilt "
+                  << (info.rebuilt ? "yes" : "no") << ", entries read " << info.vlog_entries_scanned << "\n";
+        CHECK(info.initial_status == expect && info.rebuilt);
+        CHECK(st->tree().size() == want.size());
+        for (const auto& [k, v] : want) CHECK(st->get(k) == std::optional<std::string>(v));
+        checkIndexEqualsVLog(*st, what);
+        finishStore(st, true);
+        CHECK(dirFileBytes(dir + "/superblock.db") == 8192);  // the rebuild committed a superblock
+    };
+    // (a1) current index.db, superblock.db removed.
+    CHECK(unlink((dir + "/superblock.db").c_str()) == 0);
+    verify(OpenStatus::NoSuperblock, "current-format index.db, no superblock.db");
+    // (a2) a real Phase 2 index.db (v2 meta page, clean_shutdown = 1) and no superblock.db.
+    CHECK(unlink((dir + "/superblock.db").c_str()) == 0);
+    writePhase2IndexDb(dir + "/index.db");
+    verify(OpenStatus::BadHeader, "Phase 2 (v2) index.db, no superblock.db");
+    std::cout << "PASS: both layouts without a superblock were rebuilt from the vLog with all " << want.size()
+              << " keys correct, and a superblock was committed.\n";
+}
+
+static void testCP7TreePageCrc(const std::string& dir) {
+    banner("CP7 A page of the committed tree fails its CRC -> full rebuild from the vLog");
+    std::map<std::string, std::string> want;
+    {
+        auto st = IndexedStore::open(dir, storeOpts());
+        for (int i = 0; i < 1500; ++i) {
+            std::string k = "p" + std::to_string(i % 600);
+            k.resize(60, '-');
+            want[k] = doc(i, 20);
+            st->put(k, want[k]);
+        }
+        finishStore(st, true);
+    }
+    bpt::SuperblockManager m(dir + "/superblock.db");
+    bpt::SuperblockManager::LoadResult sl = m.load();
+    CHECK(sl.status == bpt::SuperblockManager::LoadResult::Status::Ok);
+    // Pick a leaf of the committed tree: walk it and take the last reachable page id.
+    int fd = open((dir + "/index.db").c_str(), O_RDONLY);
+    CHECK(fd >= 0);
+    bpt::TreeWalk w = bpt::walkTree(fd, static_cast<bpt::page_id_t>(sl.current.sb.index_root_page),
+                                    static_cast<uint32_t>(sl.current.sb.index_page_count));
+    CHECK(close(fd) == 0);
+    CHECK(w.ok && w.height >= 2);
+    bpt::page_id_t victim = 0;
+    for (bpt::page_id_t id = 1; id < w.reachable.size(); ++id) if (w.reachable[id] && id != sl.current.sb.index_root_page) victim = id;
+    CHECK(victim != 0);
+    xorByte(dir + "/index.db", uint64_t(victim) * 4096 + 2500, 0x20);
+    auto st = IndexedStore::open(dir, storeOpts());
+    const bpt::OpenIndexResult& info = st->openInfo();
+    std::cout << "flipped one bit in page " << victim << " (tree height " << w.height << ", " << w.pages_read
+              << " tree pages): first check " << bpt::toString(info.initial_status) << " (" << info.why << "), rebuilt "
+              << (info.rebuilt ? "yes" : "no") << "\n";
+    CHECK(info.initial_status == OpenStatus::TreeCorrupt && info.rebuilt);
+    for (const auto& [k, v] : want) CHECK(st->get(k) == std::optional<std::string>(v));
+    checkIndexEqualsVLog(*st, "CP7");
+    finishStore(st, true);
+    std::cout << "PASS: the open-time tree walk found the bad page; the rebuilt index has all " << want.size()
+              << " keys correct.\n";
+}
+
 int main() {
     std::cout << "====================================================================\n"
               << "  CHECKPOINT TESTS" << (kQuick ? " (quick)" : "") << "\n"
@@ -292,6 +486,9 @@ int main() {
     testCP2BytesTrigger(dir + "/cp2");
     testCP3TimerTrigger(dir + "/cp3");
     testCP4Concurrent(dir + "/cp4");
+    testCP5FastRecovery(dir + "/cp5");
+    testCP6OldLayout(dir + "/cp6");
+    testCP7TreePageCrc(dir + "/cp7");
     printBudget();
     std::cout << "\nALL CHECKPOINT TESTS PASSED\n";
     return 0;

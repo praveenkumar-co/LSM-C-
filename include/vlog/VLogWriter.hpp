@@ -43,6 +43,12 @@ public:
     struct Options {
         uint32_t segment_size_limit; // Default 64 MB
         uint64_t max_bytes;          // Default 0 = unlimited write cap
+        // Tail discovery start (from the index superblock's replay point). Segments below
+        // scan_from_segment are not scanned; that segment is scanned from scan_from_offset.
+        // 0 = scan every segment from the start.
+        uint32_t scan_from_segment = 0;
+        uint32_t scan_from_offset = kBlockSize;
+        uint64_t min_seq = 0;        // seqs already used before the scan start (checkpoint seq)
 
         Options(uint32_t seg_limit = 64 * 1024 * 1024, uint64_t max_b = 0)
             : segment_size_limit(seg_limit), max_bytes(max_b) {}
@@ -63,6 +69,7 @@ private:
     uint64_t total_bytes_written_{0};
     uint64_t total_ops_{0};
     uint64_t total_fsyncs_{0};
+    uint64_t recovery_entries_scanned_{0};
     bool fatal_error_{false};
 
     struct Request {
@@ -249,7 +256,10 @@ private:
                 if (sid > max_seg) {
                     max_seg = sid;
                 }
-                auto res = reader.scanSegment(sid, is_last);
+                if (sid < options_.scan_from_segment) continue;  // before the replay point
+                uint32_t start = (sid == options_.scan_from_segment) ? options_.scan_from_offset : kBlockSize;
+                auto res = reader.scanSegment(sid, is_last, start);
+                recovery_entries_scanned_ += res.entries.size();
                 for (const auto& e : res.entries) {
                     if (e.header.seq > max_seq) {
                         max_seq = e.header.seq;
@@ -261,7 +271,7 @@ private:
             }
         }
 
-        current_seq_ = max_seq;
+        current_seq_ = std::max(max_seq, options_.min_seq);
         current_segment_id_ = max_seg;
         openNewSegmentLocked();
     }
@@ -492,6 +502,12 @@ public:
         std::unique_lock<std::mutex> lock(mutex_);
         if (total_fsyncs_ == 0) return 0.0;
         return static_cast<double>(total_ops_) / total_fsyncs_;
+    }
+
+    // Entries read by the tail discovery scan in the constructor.
+    uint64_t getRecoveryEntriesScanned() const {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return recovery_entries_scanned_;
     }
 
     uint32_t getCurrentSegmentId() const {
