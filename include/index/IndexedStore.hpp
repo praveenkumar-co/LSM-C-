@@ -6,6 +6,18 @@
 //   order             -> ack get(key):      index lookup -> vLog read of the referenced entry (CRC
 //   checked)
 //
+// update(key, ops): stripe lock -> read the current version -> apply ops in memory -> vLog append
+//   of a Delta (base = the current version) or of a consolidated Full entry -> apply in seq order
+//   -> release. get() follows a Delta chain back to its Full base and applies the ops oldest
+//   first; a Full entry is returned byte for byte.
+//
+// Stripe locks (1024, by key hash): put, erase and update hold their key's stripe from reading
+// the current version until their index update is applied, so a Delta's base is always the key's
+// current version. Each operation holds one stripe and never asks for another; checkpoint(),
+// get() and scan() take none. A thread waiting in the sequencer for seq s holds a stripe, but
+// every thread with a lower seq needs only the sequencer and the tree lock, so the lowest
+// unapplied seq always proceeds: no deadlock. Writes to one key run one group commit at a time.
+//
 // Sequencer: live index updates must be applied in seq order. Otherwise a put with seq 9 that
 // applies after a tombstone with seq 10 would bring a deleted key back. After append() returns
 // seq s, the thread waits until next_apply_seq == s, applies, then advances next_apply_seq.
@@ -23,13 +35,17 @@
 //
 // Directory layout: <dir>/vlog/vlog_%08u.log, <dir>/index.db, <dir>/superblock.db.
 
+#include "doc/Json.hpp"
+#include "doc/Update.hpp"
 #include "index/BPTree.hpp"
+#include "index/DeltaCodec.hpp"
 #include "index/IndexRecovery.hpp"
 #include "index/Pager.hpp"
 #include "vlog/VLogReader.hpp"
 #include "vlog/VLogWriter.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -40,6 +56,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <sys/stat.h>
@@ -83,8 +100,27 @@ struct CheckpointReport {
     double stall_ms = 0;     // time the locks were held: index updates and readers wait this long
 };
 
+static_assert(doc::kMaxDocBytes ==
+                  vlog::kMaxEntryLen - sizeof(vlog::EntryHeader) - vlog::kEntryAlign,
+              "doc::kMaxDocBytes must be the largest vLog payload (key of 1-8 bytes)");
+
+// What one get() cost.
+struct ReadStats {
+    uint32_t vlog_reads = 0;  // entries read from the vLog (chain_depth + 1)
+    uint16_t chain_depth = 0; // Delta entries between the index and the Full base
+};
+
+struct UpdateResult {
+    uint64_t seq = 0;     // seq of the written entry, or the current seq if nothing was written
+    bool written = false; // false: the ops left the document unchanged; nothing was appended
+    bool consolidated = false; // a Full entry with kFlagConsolidated was written instead of a Delta
+    uint16_t chain_depth = 0;  // the key's chain depth after this call (0 = Full entry)
+};
+
 class IndexedStore {
 public:
+    static constexpr size_t kStripes = 1024;
+
     struct Options {
         size_t cache_frames = 1024;
         vlog::VLogWriter::Options vlog_opts{};
@@ -100,6 +136,11 @@ public:
         bool auto_checkpoint = true;
         uint64_t checkpoint_bytes = 4ULL * 1024 * 1024; // vLog bytes between automatic checkpoints
         uint32_t checkpoint_interval_ms = 30000; // longest time between automatic checkpoints
+        // Delta entries allowed in a chain before update() writes a Full entry instead (0: every
+        // update writes a Full entry). At most vlog::kMaxDeltaChain.
+        uint16_t delta_chain_cap = vlog::kMaxDeltaChain;
+        // Largest document put() and update() accept; 0 = the largest payload the vLog accepts.
+        uint32_t max_document_bytes = 0;
     };
 
     struct EraseResult {
@@ -108,6 +149,12 @@ public:
     };
 
     static std::unique_ptr<IndexedStore> open(const std::string& dir, Options opts) {
+        if (opts.delta_chain_cap > vlog::kMaxDeltaChain)
+            throw std::invalid_argument("delta_chain_cap above " +
+                                        std::to_string(vlog::kMaxDeltaChain));
+        if (opts.max_document_bytes > doc::kMaxDocBytes)
+            throw std::invalid_argument("max_document_bytes above " +
+                                        std::to_string(doc::kMaxDocBytes));
         if (::mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) fatal("mkdir failed for " + dir);
         std::unique_ptr<IndexedStore> s(new IndexedStore(dir, opts));
         Pager::Options po;
@@ -159,17 +206,12 @@ public:
     // oversize document (nothing is written in that case).
     uint64_t put(std::string_view key, std::string_view doc) {
         checkKey(key);
-        // Exact on-disk entry size, computed in 64 bits: header + padded key + padded doc.
-        const uint64_t entry_bytes =
-            sizeof(vlog::EntryHeader) +
-            vlog::align_up(static_cast<uint32_t>(key.size()), vlog::kEntryAlign) +
-            ((static_cast<uint64_t>(doc.size()) + vlog::kEntryAlign - 1) &
-             ~uint64_t(vlog::kEntryAlign - 1));
-        if (entry_bytes > vlog::kMaxEntryLen) {
+        if (doc.size() > maxDocBytes(key)) {
             throw std::invalid_argument("document of " + std::to_string(doc.size()) +
-                                        " bytes exceeds the " + std::to_string(vlog::kMaxEntryLen) +
-                                        "-byte vLog entry limit");
+                                        " bytes exceeds the " + std::to_string(maxDocBytes(key)) +
+                                        "-byte limit");
         }
+        std::lock_guard<std::mutex> stripe(stripeFor(key));
         vlog::AppendResult ar =
             appendOrDie(vlog::EntryType::Full, key, doc.data(), static_cast<uint32_t>(doc.size()));
         applyInOrder(key, vlog::EntryType::Full, ar, nullptr);
@@ -179,6 +221,7 @@ public:
 
     EraseResult erase(std::string_view key) {
         checkKey(key);
+        std::lock_guard<std::mutex> stripe(stripeFor(key));
         vlog::AppendResult ar = appendOrDie(vlog::EntryType::Tombstone, key, nullptr, 0);
         bool had = false;
         applyInOrder(key, vlog::EntryType::Tombstone, ar, &had);
@@ -186,31 +229,81 @@ public:
         return EraseResult{ar.seq, had};
     }
 
-    // Returns the document, or nullopt if the key is absent. *seq_out gets the entry's seq.
-    // Throws VLogReadError if the index references an entry that cannot be read or does not match.
-    std::optional<std::string> get(std::string_view key, uint64_t* seq_out = nullptr) const {
+    // Applies ops to the key's document and appends the change: a Delta entry, or a Full entry
+    // with kFlagConsolidated when the chain would exceed delta_chain_cap or the Delta payload
+    // would be more than half the new document. Writes nothing if the document does not change.
+    // Throws (writing nothing): std::invalid_argument (bad key, no ops), doc::NotFoundError,
+    // doc::TypeError (stored value is not a JSON object, or a type error in an op),
+    // doc::ConflictError, doc::RangeError, doc::PathError, VLogReadError (stored chain unreadable).
+    UpdateResult update(std::string_view key, const std::vector<doc::UpdateOp>& ops) {
+        checkKey(key);
+        if (ops.empty()) throw std::invalid_argument("update() with no ops");
+        if (ops.size() > UINT16_MAX) throw doc::RangeError("more than 65535 ops in one update");
+        (void)doc::validateOps(ops); // path and conflict errors before taking the lock
+        std::lock_guard<std::mutex> stripe(stripeFor(key));
+        std::optional<vlog::IndexValueRef> ref = tree_->get(key);
+        if (!ref) throw doc::NotFoundError("update(): key not found");
+        Version v = readVersion(key, *ref);
+        doc::Value cur;
+        if (v.deltas.empty()) {
+            try {
+                cur = doc::parse(std::string_view(
+                    reinterpret_cast<const char*>(v.full_payload.data()), v.full_payload.size()));
+            } catch (const doc::ParseError& e) {
+                throw doc::TypeError(std::string("stored value is not JSON: ") + e.what());
+            }
+            if (!cur.isObject()) throw doc::TypeError("stored value is not a JSON object");
+        } else {
+            cur = materialize(v, key, *ref);
+        }
+        doc::Value next = cur;
+        doc::applyOps(next, ops);
+        std::string next_bytes = doc::serialize(next);
+        if (next_bytes == doc::serialize(cur)) return UpdateResult{ref->seq, false, false, v.depth};
+        if (next_bytes.size() > maxDocBytes(key)) {
+            throw doc::RangeError("updated document of " + std::to_string(next_bytes.size()) +
+                                  " bytes exceeds the " + std::to_string(maxDocBytes(key)) +
+                                  "-byte limit");
+        }
+        const uint16_t depth = static_cast<uint16_t>(v.depth + 1);
+        const std::string enc = encodeOps(ops);
+        const uint64_t delta_payload = sizeof(vlog::DeltaPrefix) + enc.size();
+        UpdateResult r;
+        if (depth > opts_.delta_chain_cap || delta_payload * 2 > next_bytes.size()) {
+            vlog::AppendResult ar =
+                appendOrDie(vlog::EntryType::Full, key, next_bytes.data(),
+                            static_cast<uint32_t>(next_bytes.size()), vlog::kFlagConsolidated);
+            applyInOrder(key, vlog::EntryType::Full, ar, nullptr);
+            r = UpdateResult{ar.seq, true, true, 0};
+        } else {
+            vlog::DeltaPrefix pre{};
+            pre.base_seq = ref->seq;
+            pre.base = ref->vptr;
+            pre.chain_depth = depth;
+            pre.op_count = static_cast<uint16_t>(ops.size());
+            vlog::AppendResult ar = appendOrDie(vlog::EntryType::Delta, key, enc.data(),
+                                                static_cast<uint32_t>(enc.size()), 0, &pre);
+            applyInOrder(key, vlog::EntryType::Delta, ar, nullptr, ref->seq);
+            r = UpdateResult{ar.seq, true, false, depth};
+        }
+        noteVLogBytes();
+        return r;
+    }
+
+    // Returns the document, or nullopt if the key is absent. *seq_out gets the index seq, *stats
+    // the read cost. A Full entry is returned byte for byte; a Delta chain is applied to its Full
+    // base and returned as canonical JSON. Throws VLogReadError if any entry of the chain cannot
+    // be read, does not match, or does not apply (no bytes are returned in that case).
+    std::optional<std::string> get(std::string_view key, uint64_t* seq_out = nullptr,
+                                   ReadStats* stats = nullptr) const {
         checkKey(key);
         std::optional<vlog::IndexValueRef> ref = tree_->get(key);
         if (!ref) return std::nullopt;
-        vlog::VLogReader reader(vlog_dir_);
-        vlog::EntryHeader h;
-        std::string k;
-        std::vector<uint8_t> payload;
-        const std::string where = "segment " + std::to_string(ref->vptr.segment_id) + " offset " +
-                                  std::to_string(ref->vptr.offset) + " (index seq " +
-                                  std::to_string(ref->seq) + ")";
-        if (!reader.readEntry(ref->vptr, h, k, payload)) {
-            throw VLogReadError(
-                "vLog entry unreadable (missing segment, bad bounds, or CRC mismatch) at " + where);
-        }
-        const uint64_t entry_seq = h.seq;
-        if (entry_seq != ref->seq || k != key ||
-            h.type == static_cast<uint8_t>(vlog::EntryType::Tombstone)) {
-            throw VLogReadError("vLog entry does not match the index (seq " +
-                                std::to_string(entry_seq) + ") at " + where);
-        }
-        if (seq_out) *seq_out = entry_seq;
-        return std::string(payload.begin(), payload.end());
+        Version v = readVersion(key, *ref);
+        if (stats) *stats = ReadStats{v.reads, v.depth};
+        if (seq_out) *seq_out = ref->seq;
+        if (v.deltas.empty()) return std::string(v.full_payload.begin(), v.full_payload.end());
+        return doc::serialize(materialize(v, key, *ref));
     }
 
     BPTree::ScanResult scan(std::string_view start, std::string_view end, size_t limit) const {
@@ -308,6 +401,97 @@ private:
     IndexedStore(const std::string& dir, const Options& opts)
         : dir_(dir), vlog_dir_(dir + "/vlog"), opts_(opts) {}
 
+    // The entry the index points at and, for a Delta, the chain back to its Full base.
+    struct Version {
+        uint16_t depth = 0;                // Delta entries in the chain
+        uint32_t reads = 0;                // vLog entries read
+        std::vector<uint8_t> full_payload; // the Full base entry's payload
+        std::vector<DecodedDelta> deltas;  // newest first
+    };
+
+    std::mutex& stripeFor(std::string_view key) {
+        return stripes_[std::hash<std::string_view>{}(key) % kStripes];
+    }
+
+    uint64_t maxDocBytes(std::string_view key) const {
+        const uint64_t vlog_max =
+            vlog::kMaxEntryLen - sizeof(vlog::EntryHeader) -
+            vlog::align_up(static_cast<uint32_t>(key.size()), vlog::kEntryAlign);
+        const uint64_t opt =
+            opts_.max_document_bytes ? opts_.max_document_bytes : uint64_t(doc::kMaxDocBytes);
+        return std::min(vlog_max, opt);
+    }
+
+    // Reads the chain starting at ref. Each entry must pass its CRC, carry this key and the
+    // expected seq (the index seq, then each Delta's base_seq), and the depth must fall by one per
+    // hop until a Full entry. Throws VLogReadError otherwise.
+    Version readVersion(std::string_view key, const vlog::IndexValueRef& ref) const {
+        vlog::VLogReader reader(vlog_dir_);
+        Version v;
+        uint64_t want_seq = ref.seq;
+        vlog::VPtr at = ref.vptr;
+        int want_depth = -1; // depth of the next entry; -1 = whatever the first entry says
+        while (true) {
+            vlog::EntryHeader h;
+            std::string k;
+            std::vector<uint8_t> payload;
+            const std::string where = "segment " + std::to_string(at.segment_id) + " offset " +
+                                      std::to_string(at.offset) + " (expected seq " +
+                                      std::to_string(want_seq) + ")";
+            if (!reader.readEntry(at, h, k, payload)) {
+                throw VLogReadError(
+                    "vLog entry unreadable (missing segment, bad bounds, or CRC mismatch) at " +
+                    where);
+            }
+            v.reads++;
+            const uint64_t seq = h.seq;
+            if (seq != want_seq || k != key)
+                throw VLogReadError("vLog entry does not match (seq " + std::to_string(seq) +
+                                    ") at " + where);
+            if (h.type == static_cast<uint8_t>(vlog::EntryType::Full)) {
+                if (want_depth > 0)
+                    throw VLogReadError("Delta chain reached a Full entry early at " + where);
+                v.full_payload = std::move(payload);
+                return v;
+            }
+            if (h.type != static_cast<uint8_t>(vlog::EntryType::Delta))
+                throw VLogReadError("index or Delta points at a non-document entry at " + where);
+            DecodedDelta d;
+            try {
+                d = decodeDelta(payload);
+            } catch (const DeltaFormatError& e) {
+                throw VLogReadError(std::string("malformed Delta entry at ") + where + ": " +
+                                    e.what());
+            }
+            const int depth = d.prefix.chain_depth;
+            if (depth < 1 || depth > vlog::kMaxDeltaChain ||
+                (want_depth >= 0 && depth != want_depth) || d.prefix.base_seq >= seq)
+                throw VLogReadError("Delta entry with a bad chain depth or base at " + where);
+            if (want_depth < 0) v.depth = static_cast<uint16_t>(depth);
+            want_seq = d.prefix.base_seq;
+            at = d.prefix.base;
+            want_depth = depth - 1;
+            v.deltas.push_back(std::move(d));
+        }
+    }
+
+    // Applies the chain's ops, oldest first, to its Full base. Any failure is corruption (ops were
+    // checked against this base when they were written): VLogReadError.
+    doc::Value materialize(const Version& v, std::string_view key,
+                           const vlog::IndexValueRef& ref) const {
+        try {
+            doc::Value d = doc::parse(std::string_view(
+                reinterpret_cast<const char*>(v.full_payload.data()), v.full_payload.size()));
+            for (auto it = v.deltas.rbegin(); it != v.deltas.rend(); ++it)
+                doc::applyOps(d, it->ops);
+            return d;
+        } catch (const std::exception& e) {
+            throw VLogReadError("Delta chain of key \"" + std::string(key) + "\" (seq " +
+                                std::to_string(ref.seq) +
+                                ") does not apply to its base: " + e.what());
+        }
+    }
+
     // Unlinks segments that did not exist before open and hold only their 4 KiB header.
     void removeSegmentsCreatedByOpen(const std::vector<uint32_t>& before) {
         bool removed = false;
@@ -334,23 +518,26 @@ private:
     }
 
     vlog::AppendResult appendOrDie(vlog::EntryType type, std::string_view key, const void* data,
-                                   uint32_t len) {
+                                   uint32_t len, uint8_t flags = 0,
+                                   const vlog::DeltaPrefix* prefix = nullptr) {
         if (closed_) fatal("IndexedStore used after close");
         try {
-            return writer_->append(type, std::string(key), data, len);
+            return writer_->append(type, std::string(key), data, len, flags, 0, prefix);
         } catch (const std::exception& e) {
             errno = 0;
             fatal(std::string("vLog append failed: ") + e.what());
         }
     }
 
+    // delta_base_seq: the Delta's base (Delta entries only). A live Delta whose base is not the
+    // key's current version is a broken invariant (the stripe lock rules it out): abort.
     void applyInOrder(std::string_view key, vlog::EntryType type, const vlog::AppendResult& ar,
-                      bool* had) {
+                      bool* had, uint64_t delta_base_seq = 0) {
         std::unique_lock<std::mutex> lk(seq_mu_);
         if (ar.seq < next_apply_seq_)
             fatal("sequencer: seq " + std::to_string(ar.seq) + " already applied");
         seq_cv_.wait(lk, [&] { return next_apply_seq_ == ar.seq; });
-        BPTree::ApplyResult r = tree_->apply(key, type, ar.seq, 0, ar.vptr, had);
+        BPTree::ApplyResult r = tree_->apply(key, type, ar.seq, 0, ar.vptr, had, delta_base_seq);
         if (r != BPTree::ApplyResult::Applied) {
             errno = 0;
             fatal("live apply was not applied (seq " + std::to_string(ar.seq) + ")");
@@ -416,6 +603,7 @@ private:
     std::unique_ptr<BPTree> tree_;
     bool closed_ = false;
 
+    std::array<std::mutex, kStripes> stripes_;
     std::mutex seq_mu_;
     std::condition_variable seq_cv_;
     uint64_t next_apply_seq_ = 1;
