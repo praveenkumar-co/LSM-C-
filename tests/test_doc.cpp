@@ -1,7 +1,9 @@
-// Phase 4 document tests: the JSON parser and serializer (P4.A). No disk writes.
+// Phase 4 document tests: the JSON parser and serializer (P4.A), paths (P4.B) and update ops
+// (P4.C1-C5, C7) checked against expected documents. No disk writes.
 #include "test_common.hpp"
 
 #include "doc/Json.hpp"
+#include "doc/Update.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -276,6 +278,223 @@ static void testA8Utf8() {
     pass("P4.A8 multi-byte UTF-8 keys/values round-trip");
 }
 
+// ------------------------------------------------------------------------------------------
+// Paths and ops. Every case applies ops to a copy of `before` and compares the result with the
+// expected document; error cases name the exception type.
+// ------------------------------------------------------------------------------------------
+using doc::UpdateOp;
+using Ops = std::vector<UpdateOp>;
+
+static std::string applied(const std::string& before, const Ops& ops) {
+    Value v = doc::parse(before);
+    doc::applyOps(v, ops);
+    return doc::serialize(v);
+}
+
+static void expectApply(const std::string& before, const Ops& ops, const std::string& after) {
+    const std::string got = applied(before, ops);
+    const std::string want = doc::serialize(doc::parse(after));
+    if (got != want) {
+        std::cerr << "apply on " << before << " gave " << got << ", expected " << want << "\n";
+        CHECK(false);
+    }
+}
+
+template <typename E> static void expectThrows(const std::string& before, const Ops& ops) {
+    try {
+        (void)applied(before, ops);
+    } catch (const E&) {
+        return;
+    } catch (const std::exception& e) {
+        std::cerr << "apply on " << before << " threw the wrong error: " << e.what() << "\n";
+        CHECK(false);
+    }
+    std::cerr << "apply on " << before << " did not throw\n";
+    CHECK(false);
+}
+
+static void testB1ValidPaths() {
+    banner("P4.B1 Valid paths");
+    CHECK(doc::splitPath("a") == std::vector<std::string>{"a"});
+    CHECK((doc::splitPath("a.b.c") == std::vector<std::string>{"a", "b", "c"}));
+    CHECK((doc::splitPath("items.0") == std::vector<std::string>{"items", "0"}));
+    CHECK((doc::splitPath("\xD0\xBA.\xE6\x97\xA5") ==
+           std::vector<std::string>{"\xD0\xBA", "\xE6\x97\xA5"}));
+    expectApply("{\"items\":[1,2]}", {doc::set("items.0", Value::integer(9))}, "{\"items\":[9,2]}");
+    expectApply("{}", {doc::set("\xD0\xBA.\xE6\x97\xA5", Value::boolean(true))},
+                "{\"\xD0\xBA\":{\"\xE6\x97\xA5\":true}}");
+    // A numeric segment on an object is a key.
+    expectApply("{\"m\":{}}", {doc::set("m.0", Value::integer(1)), doc::set("m.01", Value())},
+                "{\"m\":{\"0\":1,\"01\":null}}");
+    pass("P4.B1 valid paths: \"a\", \"a.b.c\", \"items.0\", Unicode keys");
+}
+
+static void testB2InvalidPaths() {
+    banner("P4.B2 Invalid paths");
+    int n = 0;
+    for (const char* bad : {"", ".", "a.", ".a", "a..b", ".."}) {
+        expectThrows<doc::PathError>("{\"a\":1}", {doc::set(bad, Value())});
+        ++n;
+    }
+    for (const char* bad :
+         {"items.-1", "items.01", "items.1e2", "items.x", "items.+1", "items. 1", "items.-1.a"}) {
+        expectThrows<doc::PathError>("{\"items\":[1,2,3]}", {doc::set(bad, Value())});
+        expectThrows<doc::PathError>("{\"items\":[1,2,3]}", {doc::unset(bad)});
+        ++n;
+    }
+    expectThrows<doc::PathError>("{}", {doc::set(std::string(1025, 'k'), Value())});
+    expectThrows<doc::PathError>("{}", {doc::set("a.\xFF", Value())});
+    pass("P4.B2 invalid paths rejected (\"\", \".\", \"a.\", \".a\", \"a..b\", \"items.-1\", "
+         "\"items.01\", \"items.1e2\")",
+         std::to_string(n + 2) + " cases");
+}
+
+static void testB3OutOfRange() {
+    banner("P4.B3 Array index out of range");
+    const std::string d = "{\"items\":[{\"k\":1},2]}";
+    expectThrows<doc::RangeError>(d, {doc::set("items.2", Value())});
+    expectThrows<doc::RangeError>(d, {doc::set("items.5.k", Value())});
+    expectThrows<doc::RangeError>(d, {doc::inc("items.2", 1)});
+    expectThrows<doc::RangeError>(d, {doc::unset("items.9")});
+    expectThrows<doc::RangeError>(d, {doc::set("items.99999999999999999", Value())});
+    expectThrows<doc::RangeError>("{\"e\":[]}", {doc::set("e.0", Value())});
+    expectApply(d, {doc::set("items.1", Value::integer(3)), doc::inc("items.0.k", 1)},
+                "{\"items\":[{\"k\":2},3]}");
+    pass("P4.B3 array index out of range -> RangeError");
+}
+
+static void testB4SegmentLimit() {
+    banner("P4.B4 64 path segments accepted, 65 rejected");
+    std::string p64 = "s";
+    for (int i = 1; i < 64; ++i) p64 += ".s";
+    CHECK(doc::splitPath(p64).size() == 64);
+    Value v = Value::object();
+    doc::applyOps(v, {doc::set(p64, Value::integer(1))});
+    CHECK(doc::depth(v) == 64);
+    expectThrows<doc::PathError>("{}", {doc::set(p64 + ".s", Value())});
+    // 64 segments with an object value would make the document 65 levels deep.
+    expectThrows<doc::RangeError>("{}", {doc::set(p64, Value::object())});
+    pass("P4.B4 64 path segments ok, 65 rejected");
+}
+
+static void testC1Set() {
+    banner("P4.C1 $set");
+    expectApply("{\"a\":1}", {doc::set("b", Value::string("x"))}, "{\"a\":1,\"b\":\"x\"}");
+    expectApply("{\"a\":1,\"b\":2}", {doc::set("a", Value::integer(5))}, "{\"a\":5,\"b\":2}");
+    expectApply("{\"a\":1}", {doc::set("a", doc::parse("{\"x\":[1]}"))}, "{\"a\":{\"x\":[1]}}");
+    expectApply("{\"a\":{\"x\":1}}", {doc::set("a", Value::string("s"))}, "{\"a\":\"s\"}");
+    expectApply("{\"a\":1}", {doc::set("a", Value::number(1.0))}, "{\"a\":1.0}");
+    expectApply("{}", {doc::set("a.b.c", Value::integer(1))}, "{\"a\":{\"b\":{\"c\":1}}}");
+    expectApply("{\"a\":{\"z\":0}}", {doc::set("a.b.c", Value())},
+                "{\"a\":{\"z\":0,\"b\":{\"c\":null}}}");
+    expectApply("{\"l\":[{\"n\":1},{\"n\":2}]}", {doc::set("l.1.name", Value::string("b"))},
+                "{\"l\":[{\"n\":1},{\"n\":2,\"name\":\"b\"}]}");
+    expectApply("{\"a\":1}", {doc::set("a", Value::integer(1))}, "{\"a\":1}");
+    pass("P4.C1 $set: new, overwrite, type change, nested auto-create");
+}
+
+static void testC2SubfieldOnPrimitive() {
+    banner("P4.C2 Subfield on a primitive");
+    for (const char* d :
+         {"{\"a\":5}", "{\"a\":\"s\"}", "{\"a\":null}", "{\"a\":true}", "{\"a\":1.5}"}) {
+        expectThrows<doc::TypeError>(d, {doc::set("a.b", Value::integer(1))});
+        expectThrows<doc::TypeError>(d, {doc::set("a.b.c", Value::integer(1))});
+        expectThrows<doc::TypeError>(d, {doc::inc("a.b", 1)});
+        expectApply(d, {doc::unset("a.b")}, d); // nothing to unset below a primitive
+    }
+    expectThrows<doc::TypeError>("{\"a\":[1,2]}", {doc::set("a.0.x", Value())});
+    pass("P4.C2 subfield on a primitive -> TypeError ($unset: no-op)");
+}
+
+static void testC3Unset() {
+    banner("P4.C3 $unset");
+    expectApply("{\"a\":1,\"b\":2,\"c\":3}", {doc::unset("b")}, "{\"a\":1,\"c\":3}");
+    expectApply("{\"a\":1}", {doc::unset("zz")}, "{\"a\":1}");
+    expectApply("{\"a\":1}", {doc::unset("x.y.z")}, "{\"a\":1}");
+    expectApply("{\"a\":{\"b\":1,\"c\":2}}", {doc::unset("a.b")}, "{\"a\":{\"c\":2}}");
+    expectApply("{\"l\":[{\"k\":1,\"j\":2}]}", {doc::unset("l.0.k")}, "{\"l\":[{\"j\":2}]}");
+    expectThrows<doc::TypeError>("{\"l\":[1,2]}", {doc::unset("l.0")});
+    pass("P4.C3 $unset: existing, missing (no change), nested; array element -> TypeError");
+}
+
+static void testC4Inc() {
+    banner("P4.C4 $inc");
+    const int64_t mx = std::numeric_limits<int64_t>::max();
+    const int64_t mn = std::numeric_limits<int64_t>::min();
+    expectApply("{}", {doc::inc("n", 5)}, "{\"n\":5}");
+    expectApply("{}", {doc::inc("n", 2.5)}, "{\"n\":2.5}");
+    expectApply("{}", {doc::inc("a.b", 1)}, "{\"a\":{\"b\":1}}");
+    expectApply("{\"n\":40}", {doc::inc("n", 2)}, "{\"n\":42}");
+    expectApply("{\"n\":40}", {doc::inc("n", -50)}, "{\"n\":-10}");
+    expectApply("{\"n\":1}", {doc::inc("n", 0.5)}, "{\"n\":1.5}");
+    expectApply("{\"n\":1}", {doc::inc("n", 1.0)}, "{\"n\":2.0}"); // any double -> double
+    expectApply("{\"n\":1.5}", {doc::inc("n", 1)}, "{\"n\":2.5}");
+    expectApply("{\"n\":0.25}", {doc::inc("n", 0.5)}, "{\"n\":0.75}");
+    expectApply("{\"n\":" + std::to_string(mx - 1) + "}", {doc::inc("n", 1)},
+                "{\"n\":" + std::to_string(mx) + "}");
+    for (const char* d :
+         {"{\"n\":\"5\"}", "{\"n\":null}", "{\"n\":true}", "{\"n\":[1]}", "{\"n\":{}}"}) {
+        expectThrows<doc::TypeError>(d, {doc::inc("n", 1)});
+        expectThrows<doc::TypeError>(d, {doc::inc("n", 1.0)});
+    }
+    expectThrows<doc::RangeError>("{\"n\":" + std::to_string(mx) + "}", {doc::inc("n", 1)});
+    expectThrows<doc::RangeError>("{\"n\":" + std::to_string(mn) + "}", {doc::inc("n", -1)});
+    expectThrows<doc::RangeError>("{\"n\":1e308}", {doc::inc("n", 1e308)});
+    bool threw = false;
+    try {
+        (void)doc::inc("n", uint64_t(1) << 63);
+    } catch (const doc::RangeError&) {
+        threw = true;
+    }
+    CHECK(threw);
+    pass("P4.C4 $inc: missing, int+int, int+double, double+double; non-number -> TypeError; "
+         "INT64_MAX+1, INT64_MIN-1 -> RangeError");
+}
+
+static void testC5Conflicts() {
+    banner("P4.C5 Overlapping paths in one update");
+    const std::string d = "{\"a\":{\"b\":1,\"bc\":2}}";
+    expectThrows<doc::ConflictError>(d, {doc::set("a", Value()), doc::set("a.b", Value())});
+    expectThrows<doc::ConflictError>(d, {doc::set("a.b", Value()), doc::set("a", Value())});
+    expectThrows<doc::ConflictError>(d, {doc::inc("a.b", 1), doc::inc("a.b", 1)});
+    expectThrows<doc::ConflictError>(d, {doc::unset("a.b"), doc::set("a.b.c", Value())});
+    expectThrows<doc::ConflictError>(
+        d, {doc::set("x", Value()), doc::set("y.z", Value()), doc::unset("y")});
+    expectApply(d, {doc::inc("a.b", 1), doc::inc("a.bc", 1)}, "{\"a\":{\"b\":2,\"bc\":3}}");
+    expectApply(d, {doc::set("a.b", Value()), doc::set("a.c", Value())},
+                "{\"a\":{\"b\":null,\"bc\":2,\"c\":null}}");
+    pass("P4.C5 conflicts: (\"a\",\"a.b\"), (\"a.b\",\"a\"), same path twice; (\"a.b\",\"a.bc\") "
+         "allowed");
+}
+
+static void testC7ThousandOps() {
+    banner("P4.C7 One update with 1,000 ops");
+    Ops ops;
+    Value expect = doc::parse("{\"keep\":true,\"n\":{}}");
+    for (int i = 0; i < 1000; ++i) {
+        const std::string k = "f" + std::to_string(i);
+        switch (i % 3) {
+        case 0:
+            ops.push_back(doc::set(k, Value::integer(i)));
+            expect.set(k, Value::integer(i));
+            break;
+        case 1:
+            ops.push_back(doc::inc("n." + k, i));
+            expect.find("n")->set(k, Value::integer(i));
+            break;
+        default:
+            ops.push_back(doc::set("o." + k, Value::string(k)));
+            if (!expect.find("o")) expect.set("o", Value::object());
+            expect.find("o")->set(k, Value::string(k));
+        }
+    }
+    Value v = doc::parse("{\"keep\":true,\"n\":{}}");
+    doc::applyOps(v, ops);
+    CHECK(v == expect);
+    CHECK(v.size() == 337); // keep, n, o, and 334 top-level f-keys
+    pass("P4.C7 one update with 1,000 ops");
+}
+
 int main() {
     std::string dir = setupRun("doc_test");
     Cleaner cleaner{dir};
@@ -287,6 +506,16 @@ int main() {
     testA6Depth();
     testA7MaxSize();
     testA8Utf8();
+    testB1ValidPaths();
+    testB2InvalidPaths();
+    testB3OutOfRange();
+    testB4SegmentLimit();
+    testC1Set();
+    testC2SubfieldOnPrimitive();
+    testC3Unset();
+    testC4Inc();
+    testC5Conflicts();
+    testC7ThousandOps();
     printBudget();
     return 0;
 }
