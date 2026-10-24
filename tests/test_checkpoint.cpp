@@ -797,6 +797,11 @@ static std::atomic<bool> g_in_cp{false};
 static std::atomic<int> g_cp_page_writes{0};
 static std::atomic<int> g_cp_count{0}; // automatic checkpoints started in this child
 
+// Quick mode caps the child's writes and then blocks it until the kill, so the bytes written do
+// not depend on disk speed. 600 writes still reach the 3rd automatic checkpoint (16 KiB trigger)
+// while writes are running, which kinds 1 and 2 wait for.
+static constexpr uint32_t kChildOpsPerThread = kQuick ? 150 : 3000;
+
 static void killChildWriters(const std::string& sdir, int wfd, int kind) {
     IndexedStore::Options o = storeOpts(48);
     o.auto_checkpoint = true;
@@ -829,7 +834,7 @@ static void killChildWriters(const std::string& sdir, int wfd, int kind) {
     for (uint32_t w = 0; w < 4; ++w) {
         th.emplace_back([&, w] {
             std::mt19937 rng(7000 + w + 10 * kind);
-            for (uint32_t i = 0; i < 3000; ++i) {
+            for (uint32_t i = 0; i < kChildOpsPerThread; ++i) {
                 uint32_t id = rng() % 300;
                 KAck a{0, 0, id, w, i};
                 if (rng() % 100 < 70) {
@@ -844,7 +849,8 @@ static void killChildWriters(const std::string& sdir, int wfd, int kind) {
         });
     }
     for (auto& t : th) t.join();
-    _exit(0); // not reached in practice: the parent kills the child first
+    if (kQuick) pauseForever(); // cap reached: wait for the kill
+    _exit(0);                   // not reached in practice: the parent kills the child first
 }
 
 static void testCP11KillLoop(const std::string& base) {

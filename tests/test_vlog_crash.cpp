@@ -582,6 +582,9 @@ static void testV9ProcessCrash(const std::string& base_dir) {
 #else
     const int kIterations = kQuick ? 10 : 50;
     const size_t kMinAcksBeforeKill = 200;
+    // Quick mode caps the child's appends and then blocks it until the kill, so the bytes written
+    // do not depend on disk speed. The kill still lands at a random time.
+    const int kChildOpsPerThread = kQuick ? 100 : 2000;
     std::mt19937 rng(1337);
     // Kill 5-400 ms after the 200th ack, so writes are in flight. kill -9 cannot tear a single
     // write() call, so torn tails rarely appear here; V3/V6 cover them.
@@ -606,7 +609,7 @@ static void testV9ProcessCrash(const std::string& base_dir) {
                 std::vector<std::thread> threads;
                 for (int w = 0; w < 4; ++w) {
                     threads.emplace_back([&, w]() {
-                        for (int i = 0; i < 2000; ++i) {
+                        for (int i = 0; i < kChildOpsPerThread; ++i) {
                             std::string key = "c_t" + std::to_string(w) + "_k" + std::to_string(i);
                             auto res =
                                 writer.append(EntryType::Full, key, nullptr, 128, 0, 0, nullptr,
@@ -621,6 +624,9 @@ static void testV9ProcessCrash(const std::string& base_dir) {
                     });
                 }
                 for (auto& t : threads) t.join();
+                if (kQuick) {
+                    while (true) pause(); // cap reached: wait for the kill
+                }
             } catch (const std::exception& e) {
                 std::cerr << "[Child] append failed: " << e.what() << "\n";
                 _exit(2);

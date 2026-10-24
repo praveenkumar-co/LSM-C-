@@ -1183,6 +1183,7 @@ static void b5ChildWriters(const std::string& sdir, int wfd, uint32_t ops_per_th
         }
         for (auto& t : th) t.join();
         if (close_and_pause) st->close(); // pauses inside the hook; never returns
+        if (kQuick) pauseForever();       // cap reached: wait for the kill
     } catch (const std::exception& e) {
         std::cerr << "[Child] exception: " << e.what() << "\n";
         _exit(2);
@@ -1202,6 +1203,9 @@ static void testB5KillDuringWrites(const std::string& base) {
     const int kIters = kQuick ? 10 : 50;
     std::mt19937 rng(505);
     std::uniform_int_distribution<int> delay_ms(5, 400);
+    // Quick mode caps the child's writes and then blocks it until the kill, so the bytes written
+    // do not depend on disk speed. The kill still lands at a random time.
+    const uint32_t kChildOpsPerThread = kQuick ? 100 : 2000;
     uint64_t total_acked = 0, total_unacked = 0, total_checked_keys = 0;
     int kinds[3] = {0, 0, 0};
 
@@ -1218,7 +1222,7 @@ static void testB5KillDuringWrites(const std::string& base) {
         CHECK(pid >= 0);
         if (pid == 0) {
             CHECK(close(pfd[0]) == 0);
-            b5ChildWriters(sdir, pfd[1], kind == 2 ? 60 : 2000, kind == 2);
+            b5ChildWriters(sdir, pfd[1], kind == 2 ? 60 : kChildOpsPerThread, kind == 2);
         }
         CHECK(close(pfd[1]) == 0);
 
