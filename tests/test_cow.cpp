@@ -166,13 +166,15 @@ static void testC1CommittedTreeIntact(const std::string& dir) {
     banner("C1 After a checkpoint, changes never touch the committed tree's pages");
     CHECK(mkdir(dir.c_str(), 0755) == 0);
     const std::string path = dir + "/index.db";
-    auto p = Pager::create(path, pagerOpts(256));  // tree + copies exceed 256 frames: evictions write transient pages
+    // Tree + copies exceed the cache: evictions write transient pages.
+    auto p = Pager::create(path, pagerOpts(kQuick ? 128 : 256));
     BPTree t(*p);
     auto sbm = newSbm(dir);
     std::mt19937 rng(11);
     Oracle o;
     uint64_t seq = 0;
-    for (uint32_t i = 0; i < 3000; ++i) { ++seq; t.put(key(i), ref(seq)); o[key(i)] = seq; }
+    const uint32_t n0 = kQuick ? 1500 : 3000;
+    for (uint32_t i = 0; i < n0; ++i) { ++seq; t.put(key(i), ref(seq)); o[key(i)] = seq; }
     Pager::CheckpointStats cs = checkpoint(*p, *sbm, seq);
     Snapshot s1 = takeSnapshot(path, cs.epoch, cs.root, cs.page_count, o);
     const uint64_t frees0 = p->stats().frees;

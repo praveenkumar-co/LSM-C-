@@ -643,7 +643,7 @@ static void testB3Sequential(const std::string& dir) {
 static void testB3ScanBoundaries(const std::string& dir) {
     banner("B3.3 Range scans across page boundaries");
     CHECK(mkdir(dir.c_str(), 0755) == 0);
-    auto p = Pager::create(dir + "/index.db", pagerOpts(32));
+    auto p = Pager::create(dir + "/index.db", pagerOpts(kQuick ? 1024 : 32));  // quick: no eviction writes
     BPTree t(*p);
     std::mt19937_64 rng(303);
     Oracle o;

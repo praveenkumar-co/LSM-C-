@@ -84,6 +84,7 @@ public:
         std::function<void(uint64_t)> on_index_write;  // per index.db page / superblock write (tests count bytes)
         RecoveryHooks hooks;                           // crash-test hooks (rebuild/replay, close checkpoint)
         std::function<bool(Pager::IoOp, page_id_t)> inject_index_failure;  // test-only, see Pager::Options
+        std::function<void(CheckpointTrigger)> on_checkpoint_start;              // test-only: locks held, before the flush
         std::function<void(CheckpointTrigger)> on_checkpoint_after_index_fsync;  // test-only, every checkpoint
         bool auto_checkpoint = true;
         uint64_t checkpoint_bytes = 4ULL * 1024 * 1024;  // vLog bytes between automatic checkpoints
@@ -207,6 +208,7 @@ public:
                 r.epoch = pager_->committedEpoch();
                 return r;
             }
+            if (opts_.on_checkpoint_start) opts_.on_checkpoint_start(trigger);
             Pager::CommitInfo ci;
             ci.checkpoint_seq = last_applied_seq_;
             ci.replay_segment = last_applied_segment_;
@@ -257,6 +259,7 @@ public:
     BPTree& tree() { return *tree_; }
     Pager& pager() { return *pager_; }
     uint64_t vlogBytesWritten() const { return writer_ ? writer_->getTotalBytesWritten() : 0; }
+    uint64_t vlogLastSeq() const { return writer_->getCurrentSeq(); }  // last seq assigned by the vLog writer
     uint64_t writerRecoveryEntriesScanned() const { return writer_ ? writer_->getRecoveryEntriesScanned() : 0; }
     const std::string& vlogDir() const { return vlog_dir_; }
     uint64_t lastAppliedSeq() {

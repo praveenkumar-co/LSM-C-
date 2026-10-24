@@ -476,6 +476,420 @@ static void testCP7TreePageCrc(const std::string& dir) {
               << " keys correct.\n";
 }
 
+// ------------------------------------------------------------------------------------------
+// Step 5
+// ------------------------------------------------------------------------------------------
+#ifndef TSAN_BUILD
+static uint64_t dirBytes(const std::string& dir) {
+    uint64_t total = 0;
+    std::error_code ec;
+    for (auto it = std::filesystem::recursive_directory_iterator(dir, ec); !ec && it != std::filesystem::end(it);
+         it.increment(ec)) {
+        if (it->is_regular_file()) total += it->file_size();
+    }
+    CHECK(!ec);
+    return total;
+}
+
+// CP8: entries appended to the vLog while a checkpoint holds the locks are not in that checkpoint;
+// after a crash right after the checkpoint, recovery replays them.
+static void testCP8UnappliedReplayed(const std::string& dir) {
+    banner("CP8 Entries in the vLog but not applied at checkpoint time are replayed after a crash");
+    const int kBase = 100, kLate = 8;
+    int pfd[2];
+    CHECK(pipe(pfd) == 0);
+    std::cout.flush();
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        childExpectsAbort();
+        CHECK(close(pfd[0]) == 0);
+        IndexedStore::Options o = storeOpts();
+        std::atomic<bool> armed{false};
+        IndexedStore* sp = nullptr;
+        uint64_t seq0 = 0;
+        std::vector<std::thread> late;
+        // The hook runs while the checkpoint holds the sequencer and tree locks: these puts append
+        // to the vLog (write + fsync by the group commit) and then wait to be applied.
+        o.on_checkpoint_after_index_fsync = [&](CheckpointTrigger) {
+            if (!armed.exchange(false)) return;
+            for (int t = 0; t < kLate; ++t) late.emplace_back([sp, t] { sp->put("late" + std::to_string(t), doc(1000 + t, 40)); });
+            for (int w = 0; w < 5000 && sp->vlogLastSeq() < seq0 + kLate; ++w) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));  // let the group commit write them
+        };
+        auto st = IndexedStore::open(dir, o);
+        sp = st.get();
+        for (int i = 0; i < kBase; ++i) st->put("base" + std::to_string(i), doc(i, 40));
+        seq0 = st->vlogLastSeq();
+        armed = true;
+        CheckpointReport r = st->checkpoint();
+        uint64_t rec[2] = {r.checkpoint_seq, st->vlogBytesWritten()};
+        CHECK(write(pfd[1], rec, sizeof(rec)) == static_cast<ssize_t>(sizeof(rec)));
+        raise(SIGKILL);  // crash right after the checkpoint
+    }
+    CHECK(close(pfd[1]) == 0);
+    uint64_t rec[2] = {0, 0};
+    CHECK(read(pfd[0], rec, sizeof(rec)) == static_cast<ssize_t>(sizeof(rec)));
+    CHECK(close(pfd[0]) == 0);
+    int status = 0;
+    CHECK(waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+    accountBytes(dirBytes(dir + "/vlog"), "CP8 child vLog (index writes were counted live)");
+    auto st = IndexedStore::open(dir, storeOpts());
+    const bpt::OpenIndexResult& info = st->openInfo();
+    std::vector<VLogEntryInfo> all = readVLog(st->vlogDir());
+    uint64_t newer = 0;
+    for (const auto& e : all) newer += e.seq > rec[0] ? 1 : 0;
+    std::cout << "checkpoint_seq " << rec[0] << "; vLog entries after it: " << newer << "; recovery applied "
+              << info.vlog_entries_applied << "\n";
+    CHECK(info.initial_status == OpenStatus::Ok && info.checkpoint_seq == rec[0]);
+    CHECK(newer == static_cast<uint64_t>(kLate) && info.vlog_entries_applied == newer);
+    for (int t = 0; t < kLate; ++t) CHECK(st->get("late" + std::to_string(t)) == std::optional<std::string>(doc(1000 + t, 40)));
+    checkIndexEqualsVLog(*st, "CP8");
+    finishStore(st, true);
+    std::cout << "PASS: " << kLate << " entries appended during the checkpoint were not in it (checkpoint_seq "
+              << rec[0] << "); after the crash recovery replayed exactly those " << kLate << " and all are readable.\n";
+}
+
+#endif
+
+// Pages named by either superblock slot, with the CRC of each page's bytes on disk.
+static std::map<bpt::page_id_t, uint32_t> protectedPages(const std::string& dir, uint64_t* cur_epoch) {
+    std::map<bpt::page_id_t, uint32_t> out;
+    bpt::SuperblockManager m(dir + "/superblock.db");
+    bpt::SuperblockManager::LoadResult sl = m.load();
+    CHECK(sl.status == bpt::SuperblockManager::LoadResult::Status::Ok);
+    *cur_epoch = sl.current.sb.epoch;
+    int fd = open((dir + "/index.db").c_str(), O_RDONLY);
+    CHECK(fd >= 0);
+    std::vector<const bpt::SuperblockRecord*> recs{&sl.current};
+    if (sl.has_older) recs.push_back(&sl.older);
+    std::vector<uint8_t> buf(bpt::kPageSize);
+    for (const bpt::SuperblockRecord* r : recs) {
+        bpt::TreeWalk w = bpt::walkTree(fd, static_cast<bpt::page_id_t>(r->sb.index_root_page),
+                                        static_cast<uint32_t>(r->sb.index_page_count));
+        if (!w.ok) std::cerr << "tree of epoch " << r->sb.epoch << ": " << w.why << "\n";
+        CHECK(w.ok);
+        for (bpt::page_id_t id = 1; id < w.reachable.size(); ++id) {
+            if (!w.reachable[id]) continue;
+            CHECK(pread(fd, buf.data(), bpt::kPageSize, static_cast<off_t>(id) * bpt::kPageSize) == bpt::kPageSize);
+            out[id] = vlog::crc32c(buf.data(), buf.size());
+        }
+    }
+    CHECK(close(fd) == 0);
+    return out;
+}
+
+static void testCP9PageReuse(const std::string& dir) {
+    banner("CP9 Checkpoints with page reuse: no page of the trees named by the 2 superblock slots is overwritten");
+    std::map<bpt::page_id_t, uint32_t> prot;
+    uint64_t prot_epoch = 0;
+    size_t checks = 0, pages_checked = 0;
+    IndexedStore::Options o = storeOpts(24);  // small cache: evictions write pages between checkpoints
+    o.on_checkpoint_after_index_fsync = [&](CheckpointTrigger) {
+        // All pages of the new epoch are written and fsynced; the new superblock is not written yet.
+        int fd = open((dir + "/index.db").c_str(), O_RDONLY);
+        CHECK(fd >= 0);
+        std::vector<uint8_t> buf(bpt::kPageSize);
+        for (const auto& [id, crc] : prot) {
+            CHECK(pread(fd, buf.data(), bpt::kPageSize, static_cast<off_t>(id) * bpt::kPageSize) == bpt::kPageSize);
+            if (vlog::crc32c(buf.data(), buf.size()) != crc) {
+                std::cerr << "page " << id << " of a tree named by superblock epoch " << prot_epoch << " (or the one before) was overwritten\n";
+                CHECK(false);
+            }
+        }
+        CHECK(close(fd) == 0);
+        checks++;
+        pages_checked += prot.size();
+    };
+    auto st = IndexedStore::open(dir, o);
+    std::mt19937 rng(9);
+    prot = protectedPages(dir, &prot_epoch);
+    std::printf("  %-6s %-16s %-7s %-6s %-7s\n", "epoch", "protected pages", "pages", "reuses", "pages written");
+    const int kRounds = 6;
+    for (int round = 0; round < kRounds; ++round) {
+        for (int i = 0; i < (kQuick ? 150 : 400); ++i) {
+            std::string k = "r" + std::to_string(rng() % 400);
+            k.resize(80, '=');
+            if (rng() % 100 < 70) st->put(k, doc(i, 20));
+            else st->erase(k);
+        }
+        CheckpointReport r = st->checkpoint();
+        prot = protectedPages(dir, &prot_epoch);
+        CHECK(prot_epoch == r.epoch);
+        std::printf("  %-6llu %-16zu %-7u %-6llu %-7llu\n", (unsigned long long)r.epoch, prot.size(), r.page_count,
+                    (unsigned long long)st->pager().stats().reuses, (unsigned long long)r.pages_written);
+    }
+    const uint64_t reuses = st->pager().stats().reuses;
+    checkIndexEqualsVLog(*st, "CP9");
+    finishStore(st, true);
+    CHECK(checks >= static_cast<size_t>(kRounds) && reuses > 0);
+    std::cout << "PASS: at " << checks << " checkpoints (right before each superblock write) all pages of both "
+              << "slot trees were unchanged (" << pages_checked << " page checks); " << reuses << " pages were reused.\n";
+}
+
+static void testCP10CorruptNewest(const std::string& dir) {
+    banner("CP10 Newest superblock slot corrupt: recovery uses the older slot and is still correct");
+    std::map<std::string, std::pair<uint64_t, std::string>> acked;
+    std::mt19937 rng(10);
+    std::vector<uint64_t> cp_seqs;
+    {
+        auto st = IndexedStore::open(dir, storeOpts(24));
+        for (int round = 0; round < 5; ++round) {
+            for (int i = 0; i < (kQuick ? 120 : 300); ++i) {
+                std::string k = "n" + std::to_string(rng() % 300);
+                k.resize(80, '+');
+                if (rng() % 100 < 75) {
+                    std::string d = doc(round * 1000 + i, 30);
+                    acked[k] = {st->put(k, d), d};
+                } else {
+                    acked.erase(k);
+                    st->erase(k);
+                }
+            }
+            cp_seqs.push_back(st->checkpoint().checkpoint_seq);
+        }
+        for (int i = 0; i < 100; ++i) {
+            std::string k = "n" + std::to_string(rng() % 300);
+            k.resize(80, '+');
+            std::string d = doc(9000 + i, 30);
+            acked[k] = {st->put(k, d), d};
+        }
+        finishStore(st, false);  // crash
+    }
+    const std::string sbp = dir + "/superblock.db";
+    bpt::SuperblockManager m(sbp);
+    bpt::SuperblockManager::LoadResult sl = m.load();
+    CHECK(sl.status == bpt::SuperblockManager::LoadResult::Status::Ok && sl.has_older);
+    std::cout << "slots before: current slot " << sl.current_slot << " epoch " << sl.current.sb.epoch << " (seq "
+              << sl.current.sb.checkpoint_seq << "), older epoch " << sl.older.sb.epoch << " (seq "
+              << sl.older.sb.checkpoint_seq << ")\n";
+    CHECK(sl.current.sb.checkpoint_seq == cp_seqs.back() && sl.older.sb.checkpoint_seq == cp_seqs[cp_seqs.size() - 2]);
+    xorByte(sbp, static_cast<uint64_t>(sl.current_slot) * 4096 + 24, 0x01);  // inside checkpoint_seq
+    auto st = IndexedStore::open(dir, storeOpts(64));
+    const bpt::OpenIndexResult& info = st->openInfo();
+    const uint64_t total = readVLog(st->vlogDir()).size();
+    std::cout << "after corrupting the newest slot: first check " << bpt::toString(info.initial_status)
+              << ", opened at checkpoint seq " << info.checkpoint_seq << ", replay applied " << info.vlog_entries_applied
+              << " of " << total << " entries\n";
+    CHECK(info.initial_status == OpenStatus::Ok && !info.rebuilt);
+    CHECK(info.checkpoint_seq == sl.older.sb.checkpoint_seq);
+    CHECK(info.vlog_entries_scanned == total - sl.older.sb.checkpoint_seq);
+    checkIndexEqualsVLog(*st, "CP10");
+    for (const auto& [k, sd] : acked) {
+        uint64_t s = 0;
+        CHECK(st->get(k, &s) == std::optional<std::string>(sd.second) && s == sd.first);
+    }
+    finishStore(st, true);
+    std::cout << "PASS: the older slot's tree was intact (its pages were not reused); replay from its replay point "
+                 "restored all " << acked.size() << " acked keys.\n";
+}
+
+#ifndef TSAN_BUILD
+// ------------------------------------------------------------------------------------------
+// CP11: kill -9 at random points, 50 iterations
+// ------------------------------------------------------------------------------------------
+struct KAck {
+    uint64_t seq;
+    uint32_t op;  // 1 put, 2 erase, 9 child paused at the crash point
+    uint32_t key_id;
+    uint32_t writer;
+    uint32_t idx;
+};
+static_assert(sizeof(KAck) == 24);
+
+static std::string kKey(uint32_t id) { std::string k = "acct:" + std::to_string(id); k.resize(60, '.'); return k; }
+static std::string kDoc(uint32_t w, uint32_t i, uint32_t id) {
+    return "{\"w\":" + std::to_string(w) + ",\"i\":" + std::to_string(i) + ",\"id\":" + std::to_string(id) + ",\"p\":\"" +
+           std::string(30 + (i * 7 + w) % 90, static_cast<char>('a' + (i + id) % 26)) + "\"}";
+}
+static void sendK(int fd, const KAck& a) { CHECK(write(fd, &a, sizeof(a)) == static_cast<ssize_t>(sizeof(a))); }
+static bool readK(int fd, KAck* a) {
+    while (true) {
+        ssize_t n = read(fd, a, sizeof(*a));
+        if (n == static_cast<ssize_t>(sizeof(*a))) return true;
+        if (n == 0) return false;
+        CHECK(n < 0 && errno == EINTR);
+    }
+}
+[[noreturn]] static void pauseForever() { while (true) pause(); }
+
+enum KillKind { kDuringWrites = 0, kDuringFlush = 1, kBetweenFsyncAndSuperblock = 2, kDuringRecovery = 3 };
+static const char* kindName(int k) {
+    switch (k) {
+        case kDuringWrites: return "during writes";
+        case kDuringFlush: return "during checkpoint flush";
+        case kBetweenFsyncAndSuperblock: return "index fsync -> superblock";
+        default: return "during recovery";
+    }
+}
+
+static std::atomic<bool> g_in_cp{false};
+static std::atomic<int> g_cp_page_writes{0};
+static std::atomic<int> g_cp_count{0};  // automatic checkpoints started in this child
+
+static void killChildWriters(const std::string& sdir, int wfd, int kind) {
+    IndexedStore::Options o = storeOpts(48);
+    o.auto_checkpoint = true;
+    o.checkpoint_bytes = kind == kDuringRecovery ? (1ULL << 40) : 16 * 1024;
+    o.checkpoint_interval_ms = kind == kDuringRecovery ? 3600 * 1000 : 200;
+    // Crash in the 3rd automatic checkpoint, so both superblock slots name real trees.
+    o.on_checkpoint_start = [](CheckpointTrigger) { g_cp_page_writes = 0; g_in_cp = ++g_cp_count >= 3; };
+    if (kind == kDuringFlush) {
+        o.on_checkpoint_after_index_fsync = [](CheckpointTrigger) { g_in_cp = false; };
+        o.on_index_write = [wfd](uint64_t n) {
+            accountBytes(n, "index write (child)");
+            if (g_in_cp.load() && ++g_cp_page_writes == 2) { sendK(wfd, KAck{0, 9, 0, 0, 0}); pauseForever(); }
+        };
+    } else if (kind == kBetweenFsyncAndSuperblock) {
+        o.on_checkpoint_after_index_fsync = [wfd](CheckpointTrigger) {
+            if (g_in_cp.load()) { sendK(wfd, KAck{0, 9, 0, 0, 0}); pauseForever(); }
+        };
+    }
+    auto st = IndexedStore::open(sdir, o);
+    std::vector<std::thread> th;
+    for (uint32_t w = 0; w < 4; ++w) {
+        th.emplace_back([&, w] {
+            std::mt19937 rng(7000 + w + 10 * kind);
+            for (uint32_t i = 0; i < 3000; ++i) {
+                uint32_t id = rng() % 300;
+                KAck a{0, 0, id, w, i};
+                if (rng() % 100 < 70) { a.seq = st->put(kKey(id), kDoc(w, i, id)); a.op = 1; }
+                else { a.seq = st->erase(kKey(id)).seq; a.op = 2; }
+                sendK(wfd, a);
+            }
+        });
+    }
+    for (auto& t : th) t.join();
+    _exit(0);  // not reached in practice: the parent kills the child first
+}
+
+static void testCP11KillLoop(const std::string& base) {
+    banner("CP11 kill -9 at random points (writes, checkpoint flush, between index fsync and superblock, recovery)");
+    CHECK(mkdir(base.c_str(), 0755) == 0);
+    const int kIters = kQuick ? 8 : 50;
+    std::mt19937 rng(1105);
+    int kinds[4] = {0, 0, 0, 0};
+    uint64_t total_acked = 0, total_keys = 0, sum_scanned = 0, sum_entries = 0;
+    std::printf("  %-4s %-26s %-6s %-8s %-8s %-10s %-9s\n", "iter", "crash point", "acked", "entries", "cp seq",
+                "replayed", "keys");
+    for (int iter = 0; iter < kIters; ++iter) {
+        const int kind = iter % 4;
+        kinds[kind]++;
+        const std::string sdir = base + "/it" + std::to_string(iter);
+        int pfd[2];
+        CHECK(pipe(pfd) == 0);
+        std::cout.flush();
+        pid_t pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            childExpectsAbort();
+            CHECK(close(pfd[0]) == 0);
+            killChildWriters(sdir, pfd[1], kind);
+        }
+        CHECK(close(pfd[1]) == 0);
+        std::vector<KAck> acks;
+        KAck a;
+        if (kind == kDuringFlush || kind == kBetweenFsyncAndSuperblock) {
+            bool paused = false;
+            while (readK(pfd[0], &a)) {
+                if (a.op == 9) { paused = true; break; }
+                acks.push_back(a);
+            }
+            CHECK(paused);
+        } else {
+            while (acks.size() < 150 && readK(pfd[0], &a)) acks.push_back(a);
+            CHECK(acks.size() == 150);
+            std::this_thread::sleep_for(std::chrono::milliseconds(5 + rng() % 200));
+        }
+        CHECK(kill(pid, SIGKILL) == 0);
+        int status = 0;
+        CHECK(waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+        while (readK(pfd[0], &a)) { CHECK(a.op != 9); acks.push_back(a); }
+        CHECK(close(pfd[0]) == 0);
+        accountBytes(dirBytes(sdir + "/vlog"), "CP11 child vLog");
+
+        if (kind == kDuringRecovery) {
+            // A second child recovers (replays the vLog tail) and is killed after 20 applied entries.
+            int qfd[2];
+            CHECK(pipe(qfd) == 0);
+            std::cout.flush();
+            pid_t p2 = fork();
+            CHECK(p2 >= 0);
+            if (p2 == 0) {
+                childExpectsAbort();
+                CHECK(close(qfd[0]) == 0);
+                IndexedStore::Options o = storeOpts(48);
+                o.hooks.on_rebuild_entry = [&](uint64_t n) {
+                    if (n == 20) { sendK(qfd[1], KAck{0, 9, 0, 0, 0}); pauseForever(); }
+                };
+                auto st = IndexedStore::open(sdir, o);
+                sendK(qfd[1], KAck{0, 8, 0, 0, 0});  // fewer than 20 entries to replay
+                pauseForever();
+            }
+            CHECK(close(qfd[1]) == 0);
+            CHECK(readK(qfd[0], &a) && (a.op == 9 || a.op == 8));
+            CHECK(kill(p2, SIGKILL) == 0);
+            CHECK(waitpid(p2, &status, 0) == p2);
+            CHECK(close(qfd[0]) == 0);
+            accountBytes(4096, "CP11 recovery child segment header");
+        }
+
+        auto st = IndexedStore::open(sdir, storeOpts(64));
+        const bpt::OpenIndexResult& info = st->openInfo();
+        CHECK(!info.rebuilt && info.initial_status == OpenStatus::Ok);
+        std::vector<VLogEntryInfo> all = readVLog(st->vlogDir());
+        std::set<uint64_t> seqs;
+        std::map<std::string, std::vector<const VLogEntryInfo*>> per_key;
+        for (const auto& e : all) { seqs.insert(e.seq); per_key[e.key].push_back(&e); }
+        checkIndexEqualsVLog(*st, "CP11");
+        // Every acked op is in the vLog, and the newest acked op per key is reflected.
+        std::map<uint32_t, KAck> latest;
+        for (const KAck& x : acks) {
+            CHECK(seqs.count(x.seq) == 1);
+            auto it = latest.find(x.key_id);
+            if (it == latest.end() || x.seq > it->second.seq) latest[x.key_id] = x;
+        }
+        for (const auto& [id, x] : latest) {
+            uint64_t got = 0;
+            std::optional<std::string> d = st->get(kKey(id), &got);
+            if (x.op == 1) {
+                if (d) {
+                    CHECK(got >= x.seq);
+                    if (got == x.seq) CHECK(*d == kDoc(x.writer, x.idx, id));  // the acked value
+                } else {
+                    bool later_tomb = false;  // only a later tombstone (acked or not) may hide it
+                    for (const VLogEntryInfo* e : per_key[kKey(id)])
+                        if (e->seq > x.seq && e->type == static_cast<uint8_t>(vlog::EntryType::Tombstone)) later_tomb = true;
+                    CHECK(later_tomb);
+                }
+            } else if (d) {
+                CHECK(got > x.seq);
+            }
+        }
+        total_acked += acks.size();
+        total_keys += latest.size();
+        if (kind != kDuringRecovery) {  // those iterations run without automatic checkpoints
+            sum_scanned += info.vlog_entries_scanned;
+            sum_entries += all.size();
+        }
+        std::printf("  %-4d %-26s %-6zu %-8zu %-8llu %-10llu %-9zu\n", iter + 1, kindName(kind), acks.size(), all.size(),
+                    (unsigned long long)info.checkpoint_seq, (unsigned long long)info.vlog_entries_scanned, latest.size());
+        finishStore(st, true);
+        std::error_code ec;
+        std::filesystem::remove_all(sdir, ec);
+        CHECK(!ec);
+    }
+    std::cout << "crash points: " << kinds[0] << " during writes, " << kinds[1] << " during checkpoint flush, "
+              << kinds[2] << " between index fsync and superblock write, " << kinds[3] << " during recovery replay\n";
+    std::cout << "with automatic checkpoints (every 16 KiB of vLog here), recovery read " << sum_scanned << " of "
+              << sum_entries << " vLog entries ("
+              << (sum_entries ? 100.0 * sum_scanned / sum_entries : 0.0) << "%)\n";
+    std::cout << "PASS: " << kIters << " iterations; all " << total_acked << " acked ops are in the vLog; for "
+              << total_keys << " keys the newest acked op is reflected (acked value, or a newer write); the index "
+                 "equals a full vLog replay every time.\n";
+}
+#endif
+
 int main() {
     std::cout << "====================================================================\n"
               << "  CHECKPOINT TESTS" << (kQuick ? " (quick)" : "") << "\n"
@@ -489,6 +903,14 @@ int main() {
     testCP5FastRecovery(dir + "/cp5");
     testCP6OldLayout(dir + "/cp6");
     testCP7TreePageCrc(dir + "/cp7");
+    testCP9PageReuse(dir + "/cp9");
+    testCP10CorruptNewest(dir + "/cp10");
+#ifndef TSAN_BUILD
+    testCP8UnappliedReplayed(dir + "/cp8");
+    testCP11KillLoop(dir + "/cp11");
+#else
+    std::cout << "\n[SKIP] CP8 and CP11 fork/kill -9 tests skipped under ThreadSanitizer (same rule as Phase 1 and B5.2).\n";
+#endif
     printBudget();
     std::cout << "\nALL CHECKPOINT TESTS PASSED\n";
     return 0;
