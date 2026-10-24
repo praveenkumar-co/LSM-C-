@@ -33,7 +33,7 @@
 #include "index/Pager.hpp"
 #include "index/SuperblockManager.hpp"
 #include "vlog/VLogReader.hpp"
-#include "vlog/VLogWriter.hpp"  // vlog::sync_directory
+#include "vlog/VLogWriter.hpp" // vlog::sync_directory
 
 #include <algorithm>
 #include <chrono>
@@ -50,9 +50,10 @@
 namespace bpt {
 
 struct RecoveryHooks {
-    std::function<void(uint64_t entries_applied)> on_rebuild_entry;  // after each entry applied by a rebuild or
-                                                                      // recovery replay (crash tests)
-    std::function<void()> on_close_after_flush;                       // close checkpoint: after the index fsync
+    std::function<void(uint64_t entries_applied)>
+        on_rebuild_entry;                       // after each entry applied by a rebuild or
+                                                // recovery replay (crash tests)
+    std::function<void()> on_close_after_flush; // close checkpoint: after the index fsync
 };
 
 // Identity of a vLog directory: id and created_unix_ns of its lowest-id segment.
@@ -64,14 +65,14 @@ struct VLogIdentity {
 struct OpenIndexResult {
     std::unique_ptr<Pager> pager;
     std::unique_ptr<SuperblockManager> sbm;
-    OpenStatus initial_status = OpenStatus::Ok;  // what the checks of the committed index found
-    std::string why;                             // detail for TreeCorrupt and friends
+    OpenStatus initial_status = OpenStatus::Ok; // what the checks of the committed index found
+    std::string why;                            // detail for TreeCorrupt and friends
     bool rebuilt = false;
     uint64_t vlog_entries_scanned = 0;
-    uint64_t vlog_entries_applied = 0;  // BPTree::apply returned Applied
+    uint64_t vlog_entries_applied = 0; // BPTree::apply returned Applied
     uint64_t rebuild_ms = 0;
     VLogIdentity vid;
-    uint64_t checkpoint_seq = 0;  // of the superblock the index was opened from (0 after a rebuild)
+    uint64_t checkpoint_seq = 0; // of the superblock the index was opened from (0 after a rebuild)
     // Newest vLog entry reflected in the tree, and the position right after it.
     uint64_t last_seq = 0;
     uint32_t last_segment = 0;
@@ -100,14 +101,18 @@ inline std::vector<uint32_t> listVLogSegments(const std::string& vlog_dir) {
     while (struct dirent* e = readdir(d)) {
         std::string name = e->d_name;
         if (name.size() == 17 && name.rfind("vlog_", 0) == 0 && name.compare(13, 4, ".log") == 0 &&
-            std::all_of(name.begin() + 5, name.begin() + 13, [](char c) { return c >= '0' && c <= '9'; })) {
+            std::all_of(name.begin() + 5, name.begin() + 13,
+                        [](char c) { return c >= '0' && c <= '9'; })) {
             ids.push_back(static_cast<uint32_t>(std::stoul(name.substr(5, 8))));
         }
         errno = 0;
     }
     int rd_errno = errno;
     if (closedir(d) != 0) fatal("closedir failed on " + vlog_dir);
-    if (rd_errno != 0) { errno = rd_errno; fatal("readdir failed on " + vlog_dir); }
+    if (rd_errno != 0) {
+        errno = rd_errno;
+        fatal("readdir failed on " + vlog_dir);
+    }
     std::sort(ids.begin(), ids.end());
     return ids;
 }
@@ -127,7 +132,7 @@ inline VLogIdentity readVLogIdentity(const std::string& vlog_dir) {
     if (::close(fd) != 0) fatal("close failed for " + path);
     if (r != static_cast<ssize_t>(sizeof(h)) || h.magic != vlog::kSegmentMagic ||
         h.crc32c != vlog::crc32c(&h, offsetof(vlog::SegmentHeader, crc32c))) {
-        return id;  // unreadable identity: never matches a recorded one
+        return id; // unreadable identity: never matches a recorded one
     }
     id.first_segment = h.segment_id;
     id.created_ns = h.created_unix_ns;
@@ -135,7 +140,8 @@ inline VLogIdentity readVLogIdentity(const std::string& vlog_dir) {
 }
 
 // Thrown when the committed index reflects vLog entries that the vLog no longer has
-// (acked writes missing from the vLog). Index files are left untouched, so every open fails the same way.
+// (acked writes missing from the vLog). Index files are left untouched, so every open fails the
+// same way.
 class VLogBehindError : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
@@ -150,7 +156,7 @@ struct TreeWalk {
     uint64_t keys = 0;
     uint32_t height = 0;
     uint64_t pages_read = 0;
-    std::vector<bool> reachable;  // indexed by page id
+    std::vector<bool> reachable; // indexed by page id
 };
 
 // Walks the tree at root with plain preads (no cache): every page must pass checkPage, have the
@@ -169,7 +175,8 @@ inline TreeWalk walkTree(int fd, page_id_t root, uint32_t page_count, bool read_
     while (!stack.empty()) {
         auto [id, expect] = stack.back();
         stack.pop_back();
-        if (id == kNoPage || id >= page_count) return fail(id, "page id outside [1, " + std::to_string(page_count) + ")");
+        if (id == kNoPage || id >= page_count)
+            return fail(id, "page id outside [1, " + std::to_string(page_count) + ")");
         if (w.reachable[id]) return fail(id, "reached twice");
         w.reachable[id] = true;
         if (!read_leaves && expect == 0) continue;
@@ -180,12 +187,15 @@ inline TreeWalk walkTree(int fd, page_id_t root, uint32_t page_count, bool read_
         std::string why;
         if (!checkPage(buf.data(), id, &why)) {
             w.ok = false;
-            w.why = why;  // already starts with "page <id>: "
+            w.why = why; // already starts with "page <id>: "
             return w;
         }
         PageHeader h = loadHeader(buf.data());
-        if (h.page_type == static_cast<uint8_t>(PageType::Meta)) return fail(id, "header page inside the tree");
-        if (expect >= 0 && h.level != expect) return fail(id, "level " + std::to_string(h.level) + ", expected " + std::to_string(expect));
+        if (h.page_type == static_cast<uint8_t>(PageType::Meta))
+            return fail(id, "header page inside the tree");
+        if (expect >= 0 && h.level != expect)
+            return fail(id, "level " + std::to_string(h.level) + ", expected " +
+                                std::to_string(expect));
         if (expect < 0) w.height = h.level + 1u;
         Node n(buf.data());
         const uint32_t vsize = n.valueSize();
@@ -193,13 +203,16 @@ inline TreeWalk walkTree(int fd, page_id_t root, uint32_t page_count, bool read_
             uint32_t off = n.slot(i);
             if (off < h.cell_start || off + 2 > kPageSize) return fail(id, "slot out of range");
             uint32_t klen = n.keyLen(i);
-            if (!validKeyLen(klen) || off + 2 + klen + vsize > kPageSize) return fail(id, "cell out of range");
+            if (!validKeyLen(klen) || off + 2 + klen + vsize > kPageSize)
+                return fail(id, "cell out of range");
         }
         if (n.isLeaf()) {
             w.keys += h.slot_count;
         } else {
-            if (h.slot_count == 0 || h.leftmost_child == kNoPage) return fail(id, "internal page without children");
-            for (uint32_t j = 0; j <= h.slot_count; ++j) stack.emplace_back(n.childAt(j), h.level - 1);
+            if (h.slot_count == 0 || h.leftmost_child == kNoPage)
+                return fail(id, "internal page without children");
+            for (uint32_t j = 0; j <= h.slot_count; ++j)
+                stack.emplace_back(n.childAt(j), h.level - 1);
         }
     }
     w.ok = true;
@@ -213,25 +226,37 @@ struct BootCheck {
     MetaBody header{};
     Pager::Committed committed;
     bool older_tree_ok = false;
-    uint64_t reachable_pages = 0;  // pages of the current tree
+    uint64_t reachable_pages = 0; // pages of the current tree
 };
 
 // Read-only checks of index.db + superblock.db. vid == nullptr skips the vLog identity check.
-inline BootCheck checkCommittedIndex(const std::string& dir, SuperblockManager& sbm, const VLogIdentity* vid) {
+inline BootCheck checkCommittedIndex(const std::string& dir, SuperblockManager& sbm,
+                                     const VLogIdentity* vid) {
     BootCheck bc;
     const std::string path = dir + "/index.db";
     OpenStatus hs = Pager::readHeader(path, &bc.header);
     bc.sb = sbm.load();
-    if (hs != OpenStatus::Ok) { bc.status = hs; return bc; }
-    if (bc.sb.status == SuperblockManager::LoadResult::Status::Missing) { bc.status = OpenStatus::NoSuperblock; return bc; }
+    if (hs != OpenStatus::Ok) {
+        bc.status = hs;
+        return bc;
+    }
+    if (bc.sb.status == SuperblockManager::LoadResult::Status::Missing) {
+        bc.status = OpenStatus::NoSuperblock;
+        return bc;
+    }
     if (bc.sb.status == SuperblockManager::LoadResult::Status::Corrupt) {
         bc.status = OpenStatus::SuperblockCorrupt;
-        bc.why = std::string("slot 0 ") + toString(bc.sb.slot[0]) + ", slot 1 " + toString(bc.sb.slot[1]);
+        bc.why = std::string("slot 0 ") + toString(bc.sb.slot[0]) + ", slot 1 " +
+                 toString(bc.sb.slot[1]);
         return bc;
     }
     const SuperblockRecord& cur = bc.sb.current;
-    if (cur.ext.index_nonce != bc.header.index_nonce) { bc.status = OpenStatus::IndexMismatch; return bc; }
-    if (vid && (cur.ext.vlog_first_segment != vid->first_segment || cur.ext.vlog_created_ns != vid->created_ns)) {
+    if (cur.ext.index_nonce != bc.header.index_nonce) {
+        bc.status = OpenStatus::IndexMismatch;
+        return bc;
+    }
+    if (vid && (cur.ext.vlog_first_segment != vid->first_segment ||
+                cur.ext.vlog_created_ns != vid->created_ns)) {
         bc.status = OpenStatus::VLogMismatch;
         return bc;
     }
@@ -247,7 +272,8 @@ inline BootCheck checkCommittedIndex(const std::string& dir, SuperblockManager& 
     if (static_cast<uint64_t>(st.st_size) < static_cast<uint64_t>(page_count) * kPageSize) {
         if (::close(fd) != 0) fatal("close failed for " + path);
         bc.status = OpenStatus::SizeMismatch;
-        bc.why = "file size " + std::to_string(st.st_size) + ", superblock page count " + std::to_string(page_count);
+        bc.why = "file size " + std::to_string(st.st_size) + ", superblock page count " +
+                 std::to_string(page_count);
         return bc;
     }
     TreeWalk w = walkTree(fd, root, page_count);
@@ -264,16 +290,19 @@ inline BootCheck checkCommittedIndex(const std::string& dir, SuperblockManager& 
     std::vector<bool> older_reach;
     if (bc.sb.has_older && bc.sb.older.ext.index_nonce == bc.header.index_nonce &&
         bc.sb.older.sb.index_page_count <= page_count) {
-        TreeWalk ow = walkTree(fd, static_cast<page_id_t>(bc.sb.older.sb.index_root_page),
-                               static_cast<uint32_t>(bc.sb.older.sb.index_page_count), /*read_leaves=*/false);
+        TreeWalk ow =
+            walkTree(fd, static_cast<page_id_t>(bc.sb.older.sb.index_root_page),
+                     static_cast<uint32_t>(bc.sb.older.sb.index_page_count), /*read_leaves=*/false);
         if (ow.ok) older_reach = std::move(ow.reachable);
         bc.older_tree_ok = ow.ok;
     }
     if (::close(fd) != 0) fatal("close failed for " + path);
     for (page_id_t id = 1; id < page_count; ++id) {
         if (w.reachable[id]) continue;
-        if (id < older_reach.size() && older_reach[id]) bc.committed.free_older.push_back(id);
-        else bc.committed.free_now.push_back(id);
+        if (id < older_reach.size() && older_reach[id])
+            bc.committed.free_older.push_back(id);
+        else
+            bc.committed.free_now.push_back(id);
     }
     bc.reachable_pages = 0;
     for (page_id_t id = 1; id < page_count; ++id) bc.reachable_pages += w.reachable[id] ? 1 : 0;
@@ -311,8 +340,9 @@ inline OpenIndexResult openCommittedIndex(const std::string& dir, const Pager::O
 // Applies vLog entries at or after (from_segment, from_offset) with seq > after_seq, in file order.
 // from_segment == 0: from the first segment. When expect_next is true, the first entry found must
 // have seq after_seq + 1 (the replay point is the position right after entry after_seq).
-inline void replayVLogFrom(const std::string& vlog_dir, BPTree& tree, uint32_t from_segment, uint32_t from_offset,
-                           uint64_t after_seq, bool expect_next, const RecoveryHooks& hooks, OpenIndexResult* res) {
+inline void replayVLogFrom(const std::string& vlog_dir, BPTree& tree, uint32_t from_segment,
+                           uint32_t from_offset, uint64_t after_seq, bool expect_next,
+                           const RecoveryHooks& hooks, OpenIndexResult* res) {
     std::vector<uint32_t> segs = listVLogSegments(vlog_dir);
     vlog::VLogReader reader(vlog_dir);
     uint64_t prev_seq = after_seq;
@@ -320,18 +350,20 @@ inline void replayVLogFrom(const std::string& vlog_dir, BPTree& tree, uint32_t f
     for (size_t i = 0; i < segs.size(); ++i) {
         if (segs[i] < from_segment) continue;
         uint32_t start = segs[i] == from_segment ? from_offset : vlog::kBlockSize;
-        vlog::ScanResult sr = reader.scanSegment(segs[i], /*is_last_segment=*/i + 1 == segs.size(), start);
+        vlog::ScanResult sr =
+            reader.scanSegment(segs[i], /*is_last_segment=*/i + 1 == segs.size(), start);
         for (const vlog::RecoveredEntry& e : sr.entries) {
             res->vlog_entries_scanned++;
             const uint64_t seq = e.header.seq;
             if (first && expect_next && seq != after_seq + 1) {
                 errno = 0;
-                fatal("vLog entry after the replay point has seq " + std::to_string(seq) + ", expected " +
-                      std::to_string(after_seq + 1));
+                fatal("vLog entry after the replay point has seq " + std::to_string(seq) +
+                      ", expected " + std::to_string(after_seq + 1));
             }
             if (!first && seq <= prev_seq) {
                 errno = 0;
-                fatal("vLog seq not increasing during replay: " + std::to_string(seq) + " after " + std::to_string(prev_seq));
+                fatal("vLog seq not increasing during replay: " + std::to_string(seq) + " after " +
+                      std::to_string(prev_seq));
             }
             first = false;
             prev_seq = seq;
@@ -339,11 +371,12 @@ inline void replayVLogFrom(const std::string& vlog_dir, BPTree& tree, uint32_t f
             res->last_segment = e.vptr.segment_id;
             res->last_end = e.vptr.offset + e.vptr.length;
             if (seq <= after_seq) continue;
-            BPTree::ApplyResult ar = tree.apply(e.key, static_cast<vlog::EntryType>(e.header.type), seq,
-                                                e.header.flags, e.vptr);
+            BPTree::ApplyResult ar = tree.apply(e.key, static_cast<vlog::EntryType>(e.header.type),
+                                                seq, e.header.flags, e.vptr);
             if (ar == BPTree::ApplyResult::InvalidKey) {
                 errno = 0;
-                fatal("vLog holds a key the index cannot store (length " + std::to_string(e.key.size()) + ")");
+                fatal("vLog holds a key the index cannot store (length " +
+                      std::to_string(e.key.size()) + ")");
             }
             if (ar == BPTree::ApplyResult::Applied) res->vlog_entries_applied++;
             if (hooks.on_rebuild_entry) hooks.on_rebuild_entry(res->vlog_entries_applied);
@@ -355,7 +388,7 @@ struct IndexOpenPlan {
     BootCheck bc;
     VLogIdentity vid;
     std::unique_ptr<SuperblockManager> sbm;
-    bool from_checkpoint = false;  // false: full rebuild
+    bool from_checkpoint = false; // false: full rebuild
     uint64_t checkpoint_seq = 0;
     uint32_t replay_segment = 0;
     uint32_t replay_offset = vlog::kBlockSize;
@@ -371,7 +404,8 @@ struct IndexOpenPlan {
 
 // Read-only. Call before the vLog writer opens. Throws VLogBehindError if the replay point is
 // missing from the vLog.
-inline IndexOpenPlan planIndexOpen(const std::string& dir, const std::string& vlog_dir, const Pager::Options& opts) {
+inline IndexOpenPlan planIndexOpen(const std::string& dir, const std::string& vlog_dir,
+                                   const Pager::Options& opts) {
     IndexOpenPlan plan;
     plan.vid = readVLogIdentity(vlog_dir);
     plan.sbm.reset(new SuperblockManager(dir + "/superblock.db", sbOpts(opts)));
@@ -390,21 +424,25 @@ inline IndexOpenPlan planIndexOpen(const std::string& dir, const std::string& vl
         bool ok = ::stat(seg.c_str(), &st) == 0;
         if (!ok && errno != ENOENT) fatal("stat failed for " + seg);
         if (!ok || static_cast<uint64_t>(st.st_size) < plan.replay_offset) {
-            throw VLogBehindError("committed index is ahead of the vLog: the superblock's replay point (segment " +
-                                  std::to_string(plan.replay_segment) + ", offset " + std::to_string(plan.replay_offset) +
-                                  ", checkpoint seq " + std::to_string(plan.checkpoint_seq) + ") is " +
-                                  (ok ? "past the end of the segment (" + std::to_string(st.st_size) + " bytes)"
-                                      : std::string("in a segment that does not exist")) +
-                                  ". Acked writes are missing from the vLog. Nothing was modified; restore the missing "
-                                  "segments, or delete index.db to rebuild from the vLog as it is.");
+            throw VLogBehindError(
+                "committed index is ahead of the vLog: the superblock's replay point (segment " +
+                std::to_string(plan.replay_segment) + ", offset " +
+                std::to_string(plan.replay_offset) + ", checkpoint seq " +
+                std::to_string(plan.checkpoint_seq) + ") is " +
+                (ok ? "past the end of the segment (" + std::to_string(st.st_size) + " bytes)"
+                    : std::string("in a segment that does not exist")) +
+                ". Acked writes are missing from the vLog. Nothing was modified; restore the "
+                "missing "
+                "segments, or delete index.db to rebuild from the vLog as it is.");
         }
     }
     return plan;
 }
 
 // Call after the vLog writer opened (with plan.applyToWriterOptions applied).
-inline OpenIndexResult openIndexFromPlan(IndexOpenPlan plan, const std::string& dir, const std::string& vlog_dir,
-                                         const Pager::Options& opts, const RecoveryHooks& hooks = {}) {
+inline OpenIndexResult openIndexFromPlan(IndexOpenPlan plan, const std::string& dir,
+                                         const std::string& vlog_dir, const Pager::Options& opts,
+                                         const RecoveryHooks& hooks = {}) {
     const std::string path = dir + "/index.db";
     const std::string tmp = dir + "/index.db.rebuild";
     OpenIndexResult res;
@@ -418,7 +456,8 @@ inline OpenIndexResult openIndexFromPlan(IndexOpenPlan plan, const std::string& 
         res.last_seq = plan.checkpoint_seq;
         res.last_segment = plan.replay_segment;
         res.last_end = plan.replay_offset;
-        res.pager = Pager::openCommitted(path, opts, plan.bc.committed);  // ftruncates to index_page_count
+        res.pager =
+            Pager::openCommitted(path, opts, plan.bc.committed); // ftruncates to index_page_count
         BPTree tree(*res.pager);
         replayVLogFrom(vlog_dir, tree, plan.replay_segment, plan.replay_offset, plan.checkpoint_seq,
                        /*expect_next=*/true, hooks, &res);
@@ -427,28 +466,33 @@ inline OpenIndexResult openIndexFromPlan(IndexOpenPlan plan, const std::string& 
 
     auto t0 = std::chrono::steady_clock::now();
     res.rebuilt = true;
-    res.vid = readVLogIdentity(vlog_dir);  // after the writer opened (it may have removed a ghost segment)
+    res.vid =
+        readVLogIdentity(vlog_dir); // after the writer opened (it may have removed a ghost segment)
     res.sbm->remove();
-    if (::unlink(tmp.c_str()) != 0 && errno != ENOENT) fatal("unlink of leftover " + tmp + " failed");
+    if (::unlink(tmp.c_str()) != 0 && errno != ENOENT)
+        fatal("unlink of leftover " + tmp + " failed");
     std::unique_ptr<Pager> np = Pager::create(tmp, opts);
     {
         BPTree tree(*np);
         replayVLogFrom(vlog_dir, tree, 0, vlog::kBlockSize, 0, /*expect_next=*/false, hooks, &res);
     }
     np->flushAndSync();
-    if (::rename(tmp.c_str(), path.c_str()) != 0) fatal("rename " + tmp + " -> " + path + " failed");
+    if (::rename(tmp.c_str(), path.c_str()) != 0)
+        fatal("rename " + tmp + " -> " + path + " failed");
     if (vlog::sync_directory(dir) != 0) fatal("fsync of directory " + dir + " failed after rename");
     np->setPath(path);
     np->checkpoint(*res.sbm, res.commitInfo());
     res.pager = std::move(np);
     res.rebuild_ms = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+            .count());
     return res;
 }
 
 // Plan + open for callers that opened the vLog writer themselves (with a full tail scan).
 inline OpenIndexResult openOrRebuildIndex(const std::string& dir, const std::string& vlog_dir,
-                                          const Pager::Options& opts, const RecoveryHooks& hooks = {}) {
+                                          const Pager::Options& opts,
+                                          const RecoveryHooks& hooks = {}) {
     return openIndexFromPlan(planIndexOpen(dir, vlog_dir, opts), dir, vlog_dir, opts, hooks);
 }
 

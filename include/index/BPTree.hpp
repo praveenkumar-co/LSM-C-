@@ -1,5 +1,5 @@
 #pragma once
-// BPTree.hpp - disk-based B+Tree mapping key -> vlog::IndexValueRef. See docs/PHASE2_PLAN.md section 2.
+// BPTree.hpp - disk-based B+Tree mapping key -> vlog::IndexValueRef.
 //
 // - One std::shared_mutex for the whole tree: get/scan take it shared, put/erase/apply exclusive.
 // - Copy-on-write: before a change, every frozen page on the root-to-leaf path is copied to a new
@@ -7,7 +7,7 @@
 //   handed to Pager::freePage, which keeps it reserved while a superblock can still name it.
 // - No leaf sibling pointers (a sibling link would force copying neighbours too). Scans walk with
 //   a stack of pinned parents.
-// - No merges: erase never touches parents or siblings; empty leaves stay in the tree (plan section 5).
+// - No merges: erase never touches parents or siblings; empty leaves stay in the tree.
 // - Keys: 1..256 bytes, compared like std::string (memcmp, then shorter first).
 
 #include "index/BPTreeFormat.hpp"
@@ -25,12 +25,14 @@
 
 namespace bpt {
 
-// View over the bytes of one leaf or internal page (slotted layout, plan section 1.3).
+// View over the bytes of one leaf or internal page (slotted layout).
 class Node {
 public:
     explicit Node(uint8_t* p) : p_(p) {}
 
-    bool isLeaf() const { return p_[offsetof(PageHeader, page_type)] == static_cast<uint8_t>(PageType::Leaf); }
+    bool isLeaf() const {
+        return p_[offsetof(PageHeader, page_type)] == static_cast<uint8_t>(PageType::Leaf);
+    }
     uint8_t level() const { return p_[offsetof(PageHeader, level)]; }
     uint16_t count() const { return ld<uint16_t>(offsetof(PageHeader, slot_count)); }
     uint16_t freeStart() const { return ld<uint16_t>(offsetof(PageHeader, free_start)); }
@@ -65,8 +67,10 @@ public:
     // Child j of an internal page: j == 0 is leftmost_child, j >= 1 is the child of cell j-1.
     page_id_t childAt(uint32_t j) const { return j == 0 ? leftmostChild() : cellChild(j - 1); }
     void setChildAt(uint32_t j, page_id_t c) {
-        if (j == 0) setLeftmostChild(c);
-        else std::memcpy(p_ + slot(j - 1) + 2 + keyLen(j - 1), &c, sizeof(c));
+        if (j == 0)
+            setLeftmostChild(c);
+        else
+            std::memcpy(p_ + slot(j - 1) + 2 + keyLen(j - 1), &c, sizeof(c));
     }
 
     // First index i with key(i) >= k.
@@ -74,7 +78,10 @@ public:
         uint32_t lo = 0, hi = count();
         while (lo < hi) {
             uint32_t mid = (lo + hi) / 2;
-            if (compareKeys(key(mid), k) < 0) lo = mid + 1; else hi = mid;
+            if (compareKeys(key(mid), k) < 0)
+                lo = mid + 1;
+            else
+                hi = mid;
         }
         return lo;
     }
@@ -83,7 +90,10 @@ public:
         uint32_t lo = 0, hi = count();
         while (lo < hi) {
             uint32_t mid = (lo + hi) / 2;
-            if (compareKeys(key(mid), k) <= 0) lo = mid + 1; else hi = mid;
+            if (compareKeys(key(mid), k) <= 0)
+                lo = mid + 1;
+            else
+                hi = mid;
         }
         return lo;
     }
@@ -120,10 +130,11 @@ public:
         const uint32_t cs = cellSize(pos);
         std::memset(p_ + slot(pos), 0, cs);
         uint8_t* slots = p_ + kHeaderSize;
-        std::memmove(slots + kSlotSize * pos, slots + kSlotSize * (pos + 1), kSlotSize * (n - pos - 1));
+        std::memmove(slots + kSlotSize * pos, slots + kSlotSize * (pos + 1),
+                     kSlotSize * (n - pos - 1));
         setCount(static_cast<uint16_t>(n - 1));
         setFreeStart(static_cast<uint16_t>(freeStart() - kSlotSize));
-        std::memset(p_ + freeStart(), 0, kSlotSize);  // keep [free_start, cell_start) zero
+        std::memset(p_ + freeStart(), 0, kSlotSize); // keep [free_start, cell_start) zero
         setFragBytes(static_cast<uint16_t>(fragBytes() + cs));
     }
 
@@ -157,7 +168,11 @@ public:
     }
 
 private:
-    template <typename T> T ld(size_t off) const { T v; std::memcpy(&v, p_ + off, sizeof(v)); return v; }
+    template <typename T> T ld(size_t off) const {
+        T v;
+        std::memcpy(&v, p_ + off, sizeof(v));
+        return v;
+    }
     template <typename T> void st(size_t off, T v) { std::memcpy(p_ + off, &v, sizeof(v)); }
     void setCount(uint16_t v) { st<uint16_t>(offsetof(PageHeader, slot_count), v); }
     void setFreeStart(uint16_t v) { st<uint16_t>(offsetof(PageHeader, free_start), v); }
@@ -204,7 +219,8 @@ public:
         return eraseLocked(key);
     }
 
-    // Entries with start <= key < end, ascending, at most `limit`. start >= end or limit == 0: empty.
+    // Entries with start <= key < end, ascending, at most `limit`. start >= end or limit == 0:
+    // empty.
     ScanResult scan(std::string_view start, std::string_view end, size_t limit) const {
         ScanResult out;
         if (limit == 0 || compareKeys(start, end) >= 0) return out;
@@ -222,17 +238,18 @@ public:
         return out;
     }
 
-    // Redo/live apply of one vLog entry under one exclusive lock (plan section 4):
+    // Redo/live apply of one vLog entry under one exclusive lock:
     // if should_apply(...) then Full/Delta -> put {seq, kind=1, vptr}, Tombstone -> erase.
     // *had_key (optional) reports whether the key was in the index before this call.
-    ApplyResult apply(std::string_view key, vlog::EntryType type, uint64_t seq, uint8_t flags, const vlog::VPtr& vptr,
-                      bool* had_key = nullptr) {
+    ApplyResult apply(std::string_view key, vlog::EntryType type, uint64_t seq, uint8_t flags,
+                      const vlog::VPtr& vptr, bool* had_key = nullptr) {
         if (!validKeyLen(key.size())) return ApplyResult::InvalidKey;
         std::unique_lock<std::shared_mutex> lk(mu_);
         std::optional<Ref> cur = getLocked(key);
         if (had_key) *had_key = cur.has_value();
         if (seq > pager_.maxAppliedSeq()) pager_.setMaxAppliedSeq(seq);
-        if (!vlog::should_apply(cur.has_value(), cur ? cur->seq : 0, seq, flags)) return ApplyResult::Skipped;
+        if (!vlog::should_apply(cur.has_value(), cur ? cur->seq : 0, seq, flags))
+            return ApplyResult::Skipped;
         if (type == vlog::EntryType::Tombstone) {
             eraseLocked(key);
         } else {
@@ -250,8 +267,7 @@ public:
     }
 
     // Runs f with the tree's exclusive lock held (no reader or writer is inside the tree).
-    template <typename F>
-    auto withExclusiveLock(F&& f) {
+    template <typename F> auto withExclusiveLock(F&& f) {
         std::unique_lock<std::shared_mutex> lk(mu_);
         return f();
     }
@@ -269,25 +285,27 @@ public:
         return out;
     }
 
-    // Test-only: walks the whole tree and checks the invariants listed in plan section 3.
+    // Test-only: walks the whole tree and checks its structural invariants.
     // Returns "" if all hold, else a description of the first violation.
     std::string checkInvariants(Shape* shape = nullptr) const {
         std::shared_lock<std::shared_mutex> lk(mu_);
         Shape s;
         std::vector<page_id_t> leaves;
         std::vector<page_id_t> path;
-        std::string err = checkSubtree(pager_.rootPageId(), -1, std::nullopt, std::nullopt, &leaves, &s, &path);
+        std::string err =
+            checkSubtree(pager_.rootPageId(), -1, std::nullopt, std::nullopt, &leaves, &s, &path);
         if (!err.empty()) return err;
         {
             PageGuard g = pager_.fetch(pager_.rootPageId());
             s.height = Node(g.data()).level() + 1u;
         }
         if (s.height != pager_.treeHeight()) {
-            return "meta tree_height " + std::to_string(pager_.treeHeight()) + " != root level + 1 = " +
-                   std::to_string(s.height);
+            return "meta tree_height " + std::to_string(pager_.treeHeight()) +
+                   " != root level + 1 = " + std::to_string(s.height);
         }
         if (s.keys != pager_.keyCount()) {
-            return "meta key_count " + std::to_string(pager_.keyCount()) + " != keys in leaves " + std::to_string(s.keys);
+            return "meta key_count " + std::to_string(pager_.keyCount()) + " != keys in leaves " +
+                   std::to_string(s.keys);
         }
         if (shape) *shape = s;
         return "";
@@ -306,7 +324,8 @@ private:
         PageGuard g = pager_.fetch(pager_.rootPageId());
         while (!Node(g.data()).isLeaf()) {
             Node n(g.data());
-            PageGuard child = pager_.fetch(n.childAt(n.upperBound(key)));  // pin child before unpinning parent
+            PageGuard child =
+                pager_.fetch(n.childAt(n.upperBound(key))); // pin child before unpinning parent
             g = std::move(child);
         }
         return g;
@@ -314,7 +333,8 @@ private:
 
     // Descends to the leaf for key, keeping every internal page on the path pinned together with
     // the child index taken.
-    PageGuard descendWithPath(std::string_view key, std::vector<PageGuard>* path, std::vector<uint32_t>* path_idx) {
+    PageGuard descendWithPath(std::string_view key, std::vector<PageGuard>* path,
+                              std::vector<uint32_t>* path_idx) {
         PageGuard leaf = pager_.fetch(pager_.rootPageId());
         while (!Node(leaf.data()).isLeaf()) {
             Node n(leaf.data());
@@ -331,12 +351,14 @@ private:
     // the parent's child pointer (or the root) is pointed at the copy, and the old page is freed.
     // A page allocated in this epoch has only writable ancestors, so copying stops being needed
     // below the first writable page in practice; the loop still checks every level.
-    void cowPath(std::vector<PageGuard>& path, const std::vector<uint32_t>& path_idx, PageGuard& leaf) {
+    void cowPath(std::vector<PageGuard>& path, const std::vector<uint32_t>& path_idx,
+                 PageGuard& leaf) {
         for (size_t i = 0; i <= path.size(); ++i) {
             PageGuard& g = (i < path.size()) ? path[i] : leaf;
             if (!pager_.isFrozen(g.id())) continue;
             const page_id_t old_id = g.id();
-            PageGuard c = pager_.allocate(PageType::Leaf, 0);  // type/level come from the copied bytes
+            PageGuard c =
+                pager_.allocate(PageType::Leaf, 0); // type/level come from the copied bytes
             std::memcpy(c.data(), g.data(), kPageSize);
             Node(c.data()).setPageId(c.id());
             c.markDirty();
@@ -345,11 +367,12 @@ private:
                 pager_.setRoot(c.id(), pager_.treeHeight());
             } else {
                 Node pn(path[i - 1].data());
-                if (pn.childAt(path_idx[i - 1]) != old_id) fatal("cowPath: parent does not point at the copied page");
+                if (pn.childAt(path_idx[i - 1]) != old_id)
+                    fatal("cowPath: parent does not point at the copied page");
                 pn.setChildAt(path_idx[i - 1], c.id());
                 path[i - 1].markDirty();
             }
-            g = std::move(c);  // unpins the old page
+            g = std::move(c); // unpins the old page
             pager_.freePage(old_id);
             cow_copies_++;
         }
@@ -363,7 +386,7 @@ private:
         Node n(leaf.data());
         uint32_t pos = n.lowerBound(key);
         if (pos < n.count() && compareKeys(n.key(pos), key) == 0) {
-            n.setLeafValue(pos, ref);  // same cell size: an overwrite never splits
+            n.setLeafValue(pos, ref); // same cell size: an overwrite never splits
             leaf.markDirty();
             noteSeq(ref.seq);
             return PutStatus::Updated;
@@ -384,7 +407,8 @@ private:
             PageGuard& parent = path[lvl];
             Node pn(parent.data());
             uint32_t j = path_idx[lvl];
-            if (pn.childAt(j) != left_child) fatal("split: parent does not point at the split child");
+            if (pn.childAt(j) != left_child)
+                fatal("split: parent does not point at the split child");
             // The new right sibling goes right after the split child: cell position j.
             if (pn.insert(j, sep, &new_child)) {
                 parent.markDirty();
@@ -394,7 +418,7 @@ private:
             new_child = splitInternal(parent, j, sep, new_child, &up);
             sep = std::move(up);
             left_child = parent.id();
-            path.pop_back();  // unpin
+            path.pop_back(); // unpin
         }
         // The root split: grow the tree by one level.
         uint32_t old_level = pager_.treeHeight() - 1;
@@ -410,7 +434,8 @@ private:
 
     struct Entry {
         std::string key;
-        uint8_t value[kLeafValueSize];  // leaf: IndexValueRef; internal: first 4 bytes are the child id
+        uint8_t
+            value[kLeafValueSize]; // leaf: IndexValueRef; internal: first 4 bytes are the child id
     };
 
     static std::vector<Entry> readEntries(const Node& n) {
@@ -422,9 +447,10 @@ private:
         return out;
     }
 
-    // Split index by bytes (plan 2.4 step 2): first i where the running total of (cell + slot)
+    // Split index by bytes: first i where the running total of (cell + slot)
     // bytes of E[0..i) reaches half of the grand total, clamped to [lo, hi].
-    static size_t splitIndex(const std::vector<Entry>& e, uint32_t value_size, size_t lo, size_t hi) {
+    static size_t splitIndex(const std::vector<Entry>& e, uint32_t value_size, size_t lo,
+                             size_t hi) {
         uint64_t total = 0;
         for (const Entry& x : e) total += kSlotSize + 2 + x.key.size() + value_size;
         uint64_t run = 0;
@@ -438,13 +464,15 @@ private:
 
     static void fillNode(Node& n, const std::vector<Entry>& e, size_t from, size_t to) {
         for (size_t i = from; i < to; ++i) {
-            if (!n.insert(n.count(), e[i].key, e[i].value)) fatal("split half does not fit in a page");
+            if (!n.insert(n.count(), e[i].key, e[i].value))
+                fatal("split half does not fit in a page");
         }
     }
 
     // Splits a full leaf L while inserting (key, ref) at slot pos. Returns the new right leaf R;
     // *sep = first key of R.
-    page_id_t splitLeaf(PageGuard& lg, uint32_t pos, std::string_view key, const Ref& ref, std::string* sep) {
+    page_id_t splitLeaf(PageGuard& lg, uint32_t pos, std::string_view key, const Ref& ref,
+                        std::string* sep) {
         Node l(lg.data());
         std::vector<Entry> e = readEntries(l);
         Entry ne;
@@ -466,7 +494,8 @@ private:
 
     // Splits a full internal page P while inserting (sep, child) at cell position j.
     // P keeps C0 and E[0..m); P' gets leftmost child E[m].child and E[m+1..n); E[m].key moves up.
-    page_id_t splitInternal(PageGuard& pg, uint32_t j, const std::string& sep, page_id_t child, std::string* up) {
+    page_id_t splitInternal(PageGuard& pg, uint32_t j, const std::string& sep, page_id_t child,
+                            std::string* up) {
         Node p(pg.data());
         std::vector<Entry> e = readEntries(p);
         Entry ne;
@@ -498,7 +527,8 @@ private:
         {
             Node n(leaf.data());
             uint32_t pos = n.lowerBound(key);
-            if (pos >= n.count() || compareKeys(n.key(pos), key) != 0) return false;  // nothing changes: no copy
+            if (pos >= n.count() || compareKeys(n.key(pos), key) != 0)
+                return false; // nothing changes: no copy
         }
         cowPath(path, path_idx, leaf);
         Node n(leaf.data());
@@ -511,14 +541,15 @@ private:
 
     // Cursor scan: a stack of pinned parents with the child index taken at each level. When a
     // leaf is used up, pop to the nearest parent with a next child and descend its leftmost path.
-    void scanLocked(std::string_view start, const std::string_view* end, size_t limit, ScanResult* out) const {
+    void scanLocked(std::string_view start, const std::string_view* end, size_t limit,
+                    ScanResult* out) const {
         std::vector<PageGuard> stack;
         std::vector<uint32_t> idx;
         PageGuard g = pager_.fetch(pager_.rootPageId());
         while (!Node(g.data()).isLeaf()) {
             Node n(g.data());
             uint32_t j = n.upperBound(start);
-            PageGuard child = pager_.fetch(n.childAt(j));  // pin child before the parent can move
+            PageGuard child = pager_.fetch(n.childAt(j)); // pin child before the parent can move
             stack.push_back(std::move(g));
             idx.push_back(j);
             g = std::move(child);
@@ -572,8 +603,8 @@ private:
 
     // expected_level < 0 means "root: any level".
     std::string checkSubtree(page_id_t id, int expected_level, std::optional<std::string> lo,
-                             std::optional<std::string> hi, std::vector<page_id_t>* leaves, Shape* s,
-                             std::vector<page_id_t>* path) const {
+                             std::optional<std::string> hi, std::vector<page_id_t>* leaves,
+                             Shape* s, std::vector<page_id_t>* path) const {
         auto fail = [&](const std::string& m) { return "page " + std::to_string(id) + ": " + m; };
         if (std::find(path->begin(), path->end(), id) != path->end()) return fail("cycle in tree");
         std::vector<std::string> keys;
@@ -590,24 +621,32 @@ private:
             leaf = n.isLeaf();
             level = h.level;
             if (leaf != (h.level == 0)) return fail("leaf flag and level disagree");
-            if (!leaf && h.page_type != static_cast<uint8_t>(PageType::Internal)) return fail("bad page type");
+            if (!leaf && h.page_type != static_cast<uint8_t>(PageType::Internal))
+                return fail("bad page type");
             if (expected_level >= 0 && level != expected_level) {
-                return fail("level " + std::to_string(level) + ", expected " + std::to_string(expected_level));
+                return fail("level " + std::to_string(level) + ", expected " +
+                            std::to_string(expected_level));
             }
-            if (h.free_start != kHeaderSize + kSlotSize * h.slot_count) return fail("free_start != 32 + 2*slot_count");
-            if (h.free_start > h.cell_start || h.cell_start > kPageSize) return fail("free_start > cell_start");
+            if (h.free_start != kHeaderSize + kSlotSize * h.slot_count)
+                return fail("free_start != 32 + 2*slot_count");
+            if (h.free_start > h.cell_start || h.cell_start > kPageSize)
+                return fail("free_start > cell_start");
             if (leaf && h.leftmost_child != 0) return fail("leaf with leftmost_child");
-            if (h.right_sibling != 0) return fail("right_sibling is set (no sibling links since format v3)");
-            if (!leaf && (h.leftmost_child == kNoPage || h.slot_count == 0)) return fail("internal page without children");
+            if (h.right_sibling != 0)
+                return fail("right_sibling is set (no sibling links since format v3)");
+            if (!leaf && (h.leftmost_child == kNoPage || h.slot_count == 0))
+                return fail("internal page without children");
             std::vector<std::pair<uint32_t, uint32_t>> cells;
             uint64_t live = 0;
             for (uint32_t i = 0; i < h.slot_count; ++i) {
                 uint32_t off = n.slot(i);
-                if (off < h.cell_start || off + 2 > kPageSize) return fail("slot " + std::to_string(i) + " out of range");
+                if (off < h.cell_start || off + 2 > kPageSize)
+                    return fail("slot " + std::to_string(i) + " out of range");
                 uint32_t klen = n.keyLen(i);
                 if (!validKeyLen(klen)) return fail("bad key length " + std::to_string(klen));
                 uint32_t cs = n.cellSize(i);
-                if (off + cs > kPageSize) return fail("cell " + std::to_string(i) + " runs past the page");
+                if (off + cs > kPageSize)
+                    return fail("cell " + std::to_string(i) + " runs past the page");
                 cells.emplace_back(off, off + cs);
                 live += cs;
                 keys.emplace_back(n.key(i));
@@ -618,8 +657,8 @@ private:
                 if (cells[i].first < cells[i - 1].second) return fail("overlapping cells");
             }
             if (live + h.frag_bytes != kPageSize - h.cell_start) {
-                return fail("live cell bytes " + std::to_string(live) + " + frag " + std::to_string(h.frag_bytes) +
-                            " != 4096 - cell_start");
+                return fail("live cell bytes " + std::to_string(live) + " + frag " +
+                            std::to_string(h.frag_bytes) + " != 4096 - cell_start");
             }
             for (uint32_t i = h.free_start; i < h.cell_start; ++i) {
                 if (p[i] != 0) return fail("nonzero byte in free gap at " + std::to_string(i));
@@ -627,9 +666,12 @@ private:
             if (!leaf) children.insert(children.begin(), h.leftmost_child);
         }
         for (size_t i = 0; i < keys.size(); ++i) {
-            if (i > 0 && compareKeys(keys[i - 1], keys[i]) >= 0) return fail("keys not strictly ascending");
-            if (lo && compareKeys(keys[i], *lo) < 0) return fail("key below the parent's lower bound");
-            if (hi && compareKeys(keys[i], *hi) >= 0) return fail("key at or above the parent's upper bound");
+            if (i > 0 && compareKeys(keys[i - 1], keys[i]) >= 0)
+                return fail("keys out of order or duplicated");
+            if (lo && compareKeys(keys[i], *lo) < 0)
+                return fail("key below the parent's lower bound");
+            if (hi && compareKeys(keys[i], *hi) >= 0)
+                return fail("key at or above the parent's upper bound");
         }
         if (leaf) {
             leaves->push_back(id);
@@ -641,8 +683,10 @@ private:
         s->internals++;
         path->push_back(id);
         for (size_t j = 0; j < children.size(); ++j) {
-            std::optional<std::string> clo = (j == 0) ? lo : std::optional<std::string>(keys[j - 1]);
-            std::optional<std::string> chi = (j == keys.size()) ? hi : std::optional<std::string>(keys[j]);
+            std::optional<std::string> clo =
+                (j == 0) ? lo : std::optional<std::string>(keys[j - 1]);
+            std::optional<std::string> chi =
+                (j == keys.size()) ? hi : std::optional<std::string>(keys[j]);
             std::string err = checkSubtree(children[j], level - 1, clo, chi, leaves, s, path);
             if (!err.empty()) return err;
         }
@@ -652,7 +696,7 @@ private:
 
     Pager& pager_;
     mutable std::shared_mutex mu_;
-    uint64_t cow_copies_ = 0;  // guarded by mu_ (exclusive)
+    uint64_t cow_copies_ = 0; // guarded by mu_ (exclusive)
 
 public:
     uint64_t cowCopies() const {

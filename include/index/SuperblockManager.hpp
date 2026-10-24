@@ -18,8 +18,8 @@
 #include "index/IndexCommon.hpp"
 #include "vlog/CRC32.hpp"
 #include "vlog/VLogFormat.hpp"
-#include "vlog/VLogReader.hpp"  // vlog::full_fsync
-#include "vlog/VLogWriter.hpp"  // vlog::sync_directory
+#include "vlog/VLogReader.hpp" // vlog::full_fsync
+#include "vlog/VLogWriter.hpp" // vlog::sync_directory
 
 #include <algorithm>
 #include <cstddef>
@@ -36,7 +36,7 @@ namespace bpt {
 
 constexpr uint32_t kSuperblockFormatVersion = 1;
 constexpr uint32_t kSuperSlotSize = 4096;
-constexpr uint64_t kSuperExtMagic = 0x3154584542505553ULL;  // "SUPBEXT1" (LE bytes)
+constexpr uint64_t kSuperExtMagic = 0x3154584542505553ULL; // "SUPBEXT1" (LE bytes)
 
 #pragma pack(push, 1)
 struct SuperblockExt {           // at offset 64 of each slot
@@ -61,10 +61,14 @@ enum class SlotState { Valid, Short, BadCrc, BadFields };
 
 inline const char* toString(SlotState s) {
     switch (s) {
-        case SlotState::Valid:     return "Valid";
-        case SlotState::Short:     return "Short";
-        case SlotState::BadCrc:    return "BadCrc";
-        case SlotState::BadFields: return "BadFields";
+    case SlotState::Valid:
+        return "Valid";
+    case SlotState::Short:
+        return "Short";
+    case SlotState::BadCrc:
+        return "BadCrc";
+    case SlotState::BadFields:
+        return "BadFields";
     }
     return "?";
 }
@@ -90,16 +94,21 @@ inline SlotState decodeSlot(const uint8_t* slot, size_t n, SuperblockRecord* out
     SuperblockRecord r;
     std::memcpy(&r.sb, slot, sizeof(r.sb));
     std::memcpy(&r.ext, slot + sizeof(r.sb), sizeof(r.ext));
-    if (r.sb.crc32c != vlog::crc32c(&r.sb, offsetof(vlog::Superblock, crc32c))) return SlotState::BadCrc;
-    if (r.ext.crc32c != vlog::crc32c(&r.ext, offsetof(SuperblockExt, crc32c))) return SlotState::BadCrc;
-    if (r.sb.magic != vlog::kSuperMagic || r.sb.format_version != kSuperblockFormatVersion || r.sb.reserved0 != 0 ||
-        r.ext.magic != kSuperExtMagic) {
+    if (r.sb.crc32c != vlog::crc32c(&r.sb, offsetof(vlog::Superblock, crc32c)))
+        return SlotState::BadCrc;
+    if (r.ext.crc32c != vlog::crc32c(&r.ext, offsetof(SuperblockExt, crc32c)))
+        return SlotState::BadCrc;
+    if (r.sb.magic != vlog::kSuperMagic || r.sb.format_version != kSuperblockFormatVersion ||
+        r.sb.reserved0 != 0 || r.ext.magic != kSuperExtMagic) {
         return SlotState::BadFields;
     }
     if (r.sb.epoch == 0) return SlotState::BadFields;
-    if (r.sb.index_page_count < 2 || r.sb.index_page_count > UINT32_MAX) return SlotState::BadFields;
-    if (r.sb.index_root_page == 0 || r.sb.index_root_page >= r.sb.index_page_count) return SlotState::BadFields;
-    if (r.sb.replay_offset < vlog::kBlockSize || r.sb.replay_offset % vlog::kEntryAlign != 0) return SlotState::BadFields;
+    if (r.sb.index_page_count < 2 || r.sb.index_page_count > UINT32_MAX)
+        return SlotState::BadFields;
+    if (r.sb.index_root_page == 0 || r.sb.index_root_page >= r.sb.index_page_count)
+        return SlotState::BadFields;
+    if (r.sb.replay_offset < vlog::kBlockSize || r.sb.replay_offset % vlog::kEntryAlign != 0)
+        return SlotState::BadFields;
     if (out) *out = r;
     return SlotState::Valid;
 }
@@ -110,16 +119,17 @@ public:
         enum class Status { Ok, Missing, Corrupt } status = Status::Missing;
         SlotState slot[2] = {SlotState::Short, SlotState::Short};
         int current_slot = -1;
-        SuperblockRecord current;  // valid when status == Ok
-        bool has_older = false;    // the other slot is valid and has a lower epoch
+        SuperblockRecord current; // valid when status == Ok
+        bool has_older = false;   // the other slot is valid and has a lower epoch
         SuperblockRecord older;
     };
 
     struct Options {
-        std::function<void(uint64_t)> on_write;  // bytes per pwrite (tests count bytes)
+        std::function<void(uint64_t)> on_write; // bytes per pwrite (tests count bytes)
     };
 
-    explicit SuperblockManager(std::string path, Options opts = {}) : path_(std::move(path)), opts_(std::move(opts)) {}
+    explicit SuperblockManager(std::string path, Options opts = {})
+        : path_(std::move(path)), opts_(std::move(opts)) {}
 
     const std::string& path() const { return path_; }
     uint64_t epoch() const { return epoch_; }
@@ -176,14 +186,17 @@ public:
 
     // Makes rec durable. rec.sb.epoch must be greater than the current epoch.
     // Existing file: writes the non-current slot, then F_FULLFSYNC.
-    // No file: creates it (O_CREAT | O_EXCL) with rec in slot 0, F_FULLFSYNC, fsync of the directory.
+    // No file: creates it (O_CREAT | O_EXCL) with rec in slot 0, F_FULLFSYNC, fsync of the
+    // directory.
     void commit(const SuperblockRecord& rec) {
         if (!loaded_or_created()) fatal("SuperblockManager::commit before load() on " + path_);
         if (rec.sb.epoch <= epoch_) {
             errno = 0;
-            fatal("superblock epoch " + std::to_string(rec.sb.epoch) + " is not above " + std::to_string(epoch_));
+            fatal("superblock epoch " + std::to_string(rec.sb.epoch) + " is not above " +
+                  std::to_string(epoch_));
         }
-        if (rec.sb.index_page_count > UINT32_MAX || rec.sb.index_root_page >= rec.sb.index_page_count) {
+        if (rec.sb.index_page_count > UINT32_MAX ||
+            rec.sb.index_root_page >= rec.sb.index_page_count) {
             errno = 0;
             fatal("superblock page fields out of range");
         }
@@ -198,7 +211,8 @@ public:
             pwriteAll(fd, both, sizeof(both), 0);
             if (vlog::full_fsync(fd) != 0) fatal("F_FULLFSYNC failed for new " + path_);
             if (::close(fd) != 0) fatal("close failed for " + path_);
-            if (vlog::sync_directory(parentDir(path_)) != 0) fatal("fsync of directory failed after creating " + path_);
+            if (vlog::sync_directory(parentDir(path_)) != 0)
+                fatal("fsync of directory failed after creating " + path_);
             exists_ = true;
             cur_slot_ = 0;
         } else {
@@ -206,7 +220,8 @@ public:
             int fd = ::open(path_.c_str(), O_RDWR);
             if (fd < 0) fatal("open failed for " + path_);
             pwriteAll(fd, slot, kSuperSlotSize, static_cast<off_t>(target) * kSuperSlotSize);
-            if (vlog::full_fsync(fd) != 0) fatal("F_FULLFSYNC failed for " + path_);  // never retried
+            if (vlog::full_fsync(fd) != 0)
+                fatal("F_FULLFSYNC failed for " + path_); // never retried
             if (::close(fd) != 0) fatal("close failed for " + path_);
             cur_slot_ = target;
         }
@@ -235,7 +250,7 @@ private:
         if (!known_) {
             // First use without load(): find out whether the file exists.
             struct stat st;
-            if (::stat(path_.c_str(), &st) == 0) return false;  // exists but never read: refuse
+            if (::stat(path_.c_str(), &st) == 0) return false; // exists but never read: refuse
             if (errno != ENOENT) fatal("stat failed for " + path_);
             exists_ = false;
             known_ = true;
@@ -245,7 +260,8 @@ private:
 
     void pwriteAll(int fd, const uint8_t* p, size_t n, off_t off) {
         ssize_t w = ::pwrite(fd, p, n, off);
-        if (w != static_cast<ssize_t>(n)) fatal("pwrite of " + std::to_string(n) + " bytes failed for " + path_);
+        if (w != static_cast<ssize_t>(n))
+            fatal("pwrite of " + std::to_string(n) + " bytes failed for " + path_);
         if (opts_.on_write) opts_.on_write(n);
     }
 

@@ -9,11 +9,13 @@
 
 namespace bpt {
 
-// Prints the message (and errno, if set) and aborts. Used for failed syscalls and broken invariants.
+// Prints the message (and errno, if set) and aborts. Used for failed syscalls and broken
+// invariants.
 [[noreturn]] inline void fatal(const std::string& msg) {
     int e = errno;
     if (e != 0) {
-        std::fprintf(stderr, "Fatal (index): %s (errno %d: %s). Aborting.\n", msg.c_str(), e, std::strerror(e));
+        std::fprintf(stderr, "Fatal (index): %s (errno %d: %s). Aborting.\n", msg.c_str(), e,
+                     std::strerror(e));
     } else {
         std::fprintf(stderr, "Fatal (index): %s. Aborting.\n", msg.c_str());
     }

@@ -5,9 +5,9 @@
 #   make test-quick  optimized build with -DTEST_QUICK: smaller workloads, under 20 MiB written
 #   make clean
 #
-# Each test binary prints "[Budget] Total bytes written by all stages: N ...". After a run, the
-# Makefile adds up N over all binaries and fails if the sum is over the mode's limit
-# (512 MiB for test/asan/tsan, 20 MiB for test-quick).
+# Each test binary prints one "[PASS] ..." line per test (TEST_VERBOSE=1 adds measurements) and
+# "[Budget] bytes written: N of M". After a run, the Makefile adds up N over all binaries and
+# fails if the sum is over the mode's limit (512 MiB for test/asan/tsan, 20 MiB for test-quick).
 
 ifeq ($(origin CXX),default)
 CXX := clang++
@@ -50,7 +50,7 @@ $(1): check-deps $(addprefix build/$(1)/,$(TEST_NAMES))
 	  ./build/$(1)/$$$$t > build/$(1)/$$$$t.log 2>&1; rc=$$$$?; cat build/$(1)/$$$$t.log; \
 	  if [ $$$$rc -ne 0 ]; then echo "=== [$(1)] $$$$t: FAILED (exit $$$$rc) ==="; exit $$$$rc; fi; \
 	  echo "=== [$(1)] $$$$t: exit 0 ==="; \
-	  b=$$$$(sed -n 's/^\[Budget\] Total bytes written by all stages: \([0-9]*\).*/\1/p' build/$(1)/$$$$t.log | tail -1); \
+	  b=$$$$(sed -n 's/^\[Budget\] bytes written: \([0-9]*\).*/\1/p' build/$(1)/$$$$t.log | tail -1); \
 	  if [ -z "$$$$b" ]; then echo "=== [$(1)] $$$$t: no [Budget] line ==="; exit 1; fi; \
 	  total=$$$$((total + b)); \
 	done; \

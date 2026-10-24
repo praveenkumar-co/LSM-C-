@@ -21,11 +21,10 @@
 #include "index/BPTreeFormat.hpp"
 #include "index/IndexCommon.hpp"
 #include "index/SuperblockManager.hpp"
-#include "vlog/VLogReader.hpp"  // vlog::full_fsync
+#include "vlog/VLogReader.hpp" // vlog::full_fsync
 
-#include <chrono>
 #include <cerrno>
-#include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -48,28 +47,37 @@ namespace bpt {
 // What opening the committed index found. Anything but Ok leads to a full rebuild from the vLog
 // (VLogBehindError is the one exception: see IndexRecovery.hpp).
 enum class OpenStatus {
-    Ok,                 // superblock, header, nonce, vLog identity, file size and tree pages all check out
-    Missing,            // index.db does not exist
-    BadHeader,          // index.db header page fails its checks
-    NoSuperblock,       // index.db exists but superblock.db does not
-    SuperblockCorrupt,  // both superblock slots invalid
-    IndexMismatch,      // superblock describes a different index.db (nonce differs)
-    VLogMismatch,       // superblock was written for a different vLog
-    SizeMismatch,       // index.db is shorter than the committed page count
-    TreeCorrupt,        // a page of the committed tree fails its CRC or structure checks
+    Ok,        // superblock, header, nonce, vLog identity, file size and tree pages all check out
+    Missing,   // index.db does not exist
+    BadHeader, // index.db header page fails its checks
+    NoSuperblock,      // index.db exists but superblock.db does not
+    SuperblockCorrupt, // both superblock slots invalid
+    IndexMismatch,     // superblock describes a different index.db (nonce differs)
+    VLogMismatch,      // superblock was written for a different vLog
+    SizeMismatch,      // index.db is shorter than the committed page count
+    TreeCorrupt,       // a page of the committed tree fails its CRC or structure checks
 };
 
 inline const char* toString(OpenStatus s) {
     switch (s) {
-        case OpenStatus::Ok:                return "Ok";
-        case OpenStatus::Missing:           return "Missing";
-        case OpenStatus::BadHeader:         return "BadHeader";
-        case OpenStatus::NoSuperblock:      return "NoSuperblock";
-        case OpenStatus::SuperblockCorrupt: return "SuperblockCorrupt";
-        case OpenStatus::IndexMismatch:     return "IndexMismatch";
-        case OpenStatus::VLogMismatch:      return "VLogMismatch";
-        case OpenStatus::SizeMismatch:      return "SizeMismatch";
-        case OpenStatus::TreeCorrupt:       return "TreeCorrupt";
+    case OpenStatus::Ok:
+        return "Ok";
+    case OpenStatus::Missing:
+        return "Missing";
+    case OpenStatus::BadHeader:
+        return "BadHeader";
+    case OpenStatus::NoSuperblock:
+        return "NoSuperblock";
+    case OpenStatus::SuperblockCorrupt:
+        return "SuperblockCorrupt";
+    case OpenStatus::IndexMismatch:
+        return "IndexMismatch";
+    case OpenStatus::VLogMismatch:
+        return "VLogMismatch";
+    case OpenStatus::SizeMismatch:
+        return "SizeMismatch";
+    case OpenStatus::TreeCorrupt:
+        return "TreeCorrupt";
     }
     return "?";
 }
@@ -84,7 +92,10 @@ public:
     PageGuard& operator=(const PageGuard&) = delete;
     PageGuard(PageGuard&& o) noexcept { moveFrom(o); }
     PageGuard& operator=(PageGuard&& o) noexcept {
-        if (this != &o) { release(); moveFrom(o); }
+        if (this != &o) {
+            release();
+            moveFrom(o);
+        }
         return *this;
     }
     ~PageGuard() { release(); }
@@ -100,8 +111,13 @@ private:
     PageGuard(Pager* p, uint32_t frame, uint8_t* data, page_id_t id)
         : pager_(p), frame_(frame), data_(data), id_(id) {}
     void moveFrom(PageGuard& o) {
-        pager_ = o.pager_; frame_ = o.frame_; data_ = o.data_; id_ = o.id_;
-        o.pager_ = nullptr; o.data_ = nullptr; o.id_ = kNoPage;
+        pager_ = o.pager_;
+        frame_ = o.frame_;
+        data_ = o.data_;
+        id_ = o.id_;
+        o.pager_ = nullptr;
+        o.data_ = nullptr;
+        o.id_ = kNoPage;
     }
     Pager* pager_{nullptr};
     uint32_t frame_{0};
@@ -116,10 +132,11 @@ public:
     enum class IoOp { PageWrite, Fsync };
 
     struct Options {
-        size_t num_frames = 1024;                  // 4 MiB of cache
-        std::function<void(uint64_t)> on_write;    // called with 4096 after every page pwrite (tests count bytes)
-        // Test-only fault injection: called before each page pwrite / fsync of index.db. Returning true
-        // makes that call behave as if the syscall failed with EIO (the pager then aborts).
+        size_t num_frames = 1024; // 4 MiB of cache
+        std::function<void(uint64_t)>
+            on_write; // called with 4096 after every page pwrite (tests count bytes)
+        // Test-only fault injection: called before each page pwrite / fsync of index.db. Returning
+        // true makes that call behave as if the syscall failed with EIO (the pager then aborts).
         std::function<bool(IoOp, page_id_t)> inject_failure;
     };
 
@@ -128,8 +145,8 @@ public:
         uint64_t page_writes = 0;
         uint64_t evictions = 0;
         uint64_t fsyncs = 0;
-        uint64_t frees = 0;   // freePage calls
-        uint64_t reuses = 0;  // allocations served from the free list
+        uint64_t frees = 0;  // freePage calls
+        uint64_t reuses = 0; // allocations served from the free list
     };
 
     // A verified committed tree (IndexRecovery.hpp checks it before calling openCommitted).
@@ -145,17 +162,17 @@ public:
 
     // What the next superblock records besides the tree itself.
     struct CommitInfo {
-        uint64_t checkpoint_seq = 0;      // every vLog entry with seq <= this is reflected in the tree
-        uint32_t replay_segment = 0;      // redo scan starts here (0: from the first segment)
+        uint64_t checkpoint_seq = 0; // every vLog entry with seq <= this is reflected in the tree
+        uint32_t replay_segment = 0; // redo scan starts here (0: from the first segment)
         uint32_t replay_offset = vlog::kBlockSize;
-        uint32_t vlog_first_segment = 0;  // vLog identity
+        uint32_t vlog_first_segment = 0; // vLog identity
         uint64_t vlog_created_ns = 0;
     };
 
     struct CheckpointStats {
         uint64_t epoch = 0;
-        uint64_t pages_written = 0;   // dirty pages written back by this checkpoint
-        uint64_t bytes_written = 0;   // pages + the 4096-byte superblock slot
+        uint64_t pages_written = 0; // dirty pages written back by this checkpoint
+        uint64_t bytes_written = 0; // pages + the 4096-byte superblock slot
         uint32_t page_count = 0;
         page_id_t root = kNoPage;
     };
@@ -167,8 +184,8 @@ public:
         if (fd < 0) fatal("open(O_CREAT|O_EXCL) failed for " + path);
         std::unique_ptr<Pager> p(new Pager(path, fd, opts));
         p->nonce_ = newNonce();
-        p->page_count_ = 1;  // page 0 (header)
-        p->checkpoint_page_count_ = 1;  // only the header is frozen
+        p->page_count_ = 1;            // page 0 (header)
+        p->checkpoint_page_count_ = 1; // only the header is frozen
         p->height_ = 1;
         p->writeHeaderLocked();
         p->fsyncOrDie("F_FULLFSYNC after create of " + path);
@@ -192,7 +209,8 @@ public:
     }
 
     // Opens a file whose committed tree was already verified. The header must still match.
-    static std::unique_ptr<Pager> openCommitted(const std::string& path, Options opts, const Committed& c) {
+    static std::unique_ptr<Pager> openCommitted(const std::string& path, Options opts,
+                                                const Committed& c) {
         int fd = ::open(path.c_str(), O_RDWR);
         if (fd < 0) fatal("open failed for " + path);
         MetaBody m{};
@@ -211,7 +229,8 @@ public:
         }
         std::unique_ptr<Pager> p(new Pager(path, fd, opts));
         if (static_cast<uint64_t>(st.st_size) > committed_bytes) {
-            if (::ftruncate(fd, static_cast<off_t>(committed_bytes)) != 0) fatal("ftruncate failed for " + path);
+            if (::ftruncate(fd, static_cast<off_t>(committed_bytes)) != 0)
+                fatal("ftruncate failed for " + path);
             p->fsyncOrDie("F_FULLFSYNC after ftruncate of " + path);
             p->truncated_pages_ = (static_cast<uint64_t>(st.st_size) - committed_bytes) / kPageSize;
         }
@@ -245,7 +264,8 @@ public:
     PageGuard fetch(page_id_t id) {
         std::lock_guard<std::mutex> lk(mu_);
         if (id == kMetaPageId || id >= page_count_) {
-            fatal("fetch of invalid page id " + std::to_string(id) + " (page_count " + std::to_string(page_count_) + ")");
+            fatal("fetch of invalid page id " + std::to_string(id) + " (page_count " +
+                  std::to_string(page_count_) + ")");
         }
         auto it = table_.find(id);
         if (it != table_.end()) {
@@ -286,7 +306,10 @@ public:
                 f = it->second;
                 Frame& fr = frames_[f];
                 if (fr.pins != 0) fatal("reused page " + std::to_string(id) + " is pinned");
-                if (fr.in_lru) { lru_.erase(fr.lru_it); fr.in_lru = false; }
+                if (fr.in_lru) {
+                    lru_.erase(fr.lru_it);
+                    fr.in_lru = false;
+                }
                 table_.erase(it);
                 fr.page_id = kNoPage;
             } else {
@@ -312,7 +335,8 @@ public:
     // commit; a page allocated in this epoch was never committed and is reusable at once.
     void freePage(page_id_t id) {
         std::lock_guard<std::mutex> lk(mu_);
-        if (id == kMetaPageId || id >= page_count_) fatal("freePage of invalid page id " + std::to_string(id));
+        if (id == kMetaPageId || id >= page_count_)
+            fatal("freePage of invalid page id " + std::to_string(id));
         stats_.frees++;
         if (isFrozenLocked(id)) {
             pending_.push_back({epoch_, id});
@@ -388,8 +412,10 @@ public:
         // Pages freed in epoch e are no longer referenced by either slot once epoch e + 2 commits.
         size_t keep = 0;
         for (size_t i = 0; i < pending_.size(); ++i) {
-            if (pending_[i].first + 2 <= epoch_) free_now_.push_back(pending_[i].second);
-            else pending_[keep++] = pending_[i];
+            if (pending_[i].first + 2 <= epoch_)
+                free_now_.push_back(pending_[i].second);
+            else
+                pending_[keep++] = pending_[i];
         }
         pending_.resize(keep);
         CheckpointStats cs;
@@ -409,7 +435,8 @@ public:
         std::vector<uint8_t> buf(kPageSize);
         for (page_id_t id = 0; id < page_count_; ++id) {
             ssize_t r = ::pread(fd_, buf.data(), kPageSize, static_cast<off_t>(id) * kPageSize);
-            if (r != static_cast<ssize_t>(kPageSize)) return "short pread of page " + std::to_string(id);
+            if (r != static_cast<ssize_t>(kPageSize))
+                return "short pread of page " + std::to_string(id);
             std::string why;
             if (!checkPage(buf.data(), id, &why)) return why;
         }
@@ -425,7 +452,10 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         return page_count_;
     }
-    void setRoot(page_id_t root, uint32_t height) { root_ = root; height_ = height; }
+    void setRoot(page_id_t root, uint32_t height) {
+        root_ = root;
+        height_ = height;
+    }
     void setKeyCount(uint64_t n) { key_count_ = n; }
     void setMaxAppliedSeq(uint64_t s) { max_applied_seq_ = s; }
     uint64_t nonce() const { return nonce_; }
@@ -454,20 +484,23 @@ private:
         std::list<uint32_t>::iterator lru_it;
     };
 
-    Pager(const std::string& path, int fd, const Options& opts) : path_(path), fd_(fd), opts_(opts) {
+    Pager(const std::string& path, int fd, const Options& opts)
+        : path_(path), fd_(fd), opts_(opts) {
         if (opts_.num_frames < kMinFrames) {
             errno = 0;
             fatal("Pager needs at least " + std::to_string(kMinFrames) + " frames");
         }
         frames_.resize(opts_.num_frames);
         buffer_.reset(new uint8_t[opts_.num_frames * kPageSize]);
-        for (size_t i = opts_.num_frames; i-- > 0;) free_frames_.push_back(static_cast<uint32_t>(i));
+        for (size_t i = opts_.num_frames; i-- > 0;)
+            free_frames_.push_back(static_cast<uint32_t>(i));
     }
 
     static uint64_t newNonce() {
         std::random_device rd;
         uint64_t a = (static_cast<uint64_t>(rd()) << 32) ^ rd();
-        uint64_t t = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+        uint64_t t =
+            static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
         uint64_t n = a ^ (t * 0x9E3779B97F4A7C15ULL) ^ static_cast<uint64_t>(::getpid());
         return n == 0 ? 1 : n;
     }
@@ -480,22 +513,24 @@ private:
         if (!checkPage(page, kMetaPageId, nullptr)) return OpenStatus::BadHeader;
         MetaBody m;
         std::memcpy(&m, page + kHeaderSize, sizeof(m));
-        if (m.magic != kMetaMagic || m.format_version != kIndexFormatVersion || m.page_size != kPageSize ||
-            m.index_nonce == 0 || m.reserved1 != 0) {
+        if (m.magic != kMetaMagic || m.format_version != kIndexFormatVersion ||
+            m.page_size != kPageSize || m.index_nonce == 0 || m.reserved1 != 0) {
             return OpenStatus::BadHeader;
         }
         *out = m;
         return OpenStatus::Ok;
     }
 
-    uint8_t* frameData(uint32_t f) const { return buffer_.get() + static_cast<size_t>(f) * kPageSize; }
+    uint8_t* frameData(uint32_t f) const {
+        return buffer_.get() + static_cast<size_t>(f) * kPageSize;
+    }
 
     void fsyncOrDie(const std::string& what) {
         if (opts_.inject_failure && opts_.inject_failure(IoOp::Fsync, kNoPage)) {
             errno = EIO;
             fatal(what + " [injected failure]");
         }
-        if (vlog::full_fsync(fd_) != 0) fatal(what);  // never retried
+        if (vlog::full_fsync(fd_) != 0) fatal(what); // never retried
         stats_.fsyncs++;
     }
 
@@ -542,7 +577,10 @@ private:
 
     void pinLocked(uint32_t f) {
         Frame& fr = frames_[f];
-        if (fr.in_lru) { lru_.erase(fr.lru_it); fr.in_lru = false; }
+        if (fr.in_lru) {
+            lru_.erase(fr.lru_it);
+            fr.in_lru = false;
+        }
         fr.pins++;
     }
 
@@ -561,12 +599,15 @@ private:
         std::lock_guard<std::mutex> lk(mu_);
         if (isFrozenLocked(frames_[f].page_id)) {
             errno = 0;
-            fatal("write to frozen page " + std::to_string(frames_[f].page_id) + " (copy-on-write violated)");
+            fatal("write to frozen page " + std::to_string(frames_[f].page_id) +
+                  " (copy-on-write violated)");
         }
         frames_[f].dirty = true;
     }
 
-    bool isFrozenLocked(page_id_t id) const { return id < checkpoint_page_count_ && reused_.count(id) == 0; }
+    bool isFrozenLocked(page_id_t id) const {
+        return id < checkpoint_page_count_ && reused_.count(id) == 0;
+    }
 
     // Returns an unmapped frame: a free one, else the least recently used unpinned one
     // (written back first if dirty).
@@ -613,21 +654,24 @@ private:
     uint64_t max_applied_seq_ = 0;
 
     mutable std::mutex mu_;
-    uint32_t page_count_ = 0;  // guarded by mu_
-    uint64_t epoch_ = 0;       // last committed superblock epoch; guarded by mu_
-    uint32_t checkpoint_page_count_ = 0;  // ids below this are frozen (unless in reused_); guarded by mu_
-    std::unordered_set<page_id_t> reused_;  // free-list ids handed out in this epoch (writable)
-    std::vector<page_id_t> free_now_;       // reusable now
-    std::vector<std::pair<uint64_t, page_id_t>> pending_;  // (epoch freed in, id)
+    uint32_t page_count_ = 0; // guarded by mu_
+    uint64_t epoch_ = 0;      // last committed superblock epoch; guarded by mu_
+    uint32_t checkpoint_page_count_ =
+        0; // ids below this are frozen (unless in reused_); guarded by mu_
+    std::unordered_set<page_id_t> reused_; // free-list ids handed out in this epoch (writable)
+    std::vector<page_id_t> free_now_;      // reusable now
+    std::vector<std::pair<uint64_t, page_id_t>> pending_; // (epoch freed in, id)
     std::vector<Frame> frames_;
     std::unique_ptr<uint8_t[]> buffer_;
     std::vector<uint32_t> free_frames_;
-    std::list<uint32_t> lru_;  // front = most recently unpinned
+    std::list<uint32_t> lru_; // front = most recently unpinned
     std::unordered_map<page_id_t, uint32_t> table_;
     Stats stats_;
 };
 
-inline void PageGuard::markDirty() { pager_->markDirty(frame_); }
+inline void PageGuard::markDirty() {
+    pager_->markDirty(frame_);
+}
 
 inline void PageGuard::release() {
     if (pager_) {

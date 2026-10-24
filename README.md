@@ -1,77 +1,172 @@
-# LSM & Storage Engine Systems Design Workspace
+# LSM: a document store with key-value separation
 
-A C++17 storage engine built in phases: an append-only value log (vLog, Phase 1) and a disk-based
-B+Tree primary index over it (Phase 2). The older MongoLite engine is kept in `legacy/` for reference.
+A C++17 storage engine: documents go to an append-only value log (vLog), a disk-based B+Tree maps
+each key to the location of its newest document, and checkpoints plus a two-slot superblock make
+crash recovery replay only the tail of the log.
+
+## The problem
+
+The earlier engine in `legacy/` (MongoLite) stored documents in 4 KiB slotted pages and updated
+them in place behind a write-ahead log. A small update to one document rewrites a whole page plus
+its WAL record, and a document that grows has to move. Bytes written to disk per byte of user data
+(write amplification) grow with page size, not with document size.
+
+This engine separates keys from values, in the style of WiscKey:
+
+- a document is written **once**, appended to the vLog;
+- the index holds only small fixed-size references (`seq`, segment, offset, length), so index pages
+  change far less data than the documents themselves.
+
+Write amplification of the two designs has not been measured yet (see Known limitations).
+
+## Design
+
+```
+put(key, doc) --> vLog append (group commit, F_FULLFSYNC) --> apply to B+Tree in seq order --> ack
+get(key)      --> B+Tree lookup --> vLog read at (segment, offset), CRC checked
+checkpoint    --> write dirty index pages --> F_FULLFSYNC --> superblock (other slot) --> F_FULLFSYNC
+recovery      --> superblock --> open tree at its root --> replay vLog from its replay point
+```
+
+**Value log** (`include/vlog/`)
+- Segments `vlog_%08u.log`, each starting with a 4 KiB header. Entries are 8-byte aligned and carry
+  a CRC32C over everything after the CRC field. Seq and offset are assigned under one lock, so file
+  order is seq order.
+- Group commit: one thread writes everything staged so far with one `write()` and one
+  `F_FULLFSYNC`, then acks the batch. A failed fsync aborts the process and is never retried.
+- Recovery: a torn tail is truncated only in the last segment. Damage in any other segment, or a
+  bad entry with valid entries after it, is treated as corruption and fails loudly.
+- Segments are created with `O_CREAT | O_EXCL` and existing segments are never appended to or
+  overwritten; a segment whose creation was torn by a crash is unlinked.
+
+**B+Tree index** (`include/index/`)
+- `index.db`: 4 KiB slotted pages, each with a CRC32C over the page. Page 0 is a static header
+  written once at creation (format version, random nonce).
+- Copy-on-write: pages that belong to a committed tree are never modified. Changing one copies the
+  root-to-leaf path once per checkpoint epoch. A page freed while epoch E is committed is reused
+  only after epoch E + 2 commits, so the trees named by both superblock slots stay intact.
+- No leaf sibling pointers (they would force copying neighbours); scans use a stack of parents.
+- No merges: erase leaves empty pages in place.
+- One `std::shared_mutex` per tree: reads shared, writes exclusive.
+
+**Superblock and checkpoints**
+- `superblock.db` has two 4 KiB slots. A write goes to the slot that is not current, then
+  `F_FULLFSYNC`; a read takes the valid slot with the highest epoch. Each slot records the root page,
+  page count, checkpoint seq, and the vLog replay point, plus the index nonce and vLog identity so a
+  superblock is never used with another store's files.
+- A checkpoint holds the sequencer lock and the tree's exclusive lock. It records the last seq
+  applied to the index and the vLog position right after that entry (never the writer's tail).
+- Index pages are fsynced **before** the superblock that names them is written. A crash before the
+  superblock write leaves the previous checkpoint fully usable.
+- Automatic checkpoints run every 4 MiB of vLog writes or 30 s, and on clean close.
+
+**Recovery**
+1. Check `index.db` header, the superblock, nonce, vLog identity, and every page of the committed
+   tree (CRC + structure), before the vLog writer opens.
+2. `ftruncate` `index.db` to the committed page count (drops pages written after the checkpoint).
+3. Rebuild the free list by walking the current and previous trees.
+4. The vLog writer's tail scan and the index replay both start at the replay point; the index uses
+   `should_apply()` (newer seq wins, so replay is idempotent).
+
+If anything in step 1 fails (no superblock, both slots corrupt, a bad tree page, files from another
+store), the index is rebuilt from the whole vLog. If the replay point is missing from the vLog
+(acked entries are gone), open fails with an error and changes nothing.
 
 ## Layout
 
 ```
-include/vlog/    Phase 1: value log (on-disk format, CRC32C, writer, reader)
-include/index/   Phase 2: B+Tree index (page format, pager, tree, recovery, IndexedStore)
-tests/           Tests for vlog/ and index/ (run by the Makefile)
-legacy/          Old MongoLite engine and its benchmarks (not built by the Makefile)
-docs/            Plans and design notes
+include/vlog/    value log: on-disk format, CRC32C, writer, reader
+include/index/   B+Tree: page format, pager, tree, superblock, recovery, IndexedStore
+tests/           test binaries (built and run by the Makefile)
+legacy/          earlier MongoLite engine (not built)
+docs/            design notes (written before checkpoints were added; parts are out of date)
 ```
 
-Dependency rule: `include/vlog/` never includes `include/index/` or `legacy/` (`make` checks this).
+`include/vlog/` never includes `include/index/` or `legacy/`; `make` checks this.
 
 ## Build and test
 
+Requires a C++17 compiler (tested with Apple clang 21 on macOS).
+
 ```
-make test    # optimized build, -Werror
-make asan    # AddressSanitizer + UndefinedBehaviorSanitizer, -Werror
-make tsan    # ThreadSanitizer, -Werror (fork/kill -9 tests are skipped under TSan)
+make test-quick  # optimized, smaller workloads, under 20 MiB written in total
+make test        # optimized, full workloads
+make asan        # AddressSanitizer + UndefinedBehaviorSanitizer
+make tsan        # ThreadSanitizer (fork + kill -9 tests are skipped)
 make clean
 ```
 
-Every test uses its own temp directory, deletes it on exit, writes at most 512 MiB in total, and
-aborts if free disk space is below 10 GB.
+All builds use `-Wall -Wextra -Werror`. Each test prints one `[PASS] name (summary)` line; run with
+`TEST_VERBOSE=1` to also print the measurements behind each test. Every test binary uses its own
+temp directory, removes it on exit, aborts if free disk space is below 10 GB, and enforces a write
+budget as it writes (512 MiB in total for `test`/`asan`/`tsan`, 20 MiB for `test-quick`).
 
-## Phase 1: value log (`include/vlog/`)
-1. [`VLogFormat.hpp`](include/vlog/VLogFormat.hpp): on-disk format (segment header, entry header, deltas, `IndexValueRef`, superblock) and the `should_apply()` redo rule.
-2. [`CRC32.hpp`](include/vlog/CRC32.hpp): CRC32C (ARMv8 / SSE4.2 instructions, table fallback).
-3. [`VLogWriter.hpp`](include/vlog/VLogWriter.hpp): append with group commit and `F_FULLFSYNC`; segment rollover; recovery on open.
-4. [`VLogReader.hpp`](include/vlog/VLogReader.hpp): point reads by `VPtr`; segment scan with torn-tail truncation and mid-log corruption detection.
+| Binary | Covers |
+|---|---|
+| `test_vlog_crash` | CRC32C, reader bounds, torn tails, redo rule, torn segment creation, 50 x kill -9 during group commit, group commit benchmark |
+| `test_bptree` | pager, tree vs `std::map`, splits, scans, checkpoint + reopen, corruption handling, IndexedStore, 50 x kill -9, concurrency |
+| `test_edge_cases` | index ahead of the vLog, wrong vLog, bad VPtr, 16 MiB limit, races, height 4, injected I/O failures |
+| `test_superblock` | slot CRCs, ping-pong writes, one or both slots corrupt, torn slot writes |
+| `test_cow` | committed pages never modified, copy cascade, delayed page reuse, free list rebuilt at open |
+| `test_checkpoint` | checkpoint contents and triggers, tail-only recovery, fallback rebuilds, page reuse safety, corrupt newest slot, 50 x kill -9 at random points |
 
-## Phase 2: B+Tree index (`include/index/`)
-1. [`BPTreeFormat.hpp`](include/index/BPTreeFormat.hpp): 4 KiB page header with CRC32C, meta page, key order.
-2. [`Pager.hpp`](include/index/Pager.hpp): page cache over `index.db` (LRU, pin/unpin), `clean_shutdown` protocol.
-3. [`BPTree.hpp`](include/index/BPTree.hpp): put/get/erase/scan, leaf/internal/root splits (no merges), one `std::shared_mutex`, invariant checker.
-4. [`IndexRecovery.hpp`](include/index/IndexRecovery.hpp): open `index.db`, or rebuild it from the vLog after a crash.
-5. [`IndexedStore.hpp`](include/index/IndexedStore.hpp): engine API — put → vLog append → index update in seq order → ack; get → index → vLog read.
+## Measured results
 
-## Tests (`tests/`)
-- [`test_vlog_crash.cpp`](tests/test_vlog_crash.cpp): vLog CRC, header bounds, torn tails, redo rule, torn segment creation, 50 kill -9 iterations, group commit measurements.
-- [`test_bptree.cpp`](tests/test_bptree.cpp): pager, tree vs `std::map` oracle, splits, page-boundary scans, persistence and rebuild, kill -9 of the store, concurrency.
-- [`test_common.hpp`](tests/test_common.hpp): shared temp dir, write budget and disk space checks.
+One run of `TEST_VERBOSE=1 make test` (optimized build) on 2026-10-24:
+Apple M5 (10 cores), 16 GB RAM, internal SSD (APFS), macOS 27.0, Apple clang 21.0.0.
 
-## Docs (`docs/`)
-- [`PHASE2_PLAN.md`](docs/PHASE2_PLAN.md): Phase 2 design (page layout, split algorithm, tests, open questions).
-- [`IMPLEMENTATION_DOSSIER.md`](docs/IMPLEMENTATION_DOSSIER.md): implementation notes.
-- [`MASTER_CONTEXT_DATABASE_SYSTEMS_DESIGN.md`](docs/MASTER_CONTEXT_DATABASE_SYSTEMS_DESIGN.md): research summary and roadmap.
+**Group commit** (appends of ~25-byte documents, 1.5 s per row, every ack after `F_FULLFSYNC`):
 
-## Legacy engine (`legacy/`)
-Not modified and not built by the Makefile. Numbers quoted for these files come from earlier runs and were not re-measured.
-1. [`SlottedPage.hpp`](legacy/SlottedPage.hpp): 4KB dual-growth slotted page binary format (Petrov Ch. 3).
-2. [`DiskManager.hpp`](legacy/DiskManager.hpp): Physical 4KB block I/O on disk.
-3. [`LRUReplacer.hpp`](legacy/LRUReplacer.hpp): $O(1)$ LRU frame replacer (Petrov Ch. 5).
-4. [`BufferPoolManager.hpp`](legacy/BufferPoolManager.hpp): In-memory frame cache with Steal eviction policy.
-5. [`WALManager.hpp`](legacy/WALManager.hpp): Append-only Write-Ahead Logging.
-6. [`DocumentStore.hpp`](legacy/DocumentStore.hpp): Multi-page collection manager with `RecordId(page_id, slot_id)`.
-7. [`PrimaryIndex.hpp`](legacy/PrimaryIndex.hpp): B-Tree index with `std::shared_mutex` and Range Scan API.
-8. [`MongoLite.hpp`](legacy/MongoLite.hpp): High-level document database API and streaming `Cursor`.
+| Threads | Writes/s | F_FULLFSYNC/s | Avg batch |
+|---:|---:|---:|---:|
+| 1 | 260 | 261 | 1.0 |
+| 4 | 544 | 273 | 2.0 |
+| 16 | 2,155 | 270 | 8.0 |
+| 64 | 8,692 | 272 | 31.9 |
 
-Benchmarks and tests:
-- [`test_range_scan.cpp`](legacy/test_range_scan.cpp): 9-stage range query and multi-threaded concurrency benchmark (earlier run: 134,583 range QPS, 3.5M docs/sec).
-- [`concurrent_bench.cpp`](legacy/concurrent_bench.cpp): Multi-threaded reader/writer stress test (earlier run: 1.52M read QPS).
-- [`benchmark_mongolite.cpp`](legacy/benchmark_mongolite.cpp): Sequential insert & point lookup latency test.
-- [`main_mongolite.cpp`](legacy/main_mongolite.cpp): Smoke test and crash recovery check.
+Throughput is bound by `F_FULLFSYNC` (about 270 per second, ~3.7 ms each); group commit raises
+writes per second by batching more acks per flush.
 
-## Research notes (`.t` files, not checked into this repository)
-- `WiskkeyandBlobStoreDB.t`: Key-Value Separation, vLog, GC.
-- `Important.lsmt9.t`: io_uring, SIMD, MVCC, CRC32, EBR, RESP.
-- `DatabaseHardware.t`: mmap vs File.Read, zero-copy, kernel page cache.
-- `Disadvantages.t`: RUM conjecture, compaction stalls, amplification paradox.
-- `atomicPointer.t` & `ImmutablePointer.t`: CPU CAS primitives, lock-free structures.
-- `Safety.t`: Hardware protection and sandbox containment.
-- `lsm.t` to `lsmt8.t`: SSTable immutability, Bw-Tree, LeanStore, ScyllaDB.
+**Recovery**
+
+| Scenario | Result |
+|---|---|
+| Crash after 6,000 entries in 30 segments; last checkpoint 200 entries earlier | 200 entries read by the writer scan and 200 by the index replay; open took 11.3 ms |
+| Same vLog, superblock deleted (full rebuild) | 6,000 entries read |
+| Full rebuild, 1,500 entries / 200 keys | 18-20 ms |
+
+**Checkpoints**
+- Time the locks are held (writers and readers wait): 3.9 / 10.1 / 14.7 ms (min / median / max over
+  15 checkpoints of small trees in CP1-CP3); max 18 ms over 161 checkpoints taken while 4 writers
+  and 2 readers were running (CP4). Most of it is the two `F_FULLFSYNC` calls.
+
+**Crash tests** (all passed)
+- vLog: 50 kill -9 runs during multi-threaded group commit; all 15,788 acked entries recovered with
+  correct bytes.
+- Store: 50 kill -9 runs during writes, recovery and clean close; 14,523 acked operations, the
+  newest acked operation was reflected for every key.
+- Checkpoints: 50 kill -9 runs during writes, during the checkpoint flush, between the index fsync
+  and the superblock write, and during recovery; 11,715 acked operations reflected, and the index
+  equalled a full vLog replay every time.
+
+**Tree shape**: 200,000 sequential 32-byte keys give a height-4 tree of 5,999 pages (24 MB).
+
+These are single runs on one machine, not averaged benchmarks.
+
+## Known limitations
+
+- **No vLog garbage collection.** The log only grows. The vLog identity check uses the lowest
+  segment, which has to move into the superblock once old segments can be deleted.
+- **Write amplification is not measured** for this engine or the legacy one.
+- **Only full documents are written.** The format defines delta entries and an LZ4 flag; the store
+  does not use them yet.
+- **Checkpoints stall the store** for the duration of two `F_FULLFSYNC` calls (about 10 ms here).
+- **Open reads every page of the committed tree** to check CRCs, so open time grows with index size.
+- **Lost vLog data before the replay point is not detected** unless the replay segment itself is
+  missing or too short.
+- **get() opens the segment file** for every read (no file handle cache, no value cache).
+- **No page merges**: a tree with many deletes keeps empty leaves.
+- **One lock per tree**: writers are serialized.
+- **Crash tests use kill -9**, not power loss. Only macOS with `F_FULLFSYNC` is tested; the
+  `fdatasync` path for other systems is untested.
+- **ThreadSanitizer builds skip the fork + kill -9 tests.**
