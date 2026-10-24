@@ -323,7 +323,11 @@ static void case3GetErrors(const std::string& base) {
 // 4. Document size limits
 // ------------------------------------------------------------------------------------------
 static void case4DocSize(const std::string& d) {
-    auto st = IndexedStore::open(d, storeOpts());
+    // No automatic checkpoints: the 16 MiB put would cross the 4 MiB trigger, and the crash below
+    // must leave that entry for recovery to replay.
+    IndexedStore::Options o4 = storeOpts();
+    o4.auto_checkpoint = false;
+    auto st = IndexedStore::open(d, o4);
     const std::string key = "big";  // 3 bytes -> padded to 8
     st->put("empty", "");
     CHECK(st->get("empty") == std::optional<std::string>(""));
@@ -352,13 +356,13 @@ static void case4DocSize(const std::string& d) {
         doc[max_doc - 1] = 'Z';
         uint64_t s = st->put(key, doc);
         CHECK(st->get(key) == std::optional<std::string>(doc));
-        finishStore(st, false);  // crash: next open rebuilds from the vLog, which must read the 16 MiB entry
-        st = IndexedStore::open(d, storeOpts());
-        CHECK(st->openInfo().rebuilt);
+        finishStore(st, false);  // crash: recovery replays the vLog, which must read the 16 MiB entry
+        st = IndexedStore::open(d, o4);
+        CHECK(!st->openInfo().rebuilt && st->openInfo().vlog_entries_applied >= 1);
         uint64_t seq = 0;
         CHECK(st->get(key, &seq) == std::optional<std::string>(doc) && seq == s);
         std::cout << "doc of " << max_doc << " bytes (entry exactly 16 MiB) accepted, read back, and recovered by "
-                  << "a rebuild.\n";
+                  << "vLog replay after a crash.\n";
     } else {
         std::cout << "[quick] skipped writing the 16 MiB document.\n";
     }
@@ -408,8 +412,8 @@ static void case5SameKeyRace(const std::string& d) {
     verify(*st, "after clean reopen");
     finishStore(st, false);
     st = IndexedStore::open(d, storeOpts());
-    CHECK(st->openInfo().rebuilt);
-    verify(*st, "after crash reopen (rebuild)");
+    CHECK(!st->openInfo().rebuilt);
+    verify(*st, "after crash reopen (superblock + vLog replay)");
     finishStore(st, true);
 }
 
@@ -604,7 +608,7 @@ static void case8Height4(const std::string& d) {
 }
 
 // ------------------------------------------------------------------------------------------
-// 9. index.db write/fsync failure: abort, then rebuild with no lost acked writes
+// 9. index.db write/fsync failure: abort, then recover with no lost acked writes
 // ------------------------------------------------------------------------------------------
 struct Ack { uint64_t seq; uint32_t id; uint32_t pad; };
 
@@ -674,7 +678,7 @@ static void case9IoFailure(const std::string& base) {
         accountBytes(vb, "case 9 child vLog");
 
         auto st = IndexedStore::open(d, storeOpts());
-        CHECK(st->openInfo().rebuilt && st->openInfo().initial_status == OpenStatus::NoSuperblock);
+        CHECK(!st->openInfo().rebuilt && st->openInfo().initial_status == OpenStatus::Ok);
         for (const Ack& x : acks) {
             uint64_t seq = 0;
             std::optional<std::string> doc = st->get(case9Key(x.id), &seq);
@@ -682,7 +686,7 @@ static void case9IoFailure(const std::string& base) {
         }
         checkIndexEqualsVLog(*st, "after injected failure");
         std::cout << (variant == 0 ? "9a pwrite failure (40th page write)" : "9b fsync failure in close()")
-                  << ": child aborted (SIGABRT) after " << acks.size() << " acked puts; reopen rebuilt the index; all "
+                  << ": child aborted (SIGABRT) after " << acks.size() << " acked puts; reopen recovered from the superblock + vLog replay; all "
                   << acks.size() << " acked keys return their acked value.\n";
         finishStore(st, true);
     }

@@ -251,7 +251,7 @@ static void testSB4StoreRebuild(const std::string& dir) {
     };
     verify(bpt::OpenStatus::Ok, false, "clean reopen");
     const std::string sb = dir + "/superblock.db";
-    // The store keeps one slot per clean close (Step 1 rule); flip a bit in every valid slot.
+    // Flip a bit in every valid slot.
     {
         SuperblockManager m(sb, sbOpts());
         SuperblockManager::LoadResult r = m.load();

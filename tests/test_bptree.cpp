@@ -216,7 +216,7 @@ static void testB1MetaSurvivesReopen(const std::string& dir) {
     banner("B1.2 Pager allocate/read/write, eviction, checkpoint, reopen from the superblock");
     CHECK(mkdir(dir.c_str(), 0755) == 0);
     const std::string path = dir + "/index.db";
-    const uint32_t kPages = 200;  // with 16 frames: constant eviction and reload
+    const uint32_t kPages = kQuick ? 100 : 200;  // with 16 frames: constant eviction and reload
 
     {
         auto p = Pager::create(path, pagerOpts(16));
@@ -808,7 +808,7 @@ static void testB4CleanReopen(const std::string& dir) {
     const uint64_t seed = 401;
     const uint64_t bytes_before = bytesWritten();
     std::mt19937_64 rng(seed);
-    std::vector<std::string> keys = makeKeySpace(rng, 20000);
+    std::vector<std::string> keys = makeKeySpace(rng, kQuick ? 5000 : 20000);
     Oracle o;
     uint64_t seq = 0;
     T1Result res;
@@ -892,7 +892,7 @@ static void testB4CrashRebuild(const std::string& dir) {
                   << r.pager->pageCount() << "\n";
         r.pager->checkpoint(*r.sbm, r.commitInfo());
     };
-    reopen(OpenStatus::NoSuperblock, true, "after crash (no clean close)");
+    reopen(OpenStatus::Ok, false, "after crash (no clean close): superblock from open + replay");
     reopen(OpenStatus::Ok, false, "after clean close");
 
     // Corrupt one bit in a page of the committed tree after a clean close: the open-time tree walk finds it.
@@ -1109,7 +1109,8 @@ static void testB5KillDuringWrites(const std::string& base) {
 
     for (int iter = 0; iter < kIters; ++iter) {
         const std::string sdir = base + "/iter_" + std::to_string(iter);
-        // 0: kill during writes; 1: kill during writes, then kill the rebuilding child; 2: kill during clean close.
+        // 0: kill during writes; 1: kill during writes, then kill the recovering child during vLog replay;
+        // 2: kill during clean close (between index fsync and superblock write).
         int kind = (iter % 5 == 3) ? 1 : (iter % 5 == 4) ? 2 : 0;
         kinds[kind]++;
         int pfd[2];
@@ -1149,7 +1150,8 @@ static void testB5KillDuringWrites(const std::string& base) {
 
         bool killed_rebuild = false;
         if (kind == 1) {
-            // A second child opens the store (rebuild), pauses after 100 applied entries, and is killed.
+            // A second child opens the store (recovery replays the vLog), pauses after 100 applied
+            // entries, and is killed.
             int qfd[2];
             CHECK(pipe(qfd) == 0);
             std::cout.flush();
@@ -1166,13 +1168,11 @@ static void testB5KillDuringWrites(const std::string& base) {
             }
             CHECK(close(qfd[1]) == 0);
             CHECK(readRec(qfd[0], &r) && r.op == 9);
-            struct stat sb;
-            CHECK(stat((sdir + "/index.db.rebuild").c_str(), &sb) == 0);  // rebuild in progress
             CHECK(kill(p2, SIGKILL) == 0);
             CHECK(waitpid(p2, &status, 0) == p2);
             CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
             CHECK(close(qfd[0]) == 0);
-            accountBytes(sb.st_size + 4096, "B5 killed rebuild (partial index.db.rebuild + segment header)");
+            accountBytes(4096, "B5 killed recovery (segment header)");
             killed_rebuild = true;
         }
 
@@ -1181,8 +1181,8 @@ static void testB5KillDuringWrites(const std::string& base) {
         IndexedStore::Options o = storeOpts(64);
         auto st = IndexedStore::open(sdir, o);
         const bpt::OpenIndexResult& info = st->openInfo();
-        CHECK(info.rebuilt);
-        CHECK(info.initial_status == OpenStatus::NoSuperblock);
+        CHECK(!info.rebuilt);
+        CHECK(info.initial_status == OpenStatus::Ok);
         struct stat sb;
         CHECK(stat((sdir + "/index.db.rebuild").c_str(), &sb) != 0 && errno == ENOENT);
 
@@ -1242,15 +1242,15 @@ static void testB5KillDuringWrites(const std::string& base) {
         uint64_t unacked = vlog_seqs.size() - acks.size();
         total_acked += acks.size();
         total_unacked += unacked;
-        const char* kind_name = kind == 0 ? "kill during writes" : kind == 1 ? "kill during rebuild" : "kill in clean close";
-        std::printf("Iter %2d/%d: %-19s %s acked %4zu, vLog entries %4zu (unacked %2llu), keys %2zu, rebuild %3llu ms\n",
+        const char* kind_name = kind == 0 ? "kill during writes" : kind == 1 ? "kill during recovery" : "kill in clean close";
+        std::printf("Iter %2d/%d: %-19s %s acked %4zu, vLog entries %4zu (unacked %2llu), keys %2zu, replayed %4llu\n",
                     iter + 1, kIters, kind_name,
                     kill_after >= 0 ? ("(+" + std::to_string(kill_after) + " ms),").c_str() : "",
                     acks.size(), vlog_seqs.size(), (unsigned long long)unacked, ref.size(),
-                    (unsigned long long)info.rebuild_ms);
+                    (unsigned long long)info.vlog_entries_applied);
         (void)killed_rebuild;
 
-        // Clean close + reopen: no rebuild, same contents.
+        // Clean close + reopen: same contents.
         finishStore(st, true);
         auto st2 = IndexedStore::open(sdir, storeOpts(64));
         CHECK(!st2->openInfo().rebuilt && st2->openInfo().initial_status == OpenStatus::Ok);
@@ -1260,7 +1260,7 @@ static void testB5KillDuringWrites(const std::string& base) {
         std::filesystem::remove_all(sdir, ec);
         CHECK(!ec);
     }
-    std::cout << "Crash points: " << kinds[0] << " during writes, " << kinds[1] << " during rebuild (after a write "
+    std::cout << "Crash points: " << kinds[0] << " during writes, " << kinds[1] << " during recovery replay (after a write "
               << "crash), " << kinds[2] << " between index fsync and superblock write in clean close.\n";
     std::cout << "PASS: " << kIters << " iterations; " << total_acked << " acked ops all present in the vLog; for "
               << total_checked_keys << " keys the newest acked op is reflected (acked value returned, or a newer "

@@ -11,9 +11,16 @@
 // Every assigned seq is either acked or the process aborts, so the sequence has no holes; for
 // that reason any exception from append() aborts the process.
 //
+// Checkpoint (checkpoint()): with the sequencer lock held (no index update can start) and the
+// tree's exclusive lock held (no reader or writer is in the tree):
+//   checkpoint_seq = seq of the last entry applied to the index
+//   replay point   = vLog position right after that entry (never the writer's tail: entries
+//                    appended but not yet applied have higher seqs and are replayed after a crash)
+//   write back dirty pages -> F_FULLFSYNC index.db -> superblock epoch+1 -> F_FULLFSYNC
+// Triggers: a background thread checkpoints after checkpoint_bytes of vLog writes (default
+// 4 MiB) or checkpoint_interval_ms (default 30 s), and close() checkpoints.
+//
 // Directory layout: <dir>/vlog/vlog_%08u.log, <dir>/index.db, <dir>/superblock.db.
-// close() writes back the index and commits a superblock. Without close() there is no superblock
-// (Step 1 rule, see IndexRecovery.hpp) and the next open rebuilds the index from the vLog.
 
 #include "index/BPTree.hpp"
 #include "index/IndexRecovery.hpp"
@@ -21,6 +28,7 @@
 #include "vlog/VLogReader.hpp"
 #include "vlog/VLogWriter.hpp"
 
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -28,6 +36,8 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <vector>
 
 #include <sys/stat.h>
 
@@ -40,14 +50,44 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+enum class CheckpointTrigger { Bytes, Timer, Close, Manual };
+
+inline const char* toString(CheckpointTrigger t) {
+    switch (t) {
+        case CheckpointTrigger::Bytes:  return "bytes";
+        case CheckpointTrigger::Timer:  return "timer";
+        case CheckpointTrigger::Close:  return "close";
+        case CheckpointTrigger::Manual: return "manual";
+    }
+    return "?";
+}
+
+struct CheckpointReport {
+    CheckpointTrigger trigger = CheckpointTrigger::Manual;
+    bool skipped = false;          // nothing applied since the last checkpoint (timer/bytes only)
+    uint64_t epoch = 0;
+    uint64_t checkpoint_seq = 0;
+    uint32_t replay_segment = 0;
+    uint32_t replay_offset = 0;
+    uint64_t pages_written = 0;
+    uint64_t bytes_written = 0;    // index pages + one 4096-byte superblock slot
+    uint32_t page_count = 0;
+    double lock_wait_ms = 0;       // time to get the sequencer + tree locks
+    double stall_ms = 0;           // time the locks were held: index updates and readers wait this long
+};
+
 class IndexedStore {
 public:
     struct Options {
         size_t cache_frames = 1024;
         vlog::VLogWriter::Options vlog_opts{};
-        std::function<void(uint64_t)> on_index_write;  // per index.db page write (tests count bytes)
-        RecoveryHooks hooks;                           // crash-test hooks (rebuild, clean close)
+        std::function<void(uint64_t)> on_index_write;  // per index.db page / superblock write (tests count bytes)
+        RecoveryHooks hooks;                           // crash-test hooks (rebuild/replay, close checkpoint)
         std::function<bool(Pager::IoOp, page_id_t)> inject_index_failure;  // test-only, see Pager::Options
+        std::function<void(CheckpointTrigger)> on_checkpoint_after_index_fsync;  // test-only, every checkpoint
+        bool auto_checkpoint = true;
+        uint64_t checkpoint_bytes = 4ULL * 1024 * 1024;  // vLog bytes between automatic checkpoints
+        uint32_t checkpoint_interval_ms = 30000;         // longest time between automatic checkpoints
     };
 
     struct EraseResult {
@@ -73,12 +113,19 @@ public:
         s->last_applied_seq_ = s->open_info_.last_seq;
         s->last_applied_segment_ = s->open_info_.last_segment;
         s->last_applied_end_ = s->open_info_.last_end;
+        s->last_cp_seq_ = s->open_info_.rebuilt ? s->open_info_.last_seq : s->open_info_.checkpoint_seq;
+        s->last_cp_time_ = std::chrono::steady_clock::now();
+        s->vlog_bytes_at_cp_ = 0;
+        if (opts.auto_checkpoint) s->checkpointer_ = std::thread([p = s.get()] { p->checkpointerLoop(); });
         return s;
     }
 
     IndexedStore(const IndexedStore&) = delete;
     IndexedStore& operator=(const IndexedStore&) = delete;
-    ~IndexedStore() = default;  // without close(): vLog is fsynced and closed, no superblock is written
+
+    // Without close(): the checkpointer stops without a final checkpoint; the vLog is fsynced and
+    // closed. The next open recovers from the last superblock plus the vLog.
+    ~IndexedStore() { stopCheckpointer(); }
 
     // Returns the seq of the acked write. Throws std::invalid_argument for a bad key or an
     // oversize document (nothing is written in that case).
@@ -93,6 +140,7 @@ public:
         }
         vlog::AppendResult ar = appendOrDie(vlog::EntryType::Full, key, doc.data(), static_cast<uint32_t>(doc.size()));
         applyInOrder(key, vlog::EntryType::Full, ar, nullptr);
+        noteVLogBytes();
         return ar.seq;
     }
 
@@ -101,6 +149,7 @@ public:
         vlog::AppendResult ar = appendOrDie(vlog::EntryType::Tombstone, key, nullptr, 0);
         bool had = false;
         applyInOrder(key, vlog::EntryType::Tombstone, ar, &had);
+        noteVLogBytes();
         return EraseResult{ar.seq, had};
     }
 
@@ -131,21 +180,71 @@ public:
         return tree_->scan(start, end, limit);
     }
 
-    // Clean close: callers must have stopped all other operations.
-    void close() {
-        if (closed_) fatal("IndexedStore::close called twice");
-        {
-            std::lock_guard<std::mutex> lk(seq_mu_);
+    // Makes the index durable up to the last applied entry. Safe to call while other threads use
+    // the store. Timer/bytes triggers skip the write if nothing was applied since the last one.
+    CheckpointReport checkpoint(CheckpointTrigger trigger = CheckpointTrigger::Manual) {
+        if (closed_) fatal("IndexedStore::checkpoint after close");
+        std::lock_guard<std::mutex> run_lk(cp_run_mu_);  // one checkpoint at a time
+        const auto t0 = std::chrono::steady_clock::now();
+        std::unique_lock<std::mutex> seq_lk(seq_mu_);  // no index update can start
+        CheckpointReport rep = tree_->withExclusiveLock([&] {
+            const auto t1 = std::chrono::steady_clock::now();
+            CheckpointReport r;
+            r.trigger = trigger;
+            r.lock_wait_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            r.checkpoint_seq = last_applied_seq_;
+            r.replay_segment = last_applied_segment_;
+            r.replay_offset = last_applied_end_;
+            const bool auto_trigger = trigger == CheckpointTrigger::Bytes || trigger == CheckpointTrigger::Timer;
+            if (auto_trigger && last_applied_seq_ == last_cp_seq_) {
+                r.skipped = true;
+                r.epoch = pager_->committedEpoch();
+                return r;
+            }
             Pager::CommitInfo ci;
             ci.checkpoint_seq = last_applied_seq_;
             ci.replay_segment = last_applied_segment_;
             ci.replay_offset = last_applied_end_;
             ci.vlog_first_segment = open_info_.vid.first_segment;
             ci.vlog_created_ns = open_info_.vid.created_ns;
-            pager_->checkpoint(*sbm_, ci, opts_.hooks.on_close_after_flush);
+            std::function<void()> hook;
+            if (trigger == CheckpointTrigger::Close && opts_.hooks.on_close_after_flush) {
+                hook = opts_.hooks.on_close_after_flush;
+            } else if (opts_.on_checkpoint_after_index_fsync) {
+                hook = [this, trigger] { opts_.on_checkpoint_after_index_fsync(trigger); };
+            }
+            Pager::CheckpointStats cs = pager_->checkpoint(*sbm_, ci, hook);
+            last_cp_seq_ = last_applied_seq_;
+            r.epoch = cs.epoch;
+            r.pages_written = cs.pages_written;
+            r.bytes_written = cs.bytes_written;
+            r.page_count = cs.page_count;
+            r.stall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+            return r;
+        });
+        seq_lk.unlock();
+        {
+            std::lock_guard<std::mutex> lk(cp_mu_);
+            last_cp_time_ = std::chrono::steady_clock::now();
+            vlog_bytes_at_cp_ = writer_->getTotalBytesWritten();
+            cp_bytes_due_ = false;
+            if (!rep.skipped) reports_.push_back(rep);
         }
+        return rep;
+    }
+
+    // Clean close: callers must have stopped all other operations.
+    void close() {
+        if (closed_) fatal("IndexedStore::close called twice");
+        stopCheckpointer();
+        checkpoint(CheckpointTrigger::Close);
         closed_ = true;
         writer_.reset();  // fsync + close of the current vLog segment
+    }
+
+    std::vector<CheckpointReport> checkpointReports() const {
+        std::lock_guard<std::mutex> lk(cp_mu_);
+        return reports_;
     }
 
     const OpenIndexResult& openInfo() const { return open_info_; }
@@ -153,6 +252,10 @@ public:
     Pager& pager() { return *pager_; }
     uint64_t vlogBytesWritten() const { return writer_ ? writer_->getTotalBytesWritten() : 0; }
     const std::string& vlogDir() const { return vlog_dir_; }
+    uint64_t lastAppliedSeq() {
+        std::lock_guard<std::mutex> lk(seq_mu_);
+        return last_applied_seq_;
+    }
 
 private:
     IndexedStore(const std::string& dir, const Options& opts) : dir_(dir), vlog_dir_(dir + "/vlog"), opts_(opts) {}
@@ -190,6 +293,47 @@ private:
         seq_cv_.notify_all();
     }
 
+    // Wakes the checkpointer once checkpoint_bytes of vLog have been written since the last checkpoint.
+    void noteVLogBytes() {
+        if (!opts_.auto_checkpoint) return;
+        const uint64_t b = writer_->getTotalBytesWritten();
+        std::lock_guard<std::mutex> lk(cp_mu_);
+        if (!cp_bytes_due_ && b - vlog_bytes_at_cp_ >= opts_.checkpoint_bytes) {
+            cp_bytes_due_ = true;
+            cp_cv_.notify_all();
+        }
+    }
+
+    void checkpointerLoop() {
+        std::unique_lock<std::mutex> lk(cp_mu_);
+        while (!cp_stop_) {
+            const auto deadline = last_cp_time_ + std::chrono::milliseconds(opts_.checkpoint_interval_ms);
+            cp_cv_.wait_until(lk, deadline, [&] { return cp_stop_ || cp_bytes_due_; });
+            if (cp_stop_) break;
+            CheckpointTrigger t;
+            if (cp_bytes_due_) {
+                t = CheckpointTrigger::Bytes;
+            } else if (std::chrono::steady_clock::now() >=
+                       last_cp_time_ + std::chrono::milliseconds(opts_.checkpoint_interval_ms)) {
+                t = CheckpointTrigger::Timer;
+            } else {
+                continue;
+            }
+            lk.unlock();
+            checkpoint(t);  // updates last_cp_time_ / vlog_bytes_at_cp_ / cp_bytes_due_
+            lk.lock();
+        }
+    }
+
+    void stopCheckpointer() {
+        {
+            std::lock_guard<std::mutex> lk(cp_mu_);
+            cp_stop_ = true;
+        }
+        cp_cv_.notify_all();
+        if (checkpointer_.joinable()) checkpointer_.join();
+    }
+
     std::string dir_;
     std::string vlog_dir_;
     Options opts_;
@@ -207,6 +351,17 @@ private:
     uint64_t last_applied_seq_ = 0;
     uint32_t last_applied_segment_ = 0;
     uint32_t last_applied_end_ = vlog::kBlockSize;
+    uint64_t last_cp_seq_ = 0;  // checkpoint_seq of the last superblock (guarded by seq_mu_)
+
+    std::mutex cp_run_mu_;      // serializes checkpoint()
+    mutable std::mutex cp_mu_;  // guards the fields below
+    std::condition_variable cp_cv_;
+    bool cp_stop_ = false;
+    bool cp_bytes_due_ = false;
+    std::chrono::steady_clock::time_point last_cp_time_;
+    uint64_t vlog_bytes_at_cp_ = 0;
+    std::vector<CheckpointReport> reports_;
+    std::thread checkpointer_;
 };
 
 } // namespace bpt

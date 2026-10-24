@@ -249,6 +249,13 @@ public:
         return ApplyResult::Applied;
     }
 
+    // Runs f with the tree's exclusive lock held (no reader or writer is inside the tree).
+    template <typename F>
+    auto withExclusiveLock(F&& f) {
+        std::unique_lock<std::shared_mutex> lk(mu_);
+        return f();
+    }
+
     uint64_t size() const {
         std::shared_lock<std::shared_mutex> lk(mu_);
         return pager_.keyCount();

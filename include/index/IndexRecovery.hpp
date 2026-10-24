@@ -10,9 +10,8 @@
 // large enough, and every page of the committed tree passes its CRC and structure checks.
 // Then apply vLog entries with seq > checkpoint_seq.
 //
-// Step 1 rule (until copy-on-write pages exist): pages are modified in place after open, so the
-// superblock is deleted at open (directory fsynced) and written again at clean close. A crash
-// therefore leaves no superblock, and the next open rebuilds.
+// Copy-on-write (Pager.hpp) keeps the committed tree's pages unchanged until the next superblock
+// commits, so after a crash the superblock still names an intact tree.
 //
 // Rebuild (any check fails):
 //   1. delete superblock.db (directory fsynced), so a crash during the rebuild rebuilds again
@@ -20,7 +19,7 @@
 //   3. apply every vLog entry, in file order, through BPTree::apply (should_apply)
 //   4. write back all pages, F_FULLFSYNC
 //   5. rename index.db.rebuild -> index.db, fsync the directory
-//   (the superblock is written by the next checkpoint / clean close)
+//   6. commit superblock epoch 1 (creates superblock.db, fsyncs the directory)
 //
 // The caller must have opened the vLog first (VLogWriter's constructor truncates a torn tail).
 
@@ -46,8 +45,9 @@
 namespace bpt {
 
 struct RecoveryHooks {
-    std::function<void(uint64_t entries_applied)> on_rebuild_entry;  // after each applied entry (crash tests)
-    std::function<void()> on_close_after_flush;                       // checkpoint: after the index fsync
+    std::function<void(uint64_t entries_applied)> on_rebuild_entry;  // after each entry applied by a rebuild or
+                                                                      // recovery replay (crash tests)
+    std::function<void()> on_close_after_flush;                       // close checkpoint: after the index fsync
 };
 
 // Identity of a vLog directory: id and created_unix_ns of its lowest-id segment.
@@ -371,12 +371,11 @@ inline OpenIndexResult openOrRebuildIndex(const std::string& dir, const std::str
                                   "restore the missing segments, or delete index.db to rebuild from the vLog as it is.");
         }
         res.checkpoint_seq = cp_seq;
-        res.sbm->remove();  // Step 1 rule: pages change in place from here until the next clean close
         res.pager = Pager::openCommitted(path, opts, bc.committed);
         if (newer > 0) {
             BPTree tree(*res.pager);
             OpenIndexResult scratch;
-            replayVLog(vlog_dir, tree, cp_seq, RecoveryHooks{}, &scratch);
+            replayVLog(vlog_dir, tree, cp_seq, hooks, &scratch);
             res.vlog_entries_applied = scratch.vlog_entries_applied;
         }
         return res;
@@ -395,6 +394,7 @@ inline OpenIndexResult openOrRebuildIndex(const std::string& dir, const std::str
     if (::rename(tmp.c_str(), path.c_str()) != 0) fatal("rename " + tmp + " -> " + path + " failed");
     if (vlog::sync_directory(dir) != 0) fatal("fsync of directory " + dir + " failed after rename");
     np->setPath(path);
+    np->checkpoint(*res.sbm, res.commitInfo());
     res.pager = std::move(np);
     res.rebuild_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
