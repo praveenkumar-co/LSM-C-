@@ -582,13 +582,14 @@ static void testV9ProcessCrash(const std::string& base_dir) {
 #else
     const int kIterations = kQuick ? 10 : 50;
     const size_t kMinAcksBeforeKill = 200;
-    // Quick mode caps the child's appends and then blocks it until the kill, so the bytes written
-    // do not depend on disk speed. The kill still lands at a random time.
     const int kChildOpsPerThread = kQuick ? 100 : 2000;
     std::mt19937 rng(1337);
-    // Kill 5-400 ms after the 200th ack, so writes are in flight. kill -9 cannot tear a single
+    // Full mode: kill 5-400 ms after the 200th ack, so writes are in flight. Quick mode: kill as
+    // soon as a random ack count in [200, 350) is reached (the child is still writing then), so
+    // the bytes written depend on the op count, not on disk speed. kill -9 cannot tear a single
     // write() call, so torn tails rarely appear here; V3/V6 cover them.
     std::uniform_int_distribution<int> kill_delay_ms_dist(5, 400);
+    std::uniform_int_distribution<size_t> kill_at_ack_dist(kMinAcksBeforeKill, 349);
     size_t truncated_iters = 0;
     uint64_t total_acked = 0, total_recovered = 0, min_unacked = UINT64_MAX, max_unacked = 0;
 
@@ -625,7 +626,7 @@ static void testV9ProcessCrash(const std::string& base_dir) {
                 }
                 for (auto& t : threads) t.join();
                 if (kQuick) {
-                    while (true) pause(); // cap reached: wait for the kill
+                    while (true) pause(); // cap reached before the kill arrived
                 }
             } catch (const std::exception& e) {
                 std::cerr << "[Child] append failed: " << e.what() << "\n";
@@ -636,7 +637,8 @@ static void testV9ProcessCrash(const std::string& base_dir) {
         }
         CHECK(close(pipefd[1]) == 0);
         std::vector<uint64_t> acked;
-        while (acked.size() < kMinAcksBeforeKill) {
+        const size_t kill_at = kQuick ? kill_at_ack_dist(rng) : kMinAcksBeforeKill;
+        while (acked.size() < kill_at) {
             uint64_t seq = 0;
             ssize_t r = read(pipefd[0], &seq, sizeof(seq));
             if (r == static_cast<ssize_t>(sizeof(seq)))
@@ -646,8 +648,9 @@ static void testV9ProcessCrash(const std::string& base_dir) {
             else
                 CHECK(r < 0 && errno == EINTR);
         }
-        int kill_delay_ms = kill_delay_ms_dist(rng);
-        std::this_thread::sleep_for(std::chrono::milliseconds(kill_delay_ms));
+        const int kill_delay_ms = kQuick ? 0 : kill_delay_ms_dist(rng);
+        if (kill_delay_ms > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(kill_delay_ms));
         CHECK(kill(pid, SIGKILL) == 0); // also succeeds on an unreaped zombie
         int status = 0;
         CHECK(waitpid(pid, &status, 0) == pid);

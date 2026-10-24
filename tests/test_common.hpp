@@ -2,6 +2,11 @@
 // Shared helpers for the test binaries: an isolated temp dir per run, a write budget enforced as
 // bytes are written, a free-space guard, a CHECK that aborts even under NDEBUG, and the output
 // format (one "[PASS] name (summary)" line per test; details only with TEST_VERBOSE=1).
+//
+// Rule for new tests: in quick mode (TEST_QUICK) a test must run a fixed number of operations,
+// never "for N ms" or "until killed", so the bytes it writes do not depend on time or disk speed.
+// Each test should write under 1 MiB in quick mode unless the reason is written next to it. The
+// quick total must stay well under the 20 MiB budget; each [PASS] line shows the test's bytes.
 
 #include <atomic>
 #include <cerrno>
@@ -62,11 +67,18 @@ inline void detailf(const char* fmt, ...) {
     va_end(ap);
 }
 
+inline std::string takeQuickBytesTag();
+
+// In quick mode the summary also shows the bytes written since the previous [PASS]/[SKIP] line.
 inline void pass(const std::string& name, const std::string& summary = "") {
-    std::cout << "[PASS] " << name << (summary.empty() ? "" : " (" + summary + ")") << std::endl;
+    const std::string tag = takeQuickBytesTag();
+    std::string s = summary;
+    if (!tag.empty()) s += (s.empty() ? "" : "; ") + tag;
+    std::cout << "[PASS] " << name << (s.empty() ? "" : " (" + s + ")") << std::endl;
 }
 
 inline void skip(const std::string& name, const std::string& reason) {
+    (void)takeQuickBytesTag();
     std::cout << "[SKIP] " << name << " (" << reason << ")" << std::endl;
 }
 
@@ -126,6 +138,21 @@ inline void accountBytes(uint64_t n, const char* what) {
                   << " bytes (limit " << kWriteBudgetBytes << "). Aborting.\n";
         std::abort();
     }
+}
+
+// Bytes written since the last call, e.g. "312 KiB" or "1.10 MiB"; empty outside quick mode.
+inline uint64_t g_bytes_at_last_tag = 0;
+inline std::string takeQuickBytesTag() {
+    if (!kQuick || g_bytes_written == nullptr) return "";
+    const uint64_t now = bytesWritten();
+    const uint64_t n = now - g_bytes_at_last_tag;
+    g_bytes_at_last_tag = now;
+    char buf[32];
+    if (n < 1024 * 1024)
+        std::snprintf(buf, sizeof(buf), "%llu KiB", (unsigned long long)((n + 1023) / 1024));
+    else
+        std::snprintf(buf, sizeof(buf), "%.2f MiB", n / (1024.0 * 1024.0));
+    return buf;
 }
 
 inline uint64_t remainingBudget() {

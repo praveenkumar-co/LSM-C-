@@ -200,11 +200,12 @@ static void testCP3TimerTrigger(const std::string& dir) {
     o.checkpoint_bytes = 1ULL << 40;
     o.checkpoint_interval_ms = 150;
     auto st = IndexedStore::open(dir, o);
-    auto t0 = std::chrono::steady_clock::now();
+    // A fixed number of puts, 20 ms apart (at least 700 ms in total). The number of timer
+    // checkpoints still depends on elapsed time; each writes one leaf and a superblock slot.
+    const int kPuts = 35;
     int i = 0;
-    while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(700)) {
+    for (; i < kPuts; ++i) {
         st->put("t" + std::to_string(i % 20), doc(i, 30));
-        ++i;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(250)); // let the last interval pass
@@ -212,7 +213,7 @@ static void testCP3TimerTrigger(const std::string& dir) {
     std::this_thread::sleep_for(
         std::chrono::milliseconds(600)); // idle: no new entries, no new epochs
     std::vector<CheckpointReport> reps = st->checkpointReports();
-    detail() << i << " puts over 700 ms; checkpoints while writing: " << busy
+    detail() << i << " puts, 20 ms apart; checkpoints while writing: " << busy
              << "; after 600 ms idle: " << reps.size() << "\n";
     printReports(reps);
     for (const auto& r : reps) CHECK(r.trigger == CheckpointTrigger::Timer);
@@ -230,6 +231,7 @@ static void testCP4Concurrent(const std::string& dir) {
     auto st = IndexedStore::open(dir, storeOpts(128));
     const uint32_t kWriters = 4, kOps = kQuick ? 150 : 500;
     std::atomic<bool> stop{false}, failed{false};
+    std::atomic<uint64_t> puts_done{0};
     std::vector<std::map<uint32_t, std::pair<uint64_t, std::string>>> acked(
         kWriters); // key id -> (seq, doc)
     std::vector<std::thread> th;
@@ -241,6 +243,7 @@ static void testCP4Concurrent(const std::string& dir) {
                 std::string d = doc(w * 100000 + i, 50 + rng() % 200);
                 uint64_t s = st->put("c" + std::to_string(id), d);
                 acked[w][id] = {s, d};
+                puts_done++;
             }
         });
     }
@@ -262,9 +265,19 @@ static void testCP4Concurrent(const std::string& dir) {
     }
     std::vector<CheckpointReport> reps;
     std::thread cp([&] {
+        if (kQuick) {
+            // A checkpoint after every 40 acked puts: the count does not depend on disk speed.
+            const uint64_t kStep = 40, kTotalPuts = uint64_t(kWriters) * kOps;
+            for (uint64_t next = kStep; next < kTotalPuts; next += kStep) {
+                while (puts_done.load() < next)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                reps.push_back(st->checkpoint());
+            }
+            return;
+        }
         while (!stop.load()) {
             reps.push_back(st->checkpoint());
-            std::this_thread::sleep_for(std::chrono::milliseconds(kQuick ? 30 : 15));
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
         }
     });
     for (uint32_t w = 0; w < kWriters; ++w) th[w].join();
@@ -334,7 +347,7 @@ static IndexedStore::Options smallSegOpts(size_t frames) {
 static void testCP5FastRecovery(const std::string& dir) {
     banner("CP5 Fast recovery: replay and writer tail scan start at the replay point, not at "
            "segment 1");
-    const int kTotal = kQuick ? 1200 : 6000, kTail = kQuick ? 150 : 200;
+    const int kTotal = kQuick ? 800 : 6000, kTail = kQuick ? 150 : 200;
     std::map<std::string, std::pair<uint64_t, std::string>> acked;
     uint64_t last_cp_seq = 0;
     {
@@ -797,16 +810,17 @@ static std::atomic<bool> g_in_cp{false};
 static std::atomic<int> g_cp_page_writes{0};
 static std::atomic<int> g_cp_count{0}; // automatic checkpoints started in this child
 
-// Quick mode caps the child's writes and then blocks it until the kill, so the bytes written do
-// not depend on disk speed. 600 writes still reach the 3rd automatic checkpoint (16 KiB trigger)
-// while writes are running, which kinds 1 and 2 wait for.
+// Quick mode: checkpoints come only from the 16 KiB bytes trigger (no 200 ms timer), and kinds 0
+// and 3 are killed at a random ack count instead of after a random delay, so the bytes written
+// depend on op counts, not on time or disk speed. 600 writes reach the 3rd automatic checkpoint
+// (about 250 writes) with room to spare, which kinds 1 and 2 wait for.
 static constexpr uint32_t kChildOpsPerThread = kQuick ? 150 : 3000;
 
 static void killChildWriters(const std::string& sdir, int wfd, int kind) {
     IndexedStore::Options o = storeOpts(48);
     o.auto_checkpoint = true;
     o.checkpoint_bytes = kind == kDuringRecovery ? (1ULL << 40) : 16 * 1024;
-    o.checkpoint_interval_ms = kind == kDuringRecovery ? 3600 * 1000 : 200;
+    o.checkpoint_interval_ms = (kind == kDuringRecovery || kQuick) ? 3600 * 1000 : 200;
     // Crash in the 3rd automatic checkpoint, so both superblock slots name real trees.
     o.on_checkpoint_start = [](CheckpointTrigger) {
         g_cp_page_writes = 0;
@@ -849,7 +863,7 @@ static void killChildWriters(const std::string& sdir, int wfd, int kind) {
         });
     }
     for (auto& t : th) t.join();
-    if (kQuick) pauseForever(); // cap reached: wait for the kill
+    if (kQuick) pauseForever(); // cap reached before the kill arrived
     _exit(0);                   // not reached in practice: the parent kills the child first
 }
 
@@ -857,6 +871,8 @@ static void testCP11KillLoop(const std::string& base) {
     banner("CP11 kill -9 at random points (writes, checkpoint flush, between index fsync and "
            "superblock, recovery)");
     CHECK(mkdir(base.c_str(), 0755) == 0);
+    // Quick mode writes about 1.05 MiB here, over the 1 MiB guideline: 8 runs cover each of the 4
+    // crash points twice, and each run is a fresh store with several checkpoints.
     const int kIters = kQuick ? 8 : 50;
     std::mt19937 rng(1105);
     int kinds[4] = {0, 0, 0, 0};
@@ -891,9 +907,10 @@ static void testCP11KillLoop(const std::string& base) {
             }
             CHECK(paused);
         } else {
-            while (acks.size() < 150 && readK(pfd[0], &a)) acks.push_back(a);
-            CHECK(acks.size() == 150);
-            std::this_thread::sleep_for(std::chrono::milliseconds(5 + rng() % 200));
+            const size_t kill_at = kQuick ? 150 + rng() % 300 : 150;
+            while (acks.size() < kill_at && readK(pfd[0], &a)) acks.push_back(a);
+            CHECK(acks.size() == kill_at);
+            if (!kQuick) std::this_thread::sleep_for(std::chrono::milliseconds(5 + rng() % 200));
         }
         CHECK(kill(pid, SIGKILL) == 0);
         int status = 0;

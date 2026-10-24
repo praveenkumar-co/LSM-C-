@@ -43,6 +43,8 @@ static IndexedStore::Options storeOpts(size_t frames = 256) {
     o.vlog_opts = vlog::VLogWriter::Options(
         64 * 1024 * 1024, std::min<uint64_t>(64ULL * 1024 * 1024, remainingBudget()));
     o.on_index_write = [](uint64_t n) { accountBytes(n, "index.db page write"); };
+    // Quick mode: no timer checkpoints (default 30 s), so bytes written do not depend on time.
+    if (kQuick) o.checkpoint_interval_ms = 3600 * 1000;
     return o;
 }
 
@@ -680,8 +682,11 @@ static std::string case9Key(uint32_t id) {
 
 static void case9IoFailure(const std::string& base) {
     CHECK(mkdir(base.c_str(), 0755) == 0);
+    const uint32_t kPutsPerThread = kQuick ? 100 : 150;
+    const int kFailAt = kQuick ? 8 : 40;
     for (int variant = 0; variant < 2; ++variant) {
-        // 0: the 40th page pwrite fails during normal operation (evictions with a 16-frame cache).
+        // 0: the 40th page pwrite (8th in quick mode) fails during normal operation (evictions
+        //    with a 16-frame cache).
         // 1: an fsync fails inside close() (after all writes were acked).
         const std::string d = base + (variant == 0 ? "/pwrite" : "/fsync");
         int pfd[2];
@@ -696,7 +701,7 @@ static void case9IoFailure(const std::string& base) {
             auto armed = std::make_shared<std::atomic<bool>>(false);
             IndexedStore::Options o = storeOpts(16);
             o.inject_index_failure = [=](Pager::IoOp op, bpt::page_id_t) {
-                if (variant == 0 && op == Pager::IoOp::PageWrite) return ++*writes == 40;
+                if (variant == 0 && op == Pager::IoOp::PageWrite) return ++*writes == kFailAt;
                 if (variant == 1 && op == Pager::IoOp::Fsync) return armed->load();
                 return false;
             };
@@ -704,7 +709,7 @@ static void case9IoFailure(const std::string& base) {
             std::vector<std::thread> th;
             for (uint32_t w = 0; w < 4; ++w) {
                 th.emplace_back([&, w]() {
-                    for (uint32_t i = 0; i < 150; ++i) {
+                    for (uint32_t i = 0; i < kPutsPerThread; ++i) {
                         uint32_t id = w * 1000 + i;
                         std::string doc(200, static_cast<char>('a' + id % 26));
                         uint64_t seq = st->put(case9Key(id), doc);
@@ -756,7 +761,7 @@ static void case9IoFailure(const std::string& base) {
                   *doc == std::string(200, static_cast<char>('a' + x.id % 26)));
         }
         checkIndexEqualsVLog(*st, "after injected failure");
-        detail() << (variant == 0 ? "9a pwrite failure (40th page write)"
+        detail() << (variant == 0 ? "9a pwrite failure (page write " + std::to_string(kFailAt) + ")"
                                   : "9b fsync failure in close()")
                  << ": child aborted (SIGABRT) after " << acks.size()
                  << " acked puts; reopen recovered from the superblock + vLog replay; all "

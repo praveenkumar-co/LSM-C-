@@ -275,8 +275,9 @@ static void testC3ReuseDelay(const std::string& dir) {
     detailf("  %-6llu %-10u %-11zu %-9zu %-8zu %-7llu\n", (unsigned long long)cs.epoch,
             cs.page_count, snaps.back().page_crc.size(), p->freeNowCount(), p->pendingFreeCount(),
             (unsigned long long)p->stats().reuses);
+    const int round_ops = kQuick ? kRoundOps / 10 : kRoundOps;
     for (int round = 0; round < 5; ++round) {
-        randomOps(t, o, rng, seq, kSpace, kRoundOps);
+        randomOps(t, o, rng, seq, kSpace, round_ops);
         p->flushDirty();
         // Both superblock slots name these two trees right now.
         checkSnapshotIntact(path, snaps[snaps.size() - 1], "C3 newest committed tree");

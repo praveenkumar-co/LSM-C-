@@ -882,14 +882,15 @@ static void testB4CleanReopen(const std::string& dir) {
     const uint64_t seed = 401;
     const uint64_t bytes_before = bytesWritten();
     std::mt19937_64 rng(seed);
-    std::vector<std::string> keys = makeKeySpace(rng, kQuick ? 5000 : 20000);
+    const int kOps = kQuick ? 4000 : 50000;
+    std::vector<std::string> keys = makeKeySpace(rng, kQuick ? 2000 : 20000);
     Oracle o;
     uint64_t seq = 0;
     T1Result res;
     {
         auto p = Pager::create(path, pagerOpts(1024));
         BPTree t(*p);
-        runRandomOps(t, o, keys, rng, seq, kQuick ? 10000 : 50000, 0, &res);
+        runRandomOps(t, o, keys, rng, seq, kOps, 0, &res);
         checkTree(t);
         auto sbm = newSbm(dir);
         checkpointNoVLog(*p, *sbm, seq);
@@ -898,7 +899,7 @@ static void testB4CleanReopen(const std::string& dir) {
         size_t frames;
         int more_ops;
     };
-    const int more = kQuick ? 1000 : 10000;
+    const int more = kQuick ? 500 : 10000;
     uint64_t epoch = 1;
     for (Round rd : {Round{1024, more}, Round{64, more}, Round{16, 0}}) {
         bpt::SuperblockManager::LoadResult sl = loadSb(dir);
@@ -925,7 +926,7 @@ static void testB4CleanReopen(const std::string& dir) {
     detail() << "ops total: put " << res.puts << ", get " << res.gets << ", erase " << res.erases
              << ", scan " << res.scans << " (seed " << seed << ")\n";
     pass("B4.1 checkpoint + reopen with 1024/64/16 frames equals std::map",
-         std::to_string(kQuick ? 10000 : 50000) + " ops");
+         std::to_string(kOps) + " ops");
 }
 
 static void checkIndexEquals(const std::string& dir, const std::string& vlog_dir, Pager& p,
@@ -1039,6 +1040,8 @@ static IndexedStore::Options storeOpts(size_t frames) {
     o.vlog_opts = vlog::VLogWriter::Options(
         64 * 1024 * 1024, std::min<uint64_t>(64ULL * 1024 * 1024, remainingBudget()));
     o.on_index_write = [](uint64_t n) { accountBytes(n, "index.db page write"); };
+    // Quick mode: no timer checkpoints (default 30 s), so bytes written do not depend on time.
+    if (kQuick) o.checkpoint_interval_ms = 3600 * 1000;
     return o;
 }
 
@@ -1183,7 +1186,7 @@ static void b5ChildWriters(const std::string& sdir, int wfd, uint32_t ops_per_th
         }
         for (auto& t : th) t.join();
         if (close_and_pause) st->close(); // pauses inside the hook; never returns
-        if (kQuick) pauseForever();       // cap reached: wait for the kill
+        if (kQuick) pauseForever();       // cap reached before the kill arrived
     } catch (const std::exception& e) {
         std::cerr << "[Child] exception: " << e.what() << "\n";
         _exit(2);
@@ -1202,9 +1205,11 @@ static void testB5KillDuringWrites(const std::string& base) {
     CHECK(mkdir(base.c_str(), 0755) == 0);
     const int kIters = kQuick ? 10 : 50;
     std::mt19937 rng(505);
+    // Full mode kills 5-400 ms after the 200th ack. Quick mode kills as soon as a random ack
+    // count in [200, 350) is reached (the child is still writing then), so the bytes written
+    // depend on the op count, not on disk speed.
     std::uniform_int_distribution<int> delay_ms(5, 400);
-    // Quick mode caps the child's writes and then blocks it until the kill, so the bytes written
-    // do not depend on disk speed. The kill still lands at a random time.
+    std::uniform_int_distribution<size_t> kill_at_ack(200, 349);
     const uint32_t kChildOpsPerThread = kQuick ? 100 : 2000;
     uint64_t total_acked = 0, total_unacked = 0, total_checked_keys = 0;
     int kinds[3] = {0, 0, 0};
@@ -1240,10 +1245,11 @@ static void testB5KillDuringWrites(const std::string& base) {
             }
             CHECK(paused && acks.size() == 240);
         } else {
-            while (acks.size() < 200 && readRec(pfd[0], &r)) acks.push_back(r);
-            CHECK(acks.size() == 200);
-            kill_after = delay_ms(rng);
-            std::this_thread::sleep_for(std::chrono::milliseconds(kill_after));
+            const size_t kill_at = kQuick ? kill_at_ack(rng) : 200;
+            while (acks.size() < kill_at && readRec(pfd[0], &r)) acks.push_back(r);
+            CHECK(acks.size() == kill_at);
+            kill_after = kQuick ? 0 : delay_ms(rng);
+            if (kill_after > 0) std::this_thread::sleep_for(std::chrono::milliseconds(kill_after));
         }
         CHECK(kill(pid, SIGKILL) == 0);
         int status = 0;
