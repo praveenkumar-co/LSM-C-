@@ -19,7 +19,7 @@ LDFLAGS  := -pthread
 
 TEST_SRCS := $(wildcard tests/*.cpp)
 TEST_NAMES := $(notdir $(basename $(TEST_SRCS)))
-HEADERS := $(wildcard include/vlog/*.hpp include/index/*.hpp tests/*.hpp)
+HEADERS := $(wildcard include/vlog/*.hpp include/index/*.hpp include/doc/*.hpp tests/*.hpp)
 
 FLAGS_test  := -O2
 FLAGS_asan  := -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all
@@ -33,11 +33,14 @@ LIMIT_quick := 20971520
 
 .PHONY: test asan tsan quick test-quick clean check-deps
 
-# vlog/ is the bottom layer: it must not depend on index/ or legacy/.
+# vlog/ and doc/ are bottom layers: vlog/ must not depend on index/, doc/ or legacy/, and doc/
+# (JSON and update ops) must not depend on vlog/, index/ or legacy/.
 check-deps:
-	@if grep -nE '#include *[<"](\.\./)*(index|legacy)/' include/vlog/*.hpp; then \
-	  echo "check-deps: FAIL (include/vlog must not include index/ or legacy/)"; exit 1; \
-	else echo "check-deps: OK (include/vlog has no index/ or legacy/ includes)"; fi
+	@if grep -nE '#include *[<"](\.\./)*(index|doc|legacy)/' include/vlog/*.hpp; then \
+	  echo "check-deps: FAIL (include/vlog must not include index/, doc/ or legacy/)"; exit 1; \
+	elif grep -nE '#include *[<"](\.\./)*(index|vlog|legacy)/' include/doc/*.hpp; then \
+	  echo "check-deps: FAIL (include/doc must not include index/, vlog/ or legacy/)"; exit 1; \
+	else echo "check-deps: OK (vlog/ and doc/ have no upward includes)"; fi
 
 define MODE_RULES
 build/$(1)/%: tests/%.cpp $(HEADERS) Makefile
