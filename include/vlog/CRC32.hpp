@@ -14,7 +14,7 @@
 #define VLOG_HAS_ARM_CRC 1
 #endif
 #endif
-#elif defined(__x86_64__) || defined(_M_X64)
+#elif (defined(__x86_64__) || defined(_M_X64)) && defined(__SSE4_2__)
 #include <nmmintrin.h>
 #define VLOG_HAS_X86_CRC 1
 #endif

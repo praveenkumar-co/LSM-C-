@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <map>
 #include <random>
 #include <set>
@@ -724,9 +725,12 @@ static void testV10GroupCommitBenchmark(const std::string& test_dir) {
         std::filesystem::create_directories(bench_dir);
         TrackedWriter writer(bench_dir, budgetOpts(64 * 1024 * 1024, 256 * 1024 * 1024));
         std::atomic<bool> stop{false}, append_failed{false};
+        // Quick mode runs a fixed number of appends per thread instead of a fixed time, so the
+        // bytes written do not depend on disk speed.
+        const size_t ops_per_thread = kQuick ? 64 : SIZE_MAX;
         auto worker = [&](int tid) {
             size_t idx = 0;
-            while (!stop.load(std::memory_order_relaxed)) {
+            while (!stop.load(std::memory_order_relaxed) && idx < ops_per_thread) {
                 std::string key = "b_t" + std::to_string(tid) + "_k" + std::to_string(idx++);
                 std::string payload =
                     "{\"t\": " + std::to_string(tid) + ", \"idx\": " + std::to_string(idx) + "}";
@@ -743,8 +747,10 @@ static void testV10GroupCommitBenchmark(const std::string& test_dir) {
         auto start = std::chrono::steady_clock::now();
         std::vector<std::thread> threads;
         for (int t = 0; t < num_threads; ++t) threads.emplace_back(worker, t);
-        std::this_thread::sleep_for(std::chrono::milliseconds(kQuick ? 300 : 1500));
-        stop.store(true);
+        if (!kQuick) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+            stop.store(true);
+        }
         for (auto& th : threads) th.join();
         double secs =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();

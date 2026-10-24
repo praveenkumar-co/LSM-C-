@@ -79,14 +79,14 @@ include/vlog/    value log: on-disk format, CRC32C, writer, reader
 include/index/   B+Tree: page format, pager, tree, superblock, recovery, IndexedStore
 tests/           test binaries (built and run by the Makefile)
 legacy/          earlier MongoLite engine (not built)
-docs/            design notes (written before checkpoints were added; parts are out of date)
 ```
 
 `include/vlog/` never includes `include/index/` or `legacy/`; `make` checks this.
 
 ## Build and test
 
-Requires a C++17 compiler (tested with Apple clang 21 on macOS).
+Requires a C++17 compiler. Tested with Apple clang 21 on macOS; GitHub Actions runs `make test-quick`
+and `make asan` on Ubuntu with g++ and clang++ (`.github/workflows/ci.yml`).
 
 ```
 make test-quick  # optimized, smaller workloads, under 20 MiB written in total
@@ -167,6 +167,6 @@ These are single runs on one machine, not averaged benchmarks.
 - **get() opens the segment file** for every read (no file handle cache, no value cache).
 - **No page merges**: a tree with many deletes keeps empty leaves.
 - **One lock per tree**: writers are serialized.
-- **Crash tests use kill -9**, not power loss. Only macOS with `F_FULLFSYNC` is tested; the
-  `fdatasync` path for other systems is untested.
+- **Crash tests use kill -9**, not power loss. The Linux `fdatasync` path is covered only by the
+  CI runs (quick and asan modes); the measurements above are from macOS.
 - **ThreadSanitizer builds skip the fork + kill -9 tests.**
