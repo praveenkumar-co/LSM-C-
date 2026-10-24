@@ -324,13 +324,22 @@ static void testB1Corruption(const std::string& base) {
     makeIndex(d2, 0);
     const std::string path2 = d2 + "/index.db";
     CHECK(bpt::openCommittedIndex(d2, pagerOpts(16)).initial_status == OpenStatus::Ok);
+    // Extra pages past the committed page count (as after a crash) are discarded at open.
     CHECK(truncate(path2.c_str(), 3 * kPageSize) == 0);
     accountBytes(kPageSize, "test truncate (extend by one page)");
     r = bpt::openCommittedIndex(d2, pagerOpts(16));
+    CHECK(r.initial_status == OpenStatus::Ok && r.pager->truncatedPagesAtOpen() == 1);
+    CHECK(fileSize(path2) == 2 * kPageSize);
+    std::cout << "File extended to 3 pages after checkpoint: " << bpt::toString(r.initial_status)
+              << ", 1 page past the committed count truncated at open\n";
+    r.pager.reset();
+    // Shorter than the committed page count: committed pages are missing.
+    const std::string d4 = base + "/d";
+    makeIndex(d4, 0);
+    CHECK(truncate((d4 + "/index.db").c_str(), kPageSize) == 0);
+    r = bpt::openCommittedIndex(d4, pagerOpts(16));
     CHECK(r.pager == nullptr && r.initial_status == OpenStatus::SizeMismatch);
-    std::cout << "File extended to 3 pages after checkpoint: " << bpt::toString(r.initial_status) << "\n";
-    CHECK(truncate(path2.c_str(), 2 * kPageSize) == 0);
-    CHECK(bpt::openCommittedIndex(d2, pagerOpts(16)).initial_status == OpenStatus::Ok);
+    std::cout << "File cut to 1 page (committed page count 2): " << bpt::toString(r.initial_status) << "\n";
 
     // Flip one bit in the header body.
     flipBitInFile(path2, 32 + 17, 0);
@@ -348,7 +357,7 @@ static void testB1Corruption(const std::string& base) {
     r = bpt::openCommittedIndex(d3, pagerOpts(16));
     CHECK(r.pager == nullptr && r.initial_status == OpenStatus::Missing);
     std::cout << "PASS: page outside the tree aborts the reader; tree page bit flip -> TreeCorrupt; header bit flip -> "
-                 "BadHeader; wrong size -> SizeMismatch; no superblock -> NoSuperblock; no index.db -> Missing.\n";
+                 "BadHeader; extra pages truncated; short file -> SizeMismatch; no superblock -> NoSuperblock; no index.db -> Missing.\n";
 }
 
 // ------------------------------------------------------------------------------------------
@@ -898,9 +907,8 @@ static void testB4CrashRebuild(const std::string& dir) {
     CHECK(unlink(idx.c_str()) == 0);
     reopen(OpenStatus::Missing, true, "after index.db deleted");
 
-    CHECK(truncate(idx.c_str(), static_cast<off_t>(fileSize(idx) + kPageSize)) == 0);
-    accountBytes(kPageSize, "test truncate (extend by one page)");
-    reopen(OpenStatus::SizeMismatch, true, "after file size change");
+    CHECK(truncate(idx.c_str(), static_cast<off_t>(fileSize(idx) - kPageSize)) == 0);
+    reopen(OpenStatus::SizeMismatch, true, "after index.db lost its last page");
 
     // Leftover index.db.rebuild from an interrupted rebuild, plus no superblock (as after a crash).
     {

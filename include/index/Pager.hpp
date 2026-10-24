@@ -7,6 +7,13 @@
 // - Tree state (root, height, key count, page count) is kept in memory. It becomes durable only
 //   through checkpoint(): write back dirty frames, F_FULLFSYNC index.db, then commit a
 //   superblock that names the root and page count (SuperblockManager.hpp).
+// - Copy-on-write: pages with id < checkpoint_page_count belong to a committed tree and are
+//   frozen; marking one dirty aborts. The tree copies a frozen page before changing it
+//   (BPTree::cowPath). Pages allocated in the current epoch (new ids, or ids taken from the free
+//   list) are modified in place.
+// - Page reuse: a frozen page freed while the last committed epoch is E stays reserved until
+//   epoch E + 2 commits. Until then one of the two superblock slots can still name a tree that
+//   uses it. At open the free list is rebuilt by walking the committed trees (IndexRecovery.hpp).
 // - Load: pread 4096 bytes, then check CRC/magic/page_id/type. Any failure aborts.
 // - Write-back: recompute CRC, pwrite 4096 bytes. No fsync on eviction.
 // - Every syscall return value is checked. A failed fsync aborts and is never retried.
@@ -28,6 +35,8 @@
 #include <random>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -119,6 +128,8 @@ public:
         uint64_t page_writes = 0;
         uint64_t evictions = 0;
         uint64_t fsyncs = 0;
+        uint64_t frees = 0;   // freePage calls
+        uint64_t reuses = 0;  // allocations served from the free list
     };
 
     // A verified committed tree (IndexRecovery.hpp checks it before calling openCommitted).
@@ -128,6 +139,8 @@ public:
         uint32_t height = 0;
         uint64_t key_count = 0;
         uint64_t epoch = 0;
+        std::vector<page_id_t> free_now;   // not referenced by either superblock's tree
+        std::vector<page_id_t> free_older; // referenced only by the previous superblock's tree
     };
 
     // What the next superblock records besides the tree itself.
@@ -155,6 +168,7 @@ public:
         std::unique_ptr<Pager> p(new Pager(path, fd, opts));
         p->nonce_ = newNonce();
         p->page_count_ = 1;  // page 0 (header)
+        p->checkpoint_page_count_ = 1;  // only the header is frozen
         p->height_ = 1;
         p->writeHeaderLocked();
         p->fsyncOrDie("F_FULLFSYNC after create of " + path);
@@ -186,13 +200,38 @@ public:
             errno = 0;
             fatal("index.db header changed after verification: " + path);
         }
+        // Pages past the committed page count were written after the last checkpoint (or by a
+        // crashed rebuild of the tree): no superblock names them. Discard them.
+        struct stat st;
+        if (::fstat(fd, &st) != 0) fatal("fstat failed for " + path);
+        const uint64_t committed_bytes = static_cast<uint64_t>(c.page_count) * kPageSize;
+        if (static_cast<uint64_t>(st.st_size) < committed_bytes) {
+            errno = 0;
+            fatal("index.db is shorter than the committed page count: " + path);
+        }
         std::unique_ptr<Pager> p(new Pager(path, fd, opts));
+        if (static_cast<uint64_t>(st.st_size) > committed_bytes) {
+            if (::ftruncate(fd, static_cast<off_t>(committed_bytes)) != 0) fatal("ftruncate failed for " + path);
+            p->fsyncOrDie("F_FULLFSYNC after ftruncate of " + path);
+            p->truncated_pages_ = (static_cast<uint64_t>(st.st_size) - committed_bytes) / kPageSize;
+        }
         p->nonce_ = m.index_nonce;
         p->root_ = c.root;
         p->height_ = c.height;
         p->key_count_ = c.key_count;
         p->page_count_ = c.page_count;
+        p->checkpoint_page_count_ = c.page_count;
         p->epoch_ = c.epoch;
+        for (page_id_t id : c.free_now) {
+            if (id == kMetaPageId || id >= c.page_count) fatal("free list page id out of range");
+            p->free_now_.push_back(id);
+        }
+        // Pages only the previous superblock's tree uses: freed in epoch (epoch - 1) from the
+        // point of view of reuse, so they become reusable when epoch + 1 commits.
+        for (page_id_t id : c.free_older) {
+            if (id == kMetaPageId || id >= c.page_count) fatal("free list page id out of range");
+            p->pending_.push_back({c.epoch == 0 ? 0 : c.epoch - 1, id});
+        }
         return p;
     }
 
@@ -230,15 +269,77 @@ public:
         return PageGuard(this, f, buf, id);
     }
 
-    // New page: id = page_count++, zeroed frame with an empty header, pinned and dirty.
+    // New page: an id from the free list if one is reusable, else page_count++. Zeroed frame
+    // with an empty header, pinned and dirty. The page is writable for the rest of the epoch.
     PageGuard allocate(PageType type, uint8_t level) {
         std::lock_guard<std::mutex> lk(mu_);
-        if (page_count_ == UINT32_MAX) fatal("index.db page id space exhausted");
-        page_id_t id = page_count_++;
-        uint32_t f = takeVictimLocked();
+        page_id_t id;
+        uint32_t f;
+        if (!free_now_.empty()) {
+            id = free_now_.back();
+            free_now_.pop_back();
+            reused_.insert(id);
+            stats_.reuses++;
+            auto it = table_.find(id);
+            if (it != table_.end()) {
+                // A stale copy of the old page is still cached: reuse its frame.
+                f = it->second;
+                Frame& fr = frames_[f];
+                if (fr.pins != 0) fatal("reused page " + std::to_string(id) + " is pinned");
+                if (fr.in_lru) { lru_.erase(fr.lru_it); fr.in_lru = false; }
+                table_.erase(it);
+                fr.page_id = kNoPage;
+            } else {
+                f = takeVictimLocked();
+            }
+        } else {
+            if (page_count_ == UINT32_MAX) fatal("index.db page id space exhausted");
+            id = page_count_++;
+            f = takeVictimLocked();
+        }
         initPage(frameData(f), id, type, level);
         installLocked(f, id, /*dirty=*/true);
         return PageGuard(this, f, frameData(f), id);
+    }
+
+    // True if the page belongs to a committed tree and must not be modified in place.
+    bool isFrozen(page_id_t id) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return isFrozenLocked(id);
+    }
+
+    // The tree no longer references this page. A frozen page is reserved until two more epochs
+    // commit; a page allocated in this epoch was never committed and is reusable at once.
+    void freePage(page_id_t id) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (id == kMetaPageId || id >= page_count_) fatal("freePage of invalid page id " + std::to_string(id));
+        stats_.frees++;
+        if (isFrozenLocked(id)) {
+            pending_.push_back({epoch_, id});
+        } else {
+            reused_.erase(id);
+            free_now_.push_back(id);
+        }
+    }
+
+    uint64_t truncatedPagesAtOpen() const { return truncated_pages_; }
+
+    uint32_t checkpointPageCount() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return checkpoint_page_count_;
+    }
+    size_t freeNowCount() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return free_now_.size();
+    }
+    size_t pendingFreeCount() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return pending_.size();
+    }
+    // Test helper: ids of pages that may be handed out by allocate() right now.
+    std::vector<page_id_t> freeNowForTest() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return free_now_;
     }
 
     // Writes back every dirty frame (no fsync).
@@ -281,6 +382,16 @@ public:
         rec.ext.vlog_created_ns = ci.vlog_created_ns;
         sbm.commit(rec);
         epoch_++;
+        // Everything allocated so far is now part of a committed tree.
+        checkpoint_page_count_ = page_count_;
+        reused_.clear();
+        // Pages freed in epoch e are no longer referenced by either slot once epoch e + 2 commits.
+        size_t keep = 0;
+        for (size_t i = 0; i < pending_.size(); ++i) {
+            if (pending_[i].first + 2 <= epoch_) free_now_.push_back(pending_[i].second);
+            else pending_[keep++] = pending_[i];
+        }
+        pending_.resize(keep);
         CheckpointStats cs;
         cs.epoch = epoch_;
         cs.pages_written = stats_.page_writes - writes0;
@@ -448,8 +559,14 @@ private:
 
     void markDirty(uint32_t f) {
         std::lock_guard<std::mutex> lk(mu_);
+        if (isFrozenLocked(frames_[f].page_id)) {
+            errno = 0;
+            fatal("write to frozen page " + std::to_string(frames_[f].page_id) + " (copy-on-write violated)");
+        }
         frames_[f].dirty = true;
     }
+
+    bool isFrozenLocked(page_id_t id) const { return id < checkpoint_page_count_ && reused_.count(id) == 0; }
 
     // Returns an unmapped frame: a free one, else the least recently used unpinned one
     // (written back first if dirty).
@@ -487,6 +604,7 @@ private:
     int fd_{-1};
     Options opts_;
     uint64_t nonce_ = 0;
+    uint64_t truncated_pages_ = 0;
 
     // Tree state (in memory; durable only through checkpoint()).
     page_id_t root_ = kNoPage;
@@ -497,6 +615,10 @@ private:
     mutable std::mutex mu_;
     uint32_t page_count_ = 0;  // guarded by mu_
     uint64_t epoch_ = 0;       // last committed superblock epoch; guarded by mu_
+    uint32_t checkpoint_page_count_ = 0;  // ids below this are frozen (unless in reused_); guarded by mu_
+    std::unordered_set<page_id_t> reused_;  // free-list ids handed out in this epoch (writable)
+    std::vector<page_id_t> free_now_;       // reusable now
+    std::vector<std::pair<uint64_t, page_id_t>> pending_;  // (epoch freed in, id)
     std::vector<Frame> frames_;
     std::unique_ptr<uint8_t[]> buffer_;
     std::vector<uint32_t> free_frames_;

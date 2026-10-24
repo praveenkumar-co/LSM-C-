@@ -2,8 +2,12 @@
 // BPTree.hpp - disk-based B+Tree mapping key -> vlog::IndexValueRef. See docs/PHASE2_PLAN.md section 2.
 //
 // - One std::shared_mutex for the whole tree: get/scan take it shared, put/erase/apply exclusive.
-// - No merges: erase never touches parents or siblings; empty leaves stay in the tree and the
-//   leaf chain (plan section 5).
+// - Copy-on-write: before a change, every frozen page on the root-to-leaf path is copied to a new
+//   page, top-down, and the parent (or the root) is pointed at the copy (cowPath). The old page is
+//   handed to Pager::freePage, which keeps it reserved while a superblock can still name it.
+// - No leaf sibling pointers (a sibling link would force copying neighbours too). Scans walk with
+//   a stack of pinned parents.
+// - No merges: erase never touches parents or siblings; empty leaves stay in the tree (plan section 5).
 // - Keys: 1..256 bytes, compared like std::string (memcmp, then shorter first).
 
 #include "index/BPTreeFormat.hpp"
@@ -32,10 +36,9 @@ public:
     uint16_t freeStart() const { return ld<uint16_t>(offsetof(PageHeader, free_start)); }
     uint16_t cellStart() const { return ld<uint16_t>(offsetof(PageHeader, cell_start)); }
     uint16_t fragBytes() const { return ld<uint16_t>(offsetof(PageHeader, frag_bytes)); }
-    page_id_t rightSibling() const { return ld<uint32_t>(offsetof(PageHeader, right_sibling)); }
     page_id_t leftmostChild() const { return ld<uint32_t>(offsetof(PageHeader, leftmost_child)); }
-    void setRightSibling(page_id_t id) { st<uint32_t>(offsetof(PageHeader, right_sibling), id); }
     void setLeftmostChild(page_id_t id) { st<uint32_t>(offsetof(PageHeader, leftmost_child), id); }
+    void setPageId(page_id_t id) { st<uint32_t>(offsetof(PageHeader, page_id), id); }
 
     uint32_t valueSize() const { return isLeaf() ? kLeafValueSize : kChildValueSize; }
     uint16_t slot(uint32_t i) const { return ld<uint16_t>(kHeaderSize + kSlotSize * i); }
@@ -61,6 +64,10 @@ public:
     }
     // Child j of an internal page: j == 0 is leftmost_child, j >= 1 is the child of cell j-1.
     page_id_t childAt(uint32_t j) const { return j == 0 ? leftmostChild() : cellChild(j - 1); }
+    void setChildAt(uint32_t j, page_id_t c) {
+        if (j == 0) setLeftmostChild(c);
+        else std::memcpy(p_ + slot(j - 1) + 2 + keyLen(j - 1), &c, sizeof(c));
+    }
 
     // First index i with key(i) >= k.
     uint32_t lowerBound(std::string_view k) const {
@@ -140,7 +147,7 @@ public:
         setFragBytes(0);
     }
 
-    // Removes every entry (keeps type, level, sibling, leftmost child).
+    // Removes every entry (keeps type, level, leftmost child).
     void clearEntries() {
         std::memset(p_ + kHeaderSize, 0, kPageSize - kHeaderSize);
         setCount(0);
@@ -247,23 +254,11 @@ public:
         return pager_.keyCount();
     }
 
-    // Test-only: keys of every leaf, in leaf-chain order (empty leaves included).
+    // Test-only: keys of every leaf, in key order (empty leaves included).
     std::vector<std::vector<std::string>> leafKeysForTest() const {
         std::shared_lock<std::shared_mutex> lk(mu_);
         std::vector<std::vector<std::string>> out;
-        PageGuard g = pager_.fetch(pager_.rootPageId());
-        while (!Node(g.data()).isLeaf()) {
-            PageGuard c = pager_.fetch(Node(g.data()).childAt(0));
-            g = std::move(c);
-        }
-        while (true) {
-            Node n(g.data());
-            out.emplace_back();
-            for (uint32_t i = 0; i < n.count(); ++i) out.back().emplace_back(n.key(i));
-            if (n.rightSibling() == kNoPage) break;
-            PageGuard ng = pager_.fetch(n.rightSibling());
-            g = std::move(ng);
-        }
+        collectLeaves(pager_.rootPageId(), &out);
         return out;
     }
 
@@ -287,17 +282,6 @@ public:
         if (s.keys != pager_.keyCount()) {
             return "meta key_count " + std::to_string(pager_.keyCount()) + " != keys in leaves " + std::to_string(s.keys);
         }
-        // The leaf chain must visit exactly the leaves found by the tree walk, in key order.
-        page_id_t cur = leaves.front();
-        for (size_t i = 0; i < leaves.size(); ++i) {
-            if (cur != leaves[i]) {
-                return "leaf chain position " + std::to_string(i) + " is page " + std::to_string(cur) +
-                       ", tree order says " + std::to_string(leaves[i]);
-            }
-            PageGuard g = pager_.fetch(cur);
-            cur = Node(g.data()).rightSibling();
-        }
-        if (cur != kNoPage) return "last leaf has right_sibling " + std::to_string(cur);
         if (shape) *shape = s;
         return "";
     }
@@ -321,19 +305,54 @@ private:
         return g;
     }
 
-    PutStatus putLocked(std::string_view key, const Ref& ref) {
-        // Descend, keeping every internal page on the path pinned with the child index taken.
-        std::vector<PageGuard> path;
-        std::vector<uint32_t> path_idx;
+    // Descends to the leaf for key, keeping every internal page on the path pinned together with
+    // the child index taken.
+    PageGuard descendWithPath(std::string_view key, std::vector<PageGuard>* path, std::vector<uint32_t>* path_idx) {
         PageGuard leaf = pager_.fetch(pager_.rootPageId());
         while (!Node(leaf.data()).isLeaf()) {
             Node n(leaf.data());
             uint32_t j = n.upperBound(key);
             PageGuard child = pager_.fetch(n.childAt(j));
-            path.push_back(std::move(leaf));
-            path_idx.push_back(j);
+            path->push_back(std::move(leaf));
+            path_idx->push_back(j);
             leaf = std::move(child);
         }
+        return leaf;
+    }
+
+    // Makes every page on the path writable: top-down, each frozen page is copied to a new page,
+    // the parent's child pointer (or the root) is pointed at the copy, and the old page is freed.
+    // A page allocated in this epoch has only writable ancestors, so copying stops being needed
+    // below the first writable page in practice; the loop still checks every level.
+    void cowPath(std::vector<PageGuard>& path, const std::vector<uint32_t>& path_idx, PageGuard& leaf) {
+        for (size_t i = 0; i <= path.size(); ++i) {
+            PageGuard& g = (i < path.size()) ? path[i] : leaf;
+            if (!pager_.isFrozen(g.id())) continue;
+            const page_id_t old_id = g.id();
+            PageGuard c = pager_.allocate(PageType::Leaf, 0);  // type/level come from the copied bytes
+            std::memcpy(c.data(), g.data(), kPageSize);
+            Node(c.data()).setPageId(c.id());
+            c.markDirty();
+            if (i == 0) {
+                if (pager_.rootPageId() != old_id) fatal("cowPath: path[0] is not the root");
+                pager_.setRoot(c.id(), pager_.treeHeight());
+            } else {
+                Node pn(path[i - 1].data());
+                if (pn.childAt(path_idx[i - 1]) != old_id) fatal("cowPath: parent does not point at the copied page");
+                pn.setChildAt(path_idx[i - 1], c.id());
+                path[i - 1].markDirty();
+            }
+            g = std::move(c);  // unpins the old page
+            pager_.freePage(old_id);
+            cow_copies_++;
+        }
+    }
+
+    PutStatus putLocked(std::string_view key, const Ref& ref) {
+        std::vector<PageGuard> path;
+        std::vector<uint32_t> path_idx;
+        PageGuard leaf = descendWithPath(key, &path, &path_idx);
+        cowPath(path, path_idx, leaf);
         Node n(leaf.data());
         uint32_t pos = n.lowerBound(key);
         if (pos < n.count() && compareKeys(n.key(pos), key) == 0) {
@@ -432,8 +451,6 @@ private:
         l.clearEntries();
         fillNode(l, e, 0, s);
         fillNode(r, e, s, e.size());
-        r.setRightSibling(l.rightSibling());
-        l.setRightSibling(rg.id());
         lg.markDirty();
         rg.markDirty();
         *sep = e[s].key;
@@ -468,18 +485,37 @@ private:
     }
 
     bool eraseLocked(std::string_view key) {
-        PageGuard leaf = descendToLeaf(key);
+        std::vector<PageGuard> path;
+        std::vector<uint32_t> path_idx;
+        PageGuard leaf = descendWithPath(key, &path, &path_idx);
+        {
+            Node n(leaf.data());
+            uint32_t pos = n.lowerBound(key);
+            if (pos >= n.count() || compareKeys(n.key(pos), key) != 0) return false;  // nothing changes: no copy
+        }
+        cowPath(path, path_idx, leaf);
         Node n(leaf.data());
         uint32_t pos = n.lowerBound(key);
-        if (pos >= n.count() || compareKeys(n.key(pos), key) != 0) return false;
         n.remove(pos);
         leaf.markDirty();
         pager_.setKeyCount(pager_.keyCount() - 1);
         return true;
     }
 
+    // Cursor scan: a stack of pinned parents with the child index taken at each level. When a
+    // leaf is used up, pop to the nearest parent with a next child and descend its leftmost path.
     void scanLocked(std::string_view start, const std::string_view* end, size_t limit, ScanResult* out) const {
-        PageGuard g = descendToLeaf(start);
+        std::vector<PageGuard> stack;
+        std::vector<uint32_t> idx;
+        PageGuard g = pager_.fetch(pager_.rootPageId());
+        while (!Node(g.data()).isLeaf()) {
+            Node n(g.data());
+            uint32_t j = n.upperBound(start);
+            PageGuard child = pager_.fetch(n.childAt(j));  // pin child before the parent can move
+            stack.push_back(std::move(g));
+            idx.push_back(j);
+            g = std::move(child);
+        }
         uint32_t pos = Node(g.data()).lowerBound(start);
         while (true) {
             Node n(g.data());
@@ -489,12 +525,38 @@ private:
                 out->emplace_back(std::string(k), n.leafValue(pos));
                 if (out->size() >= limit) return;
             }
-            page_id_t next = n.rightSibling();
-            if (next == kNoPage) return;
-            PageGuard ng = pager_.fetch(next);  // pin next leaf before unpinning this one
-            g = std::move(ng);
+            g.release();
+            while (!stack.empty() && idx.back() >= Node(stack.back().data()).count()) {
+                stack.pop_back();
+                idx.pop_back();
+            }
+            if (stack.empty()) return;
+            idx.back()++;
+            PageGuard c = pager_.fetch(Node(stack.back().data()).childAt(idx.back()));
+            while (!Node(c.data()).isLeaf()) {
+                PageGuard next = pager_.fetch(Node(c.data()).childAt(0));
+                stack.push_back(std::move(c));
+                idx.push_back(0);
+                c = std::move(next);
+            }
+            g = std::move(c);
             pos = 0;
         }
+    }
+
+    void collectLeaves(page_id_t id, std::vector<std::vector<std::string>>* out) const {
+        std::vector<page_id_t> children;
+        {
+            PageGuard g = pager_.fetch(id);
+            Node n(g.data());
+            if (n.isLeaf()) {
+                out->emplace_back();
+                for (uint32_t i = 0; i < n.count(); ++i) out->back().emplace_back(n.key(i));
+                return;
+            }
+            for (uint32_t j = 0; j <= n.count(); ++j) children.push_back(n.childAt(j));
+        }
+        for (page_id_t c : children) collectLeaves(c, out);
     }
 
     void noteSeq(uint64_t seq) {
@@ -528,7 +590,7 @@ private:
             if (h.free_start != kHeaderSize + kSlotSize * h.slot_count) return fail("free_start != 32 + 2*slot_count");
             if (h.free_start > h.cell_start || h.cell_start > kPageSize) return fail("free_start > cell_start");
             if (leaf && h.leftmost_child != 0) return fail("leaf with leftmost_child");
-            if (!leaf && h.right_sibling != 0) return fail("internal page with right_sibling");
+            if (h.right_sibling != 0) return fail("right_sibling is set (no sibling links since format v3)");
             if (!leaf && (h.leftmost_child == kNoPage || h.slot_count == 0)) return fail("internal page without children");
             std::vector<std::pair<uint32_t, uint32_t>> cells;
             uint64_t live = 0;
@@ -583,6 +645,13 @@ private:
 
     Pager& pager_;
     mutable std::shared_mutex mu_;
+    uint64_t cow_copies_ = 0;  // guarded by mu_ (exclusive)
+
+public:
+    uint64_t cowCopies() const {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        return cow_copies_;
+    }
 };
 
 } // namespace bpt

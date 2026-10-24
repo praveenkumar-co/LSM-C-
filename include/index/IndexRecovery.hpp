@@ -238,6 +238,8 @@ struct BootCheck {
     SuperblockManager::LoadResult sb;
     MetaBody header{};
     Pager::Committed committed;
+    bool older_tree_ok = false;
+    uint64_t reachable_pages = 0;  // pages of the current tree
 };
 
 // Read-only checks of index.db + superblock.db. vid == nullptr skips the vLog identity check.
@@ -266,15 +268,41 @@ inline BootCheck checkCommittedIndex(const std::string& dir, SuperblockManager& 
     if (fd < 0) fatal("open failed for " + path);
     struct stat st;
     if (::fstat(fd, &st) != 0) fatal("fstat failed for " + path);
-    if (static_cast<uint64_t>(st.st_size) != static_cast<uint64_t>(page_count) * kPageSize) {
+    // Shorter than the committed page count: committed pages are missing. Longer is normal after a
+    // crash (pages written after the last checkpoint); Pager::openCommitted truncates them.
+    if (static_cast<uint64_t>(st.st_size) < static_cast<uint64_t>(page_count) * kPageSize) {
         if (::close(fd) != 0) fatal("close failed for " + path);
         bc.status = OpenStatus::SizeMismatch;
         bc.why = "file size " + std::to_string(st.st_size) + ", superblock page count " + std::to_string(page_count);
         return bc;
     }
     TreeWalk w = walkTree(fd, root, page_count);
+    if (!w.ok) {
+        if (::close(fd) != 0) fatal("close failed for " + path);
+        bc.status = OpenStatus::TreeCorrupt;
+        bc.why = w.why;
+        return bc;
+    }
+    // Free list: every page in [1, page_count) that neither superblock's tree uses. Pages used only
+    // by the previous superblock's tree stay reserved until one more epoch commits. Only that
+    // tree's internal pages are read (leaf ids come from their parents). If that tree cannot be
+    // walked it cannot be recovered either, so it gets no protection.
+    std::vector<bool> older_reach;
+    if (bc.sb.has_older && bc.sb.older.ext.index_nonce == bc.header.index_nonce &&
+        bc.sb.older.sb.index_page_count <= page_count) {
+        TreeWalk ow = walkTree(fd, static_cast<page_id_t>(bc.sb.older.sb.index_root_page),
+                               static_cast<uint32_t>(bc.sb.older.sb.index_page_count), /*read_leaves=*/false);
+        if (ow.ok) older_reach = std::move(ow.reachable);
+        bc.older_tree_ok = ow.ok;
+    }
     if (::close(fd) != 0) fatal("close failed for " + path);
-    if (!w.ok) { bc.status = OpenStatus::TreeCorrupt; bc.why = w.why; return bc; }
+    for (page_id_t id = 1; id < page_count; ++id) {
+        if (w.reachable[id]) continue;
+        if (id < older_reach.size() && older_reach[id]) bc.committed.free_older.push_back(id);
+        else bc.committed.free_now.push_back(id);
+    }
+    bc.reachable_pages = 0;
+    for (page_id_t id = 1; id < page_count; ++id) bc.reachable_pages += w.reachable[id] ? 1 : 0;
     bc.committed.root = root;
     bc.committed.page_count = page_count;
     bc.committed.height = w.height;
