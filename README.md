@@ -245,12 +245,11 @@ These are single runs on one machine, not averaged benchmarks.
 
 ---
 
-## Production Verification & Systems Engineering Interview Guide
+## Production Verification & Invariant Mapping
 
 > For complete, untruncated terminal logs of all test suites and benchmarks, see [docs/VERIFICATION_LOGS.md](docs/VERIFICATION_LOGS.md).
 
-This guide details the empirical validation methodology and maps every key architectural invariant to its concrete test suite in the codebase. Use this cross-reference during systems engineering reviews and technical interviews.
-
+This section maps the core storage engine invariants to their empirical test suites and documents the underlying architectural design principles.
 
 ### 1. Test Suite & Verification Matrix
 
@@ -270,19 +269,17 @@ The engine enforces strict hardware-level correctness through three complementar
 | **Delta Logging & Write Savings** | `P4.D1`–`P4.D7`, `make bench` | Validates in-place delta updates. Reduces write volume by $3.65\times$ (1 KB) to $4.78\times$ (8 KB) while guaranteeing byte-for-byte fidelity (`P4.D7`) and identical document states across caps 0..4 (`P4.D6`). |
 | **Strict JSON & Path Safety** | `P4.A1`–`P4.C10` | RFC 8259 compliance: depth limits (64 max), int64 overflow detection, surrogate pair escapes, path conflict resolution (`"a"` vs `"a.b"`), and zero-write guarantees on error. |
 
-### 2. Architecture & Design Decisions: Key Talking Points
+### 2. Core Architectural Design Principles
 
-When discussing this storage engine architecture, highlight the following core design choices:
+1. **Key-Value Separation (WiscKey Model)**
+   - Traditional slotted page architectures (e.g., PostgreSQL heap, WiredTiger) rewrite full 4–8 KiB pages for small mutations, resulting in severe write amplification. By appending payloads sequentially to an append-only Value Log (vLog) and indexing them with slim 24-byte references (`IndexValueRef`), payload write amplification is eliminated.
+2. **Ping-Pong Double-Buffered Superblock**
+   - In-place header overwrites risk torn sectors upon sudden power failure. Alternating updates between Slot 0 (offset 0) and Slot 1 (offset 4096) with monotonic epochs and CRC32C ensures one slot remains completely consistent and atomic on disk.
+3. **Sibling-Free Copy-on-Write (COW) B+Tree**
+   - Eliminating horizontal leaf sibling pointers prevents cascading node replication across leaf levels during page modifications. Range scans are handled via an in-memory parent-stack cursor, confining COW path replication strictly to $O(\text{height})$ nodes.
+4. **Bounded Delta Update Chains**
+   - Unbounded delta logging produces unbounded read amplification. Capping chains at `kMaxDeltaChain = 4` guarantees that any point read requires at most 5 vLog lookups (p50 read latency $\le 130\ \mu\text{s}$) while reducing SSD write volume by $70\%$ to $80\%$.
+5. **Striped Key Locking & Sequencer Ordering**
+   - 1024 independent stripe locks serialize updates targeting the same key to preserve deterministic delta bases, while allowing multi-key operations to scale concurrently across group commit batches without circular waits or deadlocks.
 
-1. **Why WiscKey Key-Value Separation?**
-   - *Traditional approach (Postgres heap / WiredTiger slotted pages):* Updating a 20-byte field in an 8 KB page requires writing the entire 8 KB page back to SSD, causing $400\times$ write amplification.
-   - *Our approach:* Documents are written once to an append-only Value Log (vLog). The primary B+Tree stores only compact 24-byte references (`IndexValueRef`). Write amplification is reduced to near $1.0\times$.
-2. **Why Ping-Pong Double-Buffering for Superblocks?**
-   - Overwriting a header in-place risks torn writes if power fails mid-sector. By alternating between Slot 0 (offset 0) and Slot 1 (offset 4096) with a monotonic epoch and CRC32C, one slot is always guaranteed valid on disk.
-3. **Why Remove Leaf Sibling Pointers in Copy-on-Write?**
-   - In a traditional B+Tree, leaves have horizontal `next`/`prev` sibling pointers. In a Copy-on-Write tree, copying Leaf B would force updating Leaf A's pointer, causing a cascade of copies across all leaves. Removing sibling pointers and using a parent-stack cursor confines COW to $O(\text{height})$ nodes.
-4. **Why Cap Delta Chains at 4?**
-   - Unbounded delta logging creates unbounded read amplification. Capping chains at `kMaxDeltaChain = 4` guarantees that any `get()` requires at most 5 vLog reads, bounding tail read latency to $< 140\ \mu\text{s}$ while preserving $\sim 80\%$ write volume reduction.
-5. **Why 1024 Stripe Locks for Live Updates?**
-   - To make `$inc` and delta updates deterministic, an update must read the current version, append the delta with matching `base_seq`, and update the index. Striped locking serializes updates to the same key while allowing different keys to commit concurrently via group commit.
 
