@@ -11,7 +11,9 @@
 #include "vlog/VLogWriter.hpp"
 
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -147,6 +149,22 @@ static vlog::EntryHeader rawEntry(const std::string& vdir, const vlog::VPtr& p,
     if (payload) *payload = std::move(pl);
     return h;
 }
+
+#ifndef TSAN_BUILD // used only by the fork + kill -9 tests
+struct EntryInfo {
+    uint64_t seq;
+    std::string key;
+};
+static std::vector<EntryInfo> readVLog(const std::string& vdir) {
+    std::vector<EntryInfo> out;
+    std::vector<uint32_t> segs = bpt::listVLogSegments(vdir);
+    vlog::VLogReader reader(vdir);
+    for (size_t i = 0; i < segs.size(); ++i)
+        for (const auto& e : reader.scanSegment(segs[i], i + 1 == segs.size()).entries)
+            out.push_back(EntryInfo{e.header.seq, e.key});
+    return out;
+}
+#endif
 
 // Independent reference: replays the whole vLog in seq order with the delta rule, checking that
 // every Delta's base is the key's previous entry, and rebuilds each key's document (Full entries
@@ -909,6 +927,334 @@ static void testG6BaseMismatch(const std::string& base_dir) {
          std::to_string(cases) + " cases (wrong base, absent key, rebuild path), 2 opens each");
 }
 
+// ------------------------------------------------------------------------------------------
+// P4.G1-G4, G7, G8: crash and recovery
+// ------------------------------------------------------------------------------------------
+struct Ack {
+    uint64_t seq;
+    uint32_t key;
+    uint32_t pad;
+};
+static_assert(sizeof(Ack) == 16);
+
+#ifndef TSAN_BUILD
+static bool readAck(int fd, Ack* a) {
+    while (true) {
+        ssize_t n = read(fd, a, sizeof(*a));
+        if (n == static_cast<ssize_t>(sizeof(*a))) return true;
+        if (n == 0) return false;
+        CHECK(n < 0 && errno == EINTR);
+    }
+}
+
+// Forks a child that runs body(write_fd), reads acks until kill_at of them arrived, kills the
+// child with SIGKILL, then drains the acks written before it died.
+template <typename Body> static std::vector<Ack> runAndKill(size_t kill_at, Body body) {
+    int pfd[2];
+    CHECK(pipe(pfd) == 0);
+    std::cout.flush();
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        childExpectsAbort();
+        CHECK(close(pfd[0]) == 0);
+        body(pfd[1]);
+        while (true) pause(); // op cap reached before the kill arrived
+    }
+    CHECK(close(pfd[1]) == 0);
+    std::vector<Ack> acks;
+    Ack a;
+    while (acks.size() < kill_at && readAck(pfd[0], &a)) acks.push_back(a);
+    CHECK(acks.size() == kill_at);
+    CHECK(kill(pid, SIGKILL) == 0);
+    int status = 0;
+    CHECK(waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+    while (readAck(pfd[0], &a)) acks.push_back(a);
+    CHECK(close(pfd[0]) == 0);
+    return acks;
+}
+#endif
+
+static void testG1IncStream(const std::string& base_dir) {
+    banner("P4.G1 kill -9 during a stream of $inc");
+#ifdef TSAN_BUILD
+    skip("P4.G1 kill -9 during $inc stream", "fork + kill -9 not run under ThreadSanitizer");
+    (void)base_dir;
+#else
+    CHECK(::mkdir(base_dir.c_str(), 0755) == 0);
+    const int kIters = kQuick ? 4 : 20, kCap = 200;
+    std::mt19937 rng(101);
+    uint64_t total_acked = 0, in_flight_landed = 0;
+    for (int it = 0; it < kIters; ++it) {
+        const std::string dir = base_dir + "/it" + std::to_string(it);
+        uint64_t put_seq = 0;
+        {
+            auto st = IndexedStore::open(dir, storeOpts());
+            put_seq = st->put("ctr", padDoc(it));
+            st->close();
+        }
+        const size_t kill_at = 30 + rng() % 120; // the child is still writing at this point
+        std::vector<Ack> acks = runAndKill(kill_at, [&](int wfd) {
+            IndexedStore::Options o = storeOpts();
+            o.auto_checkpoint = true; // checkpoints land in the middle of the stream
+            o.checkpoint_bytes = 4096;
+            auto st = IndexedStore::open(dir, o);
+            for (int i = 0; i < kCap; ++i) {
+                Ack a{st->update("ctr", {doc::inc("n", 1)}).seq, 0, 0};
+                CHECK(write(wfd, &a, sizeof(a)) == static_cast<ssize_t>(sizeof(a)));
+            }
+        });
+        auto st = IndexedStore::open(dir, storeOpts());
+        const int64_t n = doc::parse(*st->get("ctr")).find("n")->asInt();
+        const uint64_t acked = acks.size();
+        // Entries for "ctr" after the initial put: each acked or in-flight update wrote one.
+        Replayed r = replayVLog(st->vlogDir());
+        uint64_t incs = 0;
+        for (const auto& e : readVLog(st->vlogDir()))
+            if (e.key == "ctr" && e.seq > put_seq) incs++;
+        CHECK(acked <= static_cast<uint64_t>(n) && static_cast<uint64_t>(n) <= acked + 1);
+        CHECK(static_cast<uint64_t>(n) == incs);
+        CHECK(r.docs.at("ctr") == *st->get("ctr"));
+        total_acked += acked;
+        in_flight_landed += static_cast<uint64_t>(n) - acked;
+        st->close();
+        accountVLog(dir);
+    }
+    pass("P4.G1 kill -9 during $inc stream: acked <= value <= acked + 1, value == $inc entries",
+         std::to_string(kIters) + " runs, " + std::to_string(total_acked) + " acked; " +
+             std::to_string(in_flight_landed) + " runs where the in-flight update landed");
+#endif
+}
+
+static void testG2RandomUpdates(const std::string& base_dir) {
+    banner("P4.G2 kill -9 during random updates on many keys");
+#ifdef TSAN_BUILD
+    skip("P4.G2 kill -9 during random updates", "fork + kill -9 not run under ThreadSanitizer");
+    (void)base_dir;
+#else
+    CHECK(::mkdir(base_dir.c_str(), 0755) == 0);
+    const int kIters = kQuick ? 4 : 20, kThreads = 4, kKeysPer = 3, kCapPer = 60;
+    std::mt19937 rng(202);
+    uint64_t total_acked = 0;
+    for (int it = 0; it < kIters; ++it) {
+        const std::string dir = base_dir + "/it" + std::to_string(it);
+        {
+            auto st = IndexedStore::open(dir, storeOpts());
+            for (int k = 0; k < kThreads * kKeysPer; ++k)
+                st->put("k" + std::to_string(k), padDoc(k));
+            st->close();
+        }
+        const size_t kill_at = 40 + rng() % 150;
+        std::vector<Ack> acks = runAndKill(kill_at, [&](int wfd) {
+            IndexedStore::Options o = storeOpts(16);
+            o.auto_checkpoint = true;
+            o.checkpoint_bytes = 6000;
+            auto st = IndexedStore::open(dir, o);
+            std::vector<std::thread> th;
+            for (int t = 0; t < kThreads; ++t)
+                th.emplace_back([&, t] {
+                    std::mt19937 r(300 + t);
+                    for (int i = 0; i < kCapPer; ++i) {
+                        const uint32_t k = static_cast<uint32_t>(t * kKeysPer + r() % kKeysPer);
+                        const std::string key = "k" + std::to_string(k);
+                        Ops ops;
+                        switch (r() % 4) {
+                        case 0:
+                            ops = {doc::inc("n", 1)};
+                            break;
+                        case 1:
+                            ops = {doc::set("f" + std::to_string(r() % 4), Value::integer(i))};
+                            break;
+                        case 2:
+                            ops = {doc::unset("f" + std::to_string(r() % 4)), doc::inc("n", 2)};
+                            break;
+                        default:
+                            ops = {doc::inc("x.y", 0.5)};
+                        }
+                        Ack a{st->update(key, ops).seq, k, 0};
+                        CHECK(write(wfd, &a, sizeof(a)) == static_cast<ssize_t>(sizeof(a)));
+                    }
+                });
+            for (auto& x : th) x.join();
+        });
+        auto st = IndexedStore::open(dir, storeOpts());
+        CHECK(!st->openInfo().rebuilt);
+        // Every acked update is in the recovered vLog, and each key is at or past its last ack.
+        std::set<uint64_t> in_vlog;
+        for (const auto& e : readVLog(st->vlogDir())) in_vlog.insert(e.seq);
+        std::map<uint32_t, uint64_t> last_ack;
+        for (const Ack& a : acks) {
+            CHECK(in_vlog.count(a.seq));
+            last_ack[a.key] = std::max(last_ack[a.key], a.seq);
+        }
+        for (const auto& [k, seq] : last_ack)
+            CHECK(st->tree().get("k" + std::to_string(k))->seq >= seq);
+        checkStoreEqualsReplay(*st, "P4.G2");
+        total_acked += acks.size();
+        st->close();
+        accountVLog(dir);
+    }
+    pass("P4.G2 kill -9 during random updates on many keys: every acked update visible; index == "
+         "full vLog replay",
+         std::to_string(kIters) + " runs, " + std::to_string(total_acked) + " acked updates");
+#endif
+}
+
+static void testG3AppendedNotApplied(const std::string& dir) {
+    banner("P4.G3 Deltas in the vLog but not in the index at crash time are replayed");
+    vlog::IndexValueRef a{};
+    std::string oracle_a = padDoc(21), oracle_b = padDoc(22);
+    {
+        auto st = IndexedStore::open(dir, storeOpts());
+        st->put("a", oracle_a);
+        st->update("a", {doc::inc("n", 1)});
+        oracle_a = applyToCopy(oracle_a, {doc::inc("n", 1)});
+        a = *st->tree().get("a");
+        st->close();
+    }
+    // The state a crash leaves when update() appended (fsynced) its entries but died before
+    // applying them: a Delta on a's chain (depth 2), and a put of b followed by a Delta on it.
+    {
+        vlog::VLogWriter w(dir + "/vlog", writerOpts());
+        appendDelta(w, "a", a.seq, a.vptr, 2, {doc::set("late", Value::boolean(true))});
+        oracle_a = applyToCopy(oracle_a, {doc::set("late", Value::boolean(true))});
+        vlog::AppendResult pb = w.append(vlog::EntryType::Full, "b", oracle_b.data(),
+                                         static_cast<uint32_t>(oracle_b.size()));
+        appendDelta(w, "b", pb.seq, pb.vptr, 1, {doc::inc("n", 3)});
+        oracle_b = applyToCopy(oracle_b, {doc::inc("n", 3)});
+    }
+    auto st = IndexedStore::open(dir, storeOpts());
+    CHECK(!st->openInfo().rebuilt && st->openInfo().vlog_entries_applied == 3);
+    bpt::ReadStats rs;
+    CHECK(st->get("a", nullptr, &rs) == oracle_a && rs.chain_depth == 2);
+    CHECK(st->get("b", nullptr, &rs) == oracle_b && rs.chain_depth == 1);
+    // update() continues the replayed chain.
+    CHECK(st->update("a", {doc::inc("n", 1)}).chain_depth == 3);
+    checkStoreEqualsReplay(*st, "P4.G3");
+    st->close();
+    accountVLog(dir);
+    pass("P4.G3 delta appended but not applied at crash time -> replay applies it",
+         "3 entries replayed");
+}
+
+static void testG4CheckpointMidChain(const std::string& dir) {
+    banner("P4.G4 Checkpoint in the middle of a chain, then a crash");
+    std::string oracle = padDoc(23);
+    {
+        auto st = IndexedStore::open(dir, storeOpts());
+        st->put("k", oracle);
+        for (int i = 0; i < 2; ++i) {
+            st->update("k", {doc::inc("n", 1)});
+            oracle = applyToCopy(oracle, {doc::inc("n", 1)});
+        }
+        st->checkpoint(); // the base and the first two deltas are before the replay point
+        for (int i = 0; i < 2; ++i) {
+            st->update("k", {doc::set("after" + std::to_string(i), Value::integer(i))});
+            oracle =
+                applyToCopy(oracle, {doc::set("after" + std::to_string(i), Value::integer(i))});
+        }
+        // dropped without close(): a crash
+    }
+    {
+        auto st = IndexedStore::open(dir, storeOpts());
+        CHECK(!st->openInfo().rebuilt && st->openInfo().vlog_entries_applied == 2);
+        bpt::ReadStats rs;
+        CHECK(st->get("k", nullptr, &rs) == oracle && rs.chain_depth == 4 && rs.vlog_reads == 5);
+    }
+    CHECK(::unlink((dir + "/superblock.db").c_str()) == 0);
+    {
+        auto st = IndexedStore::open(dir, storeOpts());
+        CHECK(st->openInfo().rebuilt && st->get("k") == oracle);
+        st->close();
+    }
+    accountVLog(dir);
+    pass("P4.G4 checkpoint mid-chain (base before replay point, deltas after); crash; get() "
+         "correct");
+}
+
+static void flipByte(const std::string& path, uint64_t offset) {
+    int fd = ::open(path.c_str(), O_RDWR);
+    CHECK(fd >= 0);
+    unsigned char b;
+    CHECK(pread(fd, &b, 1, static_cast<off_t>(offset)) == 1);
+    b ^= 0x5A;
+    CHECK(pwrite(fd, &b, 1, static_cast<off_t>(offset)) == 1);
+    CHECK(fsync(fd) == 0 && close(fd) == 0);
+}
+
+static std::string segPath(const std::string& vdir, uint32_t id) {
+    char name[32];
+    std::snprintf(name, sizeof(name), "/vlog_%08u.log", id);
+    return vdir + name;
+}
+
+// Entries of key's chain, newest first: the index target, then each base down to the Full entry.
+static std::vector<vlog::VPtr> chainOf(IndexedStore& st, const std::string& key) {
+    std::vector<vlog::VPtr> out;
+    vlog::VPtr at = st.tree().get(key)->vptr;
+    while (true) {
+        out.push_back(at);
+        std::vector<uint8_t> pl;
+        if (rawEntry(st.vlogDir(), at, &pl).type == static_cast<uint8_t>(vlog::EntryType::Full))
+            return out;
+        at = bpt::decodeDelta(pl).prefix.base;
+    }
+}
+
+static void testG7CorruptBase(const std::string& dir) {
+    banner("P4.G7 A corrupt entry in a chain: get() fails, never a wrong document");
+    std::vector<vlog::VPtr> chain_a, chain_b;
+    {
+        auto st = IndexedStore::open(dir, storeOpts());
+        st->put("a", padDoc(24));
+        st->put("b", padDoc(25));
+        for (int i = 0; i < 2; ++i) {
+            st->update("a", {doc::inc("n", 1)});
+            st->update("b", {doc::inc("n", 1)});
+        }
+        st->put("c", padDoc(26));
+        chain_a = chainOf(*st, "a");
+        chain_b = chainOf(*st, "b");
+        st->close(); // everything is before the replay point
+    }
+    accountVLog(dir);
+    // a: flip a byte in the Full base's payload; b: in the middle Delta.
+    flipByte(segPath(dir + "/vlog", chain_a.back().segment_id), chain_a.back().offset + 60);
+    flipByte(segPath(dir + "/vlog", chain_b[1].segment_id), chain_b[1].offset + 40);
+    auto st = IndexedStore::open(dir, storeOpts());
+    for (const char* key : {"a", "b"}) {
+        const std::string k = key;
+        expectThrow<bpt::VLogReadError>([&] { (void)st->get(k); }, "get of a corrupt chain");
+        expectErrorWritesNothing<bpt::VLogReadError>(
+            *st, dir, [&] { st->update(k, {doc::inc("n", 1)}); }, "update of a corrupt chain");
+    }
+    CHECK(st->get("c") == padDoc(26));
+    st->close();
+    pass("P4.G7 corrupt base entry -> get() error, never a wrong document",
+         "corrupt Full base and corrupt middle Delta");
+}
+
+static void testG8MissingSegment(const std::string& dir) {
+    banner("P4.G8 The segment holding a chain's base is missing");
+    IndexedStore::Options o = storeOpts();
+    o.vlog_opts =
+        vlog::VLogWriter::Options(8 * 1024, std::min<uint64_t>(4 << 20, remainingBudget()));
+    auto st = IndexedStore::open(dir, o);
+    st->put("k", padDoc(27));
+    for (int i = 0; i < 3; ++i) st->put("filler" + std::to_string(i), std::string(3000, 'f'));
+    st->update("k", {doc::inc("n", 1)});
+    st->update("k", {doc::inc("n", 1)});
+    std::vector<vlog::VPtr> chain = chainOf(*st, "k");
+    CHECK(chain.size() == 3 && chain.back().segment_id != chain.front().segment_id);
+    accountVLog(dir);
+    CHECK(::unlink(segPath(dir + "/vlog", chain.back().segment_id).c_str()) == 0);
+    expectThrow<bpt::VLogReadError>([&] { (void)st->get("k"); }, "get with a missing base");
+    expectThrow<bpt::VLogReadError>([&] { st->update("k", {doc::inc("n", 1)}); },
+                                    "update with a missing base");
+    st.reset();
+    pass("P4.G8 missing segment holding a chain's base -> get() error");
+}
+
 int main() {
     std::string dir = setupRun("delta_test");
     Cleaner cleaner{dir};
@@ -930,8 +1276,14 @@ int main() {
     testF3UpdateAndErase(dir + "/f3");
     testF4NoPartialDocuments(dir + "/f4");
     testF5CheckpointsDuringUpdates(dir + "/f5");
+    testG1IncStream(dir + "/g1");
+    testG2RandomUpdates(dir + "/g2");
+    testG3AppendedNotApplied(dir + "/g3");
+    testG4CheckpointMidChain(dir + "/g4");
     testG5RecoverTwiceAndRebuild(dir + "/g5");
     testG6BaseMismatch(dir + "/g6");
+    testG7CorruptBase(dir + "/g7");
+    testG8MissingSegment(dir + "/g8");
     printBudget();
     return 0;
 }
