@@ -247,7 +247,10 @@ These are single runs on one machine, not averaged benchmarks.
 
 ## Production Verification & Systems Engineering Interview Guide
 
+> For complete, untruncated terminal logs of all test suites and benchmarks, see [docs/VERIFICATION_LOGS.md](docs/VERIFICATION_LOGS.md).
+
 This guide details the empirical validation methodology and maps every key architectural invariant to its concrete test suite in the codebase. Use this cross-reference during systems engineering reviews and technical interviews.
+
 
 ### 1. Test Suite & Verification Matrix
 
