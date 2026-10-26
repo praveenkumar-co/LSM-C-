@@ -33,12 +33,14 @@ get(key)      --> B+Tree lookup --> vLog read at (segment, offset), CRC checked
                   (a Delta: follow its chain to the Full entry, apply the ops oldest first)
 checkpoint    --> write dirty index pages --> F_FULLFSYNC --> superblock (other slot) --> F_FULLFSYNC
 recovery      --> superblock --> open tree at its root --> replay vLog from its replay point
+gc pass       --> pick a victim segment --> copy its live data forward (stripe locks held)
+                  --> wait 2 checkpoints and for readers --> condemn in the superblock --> unlink
 ```
 
 **Value log** (`include/vlog/`)
 - Segments `vlog_%08u.log`, each starting with a 4 KiB header. Entries are 8-byte aligned and carry
   a CRC32C over everything after the CRC field. Seq and offset are assigned under one lock, so file
-  order is seq order.
+  order is seq order, except for GC copies (`kFlagRelocated`), which keep their original seq.
 - Group commit: one thread writes everything staged so far with one `write()` and one
   `F_FULLFSYNC`, then acks the batch. A failed fsync aborts the process and is never retried.
 - Recovery: a torn tail is truncated only in the last segment. Damage in any other segment, or a
@@ -60,7 +62,9 @@ recovery      --> superblock --> open tree at its root --> replay vLog from its 
 - `superblock.db` has two 4 KiB slots. A write goes to the slot that is not current, then
   `F_FULLFSYNC`; a read takes the valid slot with the highest epoch. Each slot records the root page,
   page count, checkpoint seq, and the vLog replay point, plus the index nonce and vLog identity so a
-  superblock is never used with another store's files.
+  superblock is never used with another store's files. The identity is the replay segment's id and
+  creation time (GC never deletes that segment); stores written before GC, which recorded the
+  lowest segment, still open without a rebuild.
 - A checkpoint holds the sequencer lock and the tree's exclusive lock. It records the last seq
   applied to the index and the vLog position right after that entry (never the writer's tail).
 - Index pages are fsynced **before** the superblock that names them is written. A crash before the
@@ -88,6 +92,28 @@ recovery      --> superblock --> open tree at its root --> replay vLog from its 
   its seq is not the Delta's base seq, open fails with `VLogCorruptError` and changes no file;
   otherwise the key moves to the Delta.
 
+**Garbage collection** (`IndexedStore::runGcPass`, `gc_enabled`; design in `docs/PHASE5_PLAN.md`)
+- Per segment, in memory: total bytes and live bytes (index heads and their Delta chains). A Full
+  write or an erase kills the key's whole previous chain; a Delta kills nothing. Open rebuilds the
+  counters from the index (one small read per key, one per Delta hop).
+- Victims: never the segment being written, nor one holding entries not yet applied to the index.
+  A 0-live segment is deleted without copying only after a scan confirms every entry is dead
+  (this catches counter bugs). Otherwise the lowest live ratio below `gc_threshold` (0.5), oldest
+  first on a tie.
+- Relocation in batches: GC locks the batch's stripes in ascending order and holds them from the
+  re-check through one `appendRelocated` (one fsync) and the index updates. A Full entry is copied
+  byte for byte with its original seq; a chain touching the victim becomes one consolidated Full
+  entry with the head's seq. Holding the stripe across the append is what stops a relocated copy
+  from landing after the key's tombstone.
+- Tombstones of erased keys are copied forward unless the victim is the oldest segment; kept
+  tombstones count as occupied, so GC does not rewrite them in a loop.
+- A segment is deleted only after two checkpoints that both include its relocations, once no
+  reader that pinned before its retirement is still reading (`get()` pins before its index read),
+  and once both superblock slots' replay points are past it. Its id is first written into the
+  superblock's condemned list (at most 32), then unlinked and the directory fsynced; open deletes
+  any listed segment a crash brought back.
+- `appendRelocated` is the only change in `include/vlog/`; the on-disk format is unchanged.
+
 **Recovery**
 1. Check `index.db` header, the superblock, nonce, vLog identity, and every page of the committed
    tree (CRC + structure), before the vLog writer opens.
@@ -97,7 +123,10 @@ recovery      --> superblock --> open tree at its root --> replay vLog from its 
    `should_apply()` (newer seq wins, so replay is idempotent).
 
 If anything in step 1 fails (no superblock, both slots corrupt, a bad tree page, files from another
-store), the index is rebuilt from the whole vLog. If the replay point is missing from the vLog
+store), the index is rebuilt from the whole vLog. The rebuild does not depend on file order: per key
+the highest seq wins (a GC copy beats the entry it copied), a winning tombstone means absent, and
+every winning Delta chain is then walked back to its Full base; a broken chain fails the open with
+`VLogCorruptError` and changes no file. Segment ids may have gaps after GC. If the replay point is missing from the vLog
 (acked entries are gone), open fails with an error and changes nothing.
 
 ## Layout
@@ -107,7 +136,7 @@ include/vlog/    value log: on-disk format, CRC32C, writer, reader
 include/index/   B+Tree: page format, pager, tree, superblock, recovery, Delta codec, IndexedStore
 include/doc/     JSON value/parser/serializer and update ops
 tests/           test binaries (built and run by the Makefile)
-bench/           delta-update benchmark (make bench)
+bench/           delta-update and GC benchmarks (make bench)
 legacy/          earlier MongoLite engine (not built)
 ```
 
@@ -119,18 +148,18 @@ Requires a C++17 compiler. Tested with Apple clang 21 on macOS; GitHub Actions r
 and `make asan` on Ubuntu with g++ and clang++ (`.github/workflows/ci.yml`).
 
 ```
-make test-quick  # optimized, smaller workloads, under 20 MiB written in total
+make test-quick  # optimized, smaller workloads, under 24 MiB written in total
 make test        # optimized, full workloads
 make asan        # AddressSanitizer + UndefinedBehaviorSanitizer
 make tsan        # ThreadSanitizer (fork + kill -9 tests are skipped)
-make bench       # delta-update benchmark; not part of the test modes, writes about 180 MB
+make bench       # delta-update and GC benchmarks; not part of the test modes, about 390 MB written
 make clean
 ```
 
 All builds use `-Wall -Wextra -Werror`. Each test prints one `[PASS] name (summary)` line; run with
 `TEST_VERBOSE=1` to also print the measurements behind each test. Every test binary uses its own
 temp directory, removes it on exit, aborts if free disk space is below 10 GB, and enforces a write
-budget as it writes (512 MiB in total for `test`/`asan`/`tsan`, 20 MiB for `test-quick`).
+budget as it writes (512 MiB in total for `test`/`asan`/`tsan`, 24 MiB for `test-quick`).
 
 | Binary | Covers |
 |---|---|
@@ -142,6 +171,7 @@ budget as it writes (512 MiB in total for `test`/`asan`/`tsan`, 20 MiB for `test
 | `test_checkpoint` | checkpoint contents and triggers, tail-only recovery, fallback rebuilds, page reuse safety, corrupt newest slot, 50 x kill -9 at random points |
 | `test_doc` | JSON parsing and serialization edge cases, paths, `$set`/`$unset`/`$inc` semantics and errors (P4.A-C) |
 | `test_delta` | `update()` errors write nothing, chains and consolidation, mixed put/erase/update, concurrent updates, kill -9 during updates, replay rule, corrupt or missing chain entries (P4.C-G) |
+| `test_gc` | relocated entries in replay and rebuild, segment-id gaps, identity of older stores, counters, segment lifecycle and condemned list, reader pins, victim selection, relocation of Full entries / chains / tombstones, user writes and erases racing GC, kill -9 at 5 GC points, GC thread + 8 threads (P5) |
 
 ## Measured results
 
@@ -214,14 +244,43 @@ Depth d reads d + 1 vLog entries. Depth 0 returns the stored bytes without parsi
 on, get() also parses the base, applies the ops and serializes the result, which is most of the
 jump from depth 0 to 1 for 8 KB documents.
 
+**Garbage collection** (`make bench`, same machine, 2026-10-27): 10,000 keys x 1 KB, 1 MiB
+segments, 10 rounds of 3,000 overwrites, 3,000 one-field updates, 500 erases and 500 re-puts.
+
+| Run | vLog on disk | Space amplification | GC bytes written | Segments unlinked |
+|---|---:|---:|---:|---:|
+| GC off, before collecting | 50.5 MB | 4.51x | - | - |
+| GC off, then collected to idle (54 passes, 1.2 s) | 13.3 MB | 1.26x | 4.8 MB | 51 |
+| GC on (background thread, 32 MB/s limit), at the end | 15.4 MB | 1.43x | 35.4 MB | 80 |
+
+Space amplification = vLog bytes on disk / live bytes. With GC running during the workload it
+wrote 7x more than collecting once at the end, because it copies data that is overwritten again
+later. The verification scans read 0.1 MB and found no counter mismatch. The next open rebuilt the
+counters in 6.0 ms (10,000 head reads, 1,985 chain reads).
+
+Foreground latency, one thread, every operation timed (µs):
+
+| Operation | GC off p50 | GC off p99 | GC on p50 | GC on p99 |
+|---|---:|---:|---:|---:|
+| put | 3,065 | 4,424 | 3,014 | 5,029 |
+| update | 3,868 | 4,688 | 3,085 | 4,666 |
+| get | 39.9 | 241.4 | 26.2 | 161.8 |
+
+put and update are dominated by `F_FULLFSYNC` (about 3 ms here). With GC on, put p99 rose by about
+0.6 ms; the other differences are within the run-to-run noise of a single run.
+
 **Tree shape**: 200,000 sequential 32-byte keys give a height-4 tree of 5,999 pages (24 MB).
 
 These are single runs on one machine, not averaged benchmarks.
 
 ## Known limitations
 
-- **No vLog garbage collection.** The log only grows. The vLog identity check uses the lowest
-  segment, which has to move into the superblock once old segments can be deleted.
+- **GC limits**: one GC thread and one victim per pass; `index.db` never shrinks (freed pages are
+  reused); open reads one small header per key to rebuild the GC counters; tombstones of erased
+  keys are copied forward until their segment is the oldest, and the record of which tombstones
+  GC kept is not persisted (after a restart such a segment may be copied once more); with GC on
+  during heavy overwrites, GC writes several times more than collecting once later.
+- **`scan()` returns vLog pointers** that stay readable only while the caller holds `pin()`.
 - **Write amplification is measured only at the engine level** (bytes the engine writes), only for
   delta vs full updates of one field, and not for the legacy engine or at the device level.
 - **Delta savings are capped by the chain length**: at most 4 Deltas per chain

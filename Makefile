@@ -3,7 +3,7 @@
 #   make asan        AddressSanitizer + UndefinedBehaviorSanitizer
 #   make tsan        ThreadSanitizer (defines TSAN_BUILD)
 #   make test-quick  optimized build with -DTEST_QUICK: smaller workloads, under 24 MiB written
-#   make bench       delta-update benchmark (not part of any test mode; about 180 MB written)
+#   make bench       delta-update and GC benchmarks (not part of any test mode)
 #   make clean
 #
 # Each test binary prints one "[PASS] ..." line per test (TEST_VERBOSE=1 adds measurements) and
@@ -73,8 +73,13 @@ build/bench/bench_delta: bench/bench_delta.cpp $(HEADERS) Makefile
 	@mkdir -p build/bench
 	$(CXX) $(CXXSTD) $(WARN) -O2 $(INCLUDES) $(LDFLAGS) $< -o $@
 
-bench: check-deps build/bench/bench_delta
+build/bench/bench_gc: bench/bench_gc.cpp $(HEADERS) Makefile
+	@mkdir -p build/bench
+	$(CXX) $(CXXSTD) $(WARN) -O2 $(INCLUDES) $(LDFLAGS) $< -o $@
+
+bench: check-deps build/bench/bench_delta build/bench/bench_gc
 	./build/bench/bench_delta
+	./build/bench/bench_gc
 
 clean:
 	rm -rf build
