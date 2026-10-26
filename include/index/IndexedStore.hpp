@@ -40,6 +40,18 @@
 // head is a Delta, so put() and erase() find the chain to kill without reading the vLog. Open
 // rebuilds both from the index (one small read per key, plus one per Delta hop).
 //
+// Segment lifecycle (plan section 4): a segment whose live data is gone (relocated, or dead) is
+// retired: WaitingForCheckpoints with ready_at_epoch = E + 2 (E = committed epoch read under
+// seq_mu_ after its last relocation; checkpoint() holds seq_mu_ for its whole run, so checkpoint
+// E + 1 contains every relocation, and after E + 2 neither superblock slot can name it). It is
+// condemned once that epoch committed, no reader pinned before its retirement is still reading,
+// and both slots' replay points are past it, while the condemned list has room (32). The next
+// checkpoint writes it into the superblock's condemned list; then it is unlinked and the
+// directory fsynced; the checkpoint after that drops it from the list. Open unlinks any segment
+// the current slot lists (or below oldest_live_segment) that a crash brought back.
+// Readers: get() pins (ReaderRegistry) before it reads the index; pin() lets scan() callers
+// keep VPtrs readable.
+//
 // Directory layout: <dir>/vlog/vlog_%08u.log, <dir>/index.db, <dir>/superblock.db.
 
 #include "doc/Json.hpp"
@@ -152,6 +164,10 @@ public:
         uint16_t delta_chain_cap = vlog::kMaxDeltaChain;
         // Largest document put() and update() accept; 0 = the largest payload the vLog accepts.
         uint32_t max_document_bytes = 0;
+        // Test-only hooks.
+        std::function<void(std::string_view key)> on_get_after_index_read;
+        std::function<void(uint32_t segment)> on_gc_before_unlink;
+        std::function<void(uint32_t segment)> on_gc_after_unlink_before_dirsync;
     };
 
     struct EraseResult {
@@ -178,6 +194,13 @@ public:
         //    everything). It truncates a torn tail before the index replays the vLog.
         vlog::VLogWriter::Options wo = opts.vlog_opts;
         plan.applyToWriterOptions(&wo);
+        const bool from_cp = plan.from_checkpoint;
+        const SuperblockRecord cur_slot = plan.bc.sb.current;
+        const bool has_older = from_cp && plan.bc.sb.has_older;
+        const uint32_t older_replay = has_older ? plan.bc.sb.older.sb.replay_segment_id : 0;
+        // Condemned segments a crash brought back (unlinked before the directory fsync, or
+        // condemned but not yet unlinked). Only with a valid superblock.
+        if (from_cp) s->gc_open_removed_ = s->removeCondemnedAtOpen(cur_slot);
         const std::vector<uint32_t> segments_before = listVLogSegments(s->vlog_dir_);
         s->writer_.reset(new vlog::VLogWriter(s->vlog_dir_, wo));
         if (vlog::sync_directory(dir) != 0) fatal("fsync of directory " + dir + " failed");
@@ -203,6 +226,10 @@ public:
         s->vlog_bytes_at_cp_ = 0;
         s->anchor_ = s->open_info_.vid;
         s->rebuildCounters();
+        s->gc_open_.segments_removed = s->gc_open_removed_;
+        s->cp_replay_cur_ = from_cp ? cur_slot.sb.replay_segment_id : s->open_info_.last_segment;
+        s->cp_has_older_ = has_older;
+        s->cp_replay_older_ = older_replay;
         if (opts.auto_checkpoint)
             s->checkpointer_ = std::thread([p = s.get()] { p->checkpointerLoop(); });
         return s;
@@ -260,6 +287,7 @@ public:
         if (ops.size() > UINT16_MAX) throw doc::RangeError("more than 65535 ops in one update");
         (void)doc::validateOps(ops); // path and conflict errors before taking the lock
         std::lock_guard<std::mutex> stripe(stripeFor(key));
+        ReadGuard guard(&readers_);
         std::optional<vlog::IndexValueRef> ref = tree_->get(key);
         if (!ref) throw doc::NotFoundError("update(): key not found");
         Version v = readVersion(key, *ref);
@@ -318,8 +346,10 @@ public:
     std::optional<std::string> get(std::string_view key, uint64_t* seq_out = nullptr,
                                    ReadStats* stats = nullptr) const {
         checkKey(key);
+        ReadGuard guard(&readers_); // before the index read (plan section 4)
         std::optional<vlog::IndexValueRef> ref = tree_->get(key);
         if (!ref) return std::nullopt;
+        if (opts_.on_get_after_index_read) opts_.on_get_after_index_read(key);
         Version v = readVersion(key, *ref);
         if (stats) *stats = ReadStats{v.reads, v.depth};
         if (seq_out) *seq_out = ref->seq;
@@ -327,9 +357,13 @@ public:
         return doc::serialize(materialize(v, key, *ref));
     }
 
+    // The VPtrs returned stay readable only while the caller holds a pin() taken before the scan.
     BPTree::ScanResult scan(std::string_view start, std::string_view end, size_t limit) const {
         return tree_->scan(start, end, limit);
     }
+
+    // Keeps every segment the index references now on disk until the guard is released.
+    ReadGuard pin() const { return ReadGuard(&readers_); }
 
     // Makes the index durable up to the last applied entry. Safe to call while other threads use
     // the store. Timer/bytes triggers skip the write if nothing was applied since the last one.
@@ -371,6 +405,10 @@ public:
             ci.vlog_first_segment = anchor_.first_segment;
             ci.vlog_created_ns = anchor_.created_ns;
             ci.oldest_live_segment = oldestSegment();
+            {
+                std::lock_guard<std::mutex> gl(gc_mu_);
+                ci.condemned = condemned_;
+            }
             std::function<void()> hook;
             if (trigger == CheckpointTrigger::Close && opts_.hooks.on_close_after_flush) {
                 hook = opts_.hooks.on_close_after_flush;
@@ -379,6 +417,17 @@ public:
             }
             Pager::CheckpointStats cs = pager_->checkpoint(*sbm_, ci, hook);
             last_cp_seq_ = last_applied_seq_;
+            {
+                std::lock_guard<std::mutex> gl(gc_mu_);
+                for (uint32_t id : ci.condemned) {
+                    auto it = segs_.find(id);
+                    if (it != segs_.end() && it->second.condemned_epoch == 0)
+                        it->second.condemned_epoch = cs.epoch;
+                }
+                cp_has_older_ = true;
+                cp_replay_older_ = cp_replay_cur_;
+                cp_replay_cur_ = ci.replay_segment;
+            }
             r.epoch = cs.epoch;
             r.pages_written = cs.pages_written;
             r.bytes_written = cs.bytes_written;
@@ -434,6 +483,38 @@ public:
         return g;
     }
     const GcOpenStats& gcOpenStats() const { return gc_open_; }
+
+    // Test-only: retires a Sealed segment that holds nothing live (as GC does after relocating
+    // it). Throws std::logic_error if it is not eligible.
+    void retireSegmentForTest(uint32_t id) {
+        {
+            std::lock_guard<std::mutex> lk(gc_mu_);
+            auto it = segs_.find(id);
+            if (it == segs_.end() || it->second.state != SegmentState::Sealed ||
+                it->second.live_bytes != 0)
+                throw std::logic_error("segment " + std::to_string(id) + " cannot be retired");
+        }
+        if (!sealedAndApplied(id))
+            throw std::logic_error("segment " + std::to_string(id) + " is active or unapplied");
+        retireSegment(id);
+    }
+    // Test-only: one lifecycle step (unlink what a committed superblock condemned, condemn what is
+    // ready).
+    GcReport advanceLifecycleForTest() {
+        GcReport r;
+        advanceLifecycle(&r);
+        return r;
+    }
+    SegStats segStatsForTest(uint32_t id) const {
+        std::lock_guard<std::mutex> lk(gc_mu_);
+        auto it = segs_.find(id);
+        return it == segs_.end() ? SegStats{} : it->second;
+    }
+    std::vector<uint32_t> condemnedForTest() const {
+        std::lock_guard<std::mutex> lk(gc_mu_);
+        return condemned_;
+    }
+    uint64_t activeReadPinsForTest() const { return readers_.activePins(); }
 
     // Test-only: recomputes the counters from the index and the segment files and compares them
     // with the in-memory ones. "" if equal, else the first difference. Callers must have stopped
@@ -495,6 +576,100 @@ private:
         std::vector<DecodedDelta> deltas;  // newest first
         std::vector<vlog::VPtr> chain;     // every entry read, head first (the Full base last)
     };
+
+    // ---- Segment lifecycle (plan section 4) ----
+
+    // True if id is below the writer's segment and below the segment of the last applied entry
+    // (normal entries apply in seq order = file order, so every entry in id is applied).
+    bool sealedAndApplied(uint32_t id) {
+        const uint32_t active = writer_->getCurrentSegmentId();
+        uint32_t applied_seg;
+        {
+            std::lock_guard<std::mutex> lk(seq_mu_);
+            applied_seg = last_applied_segment_;
+        }
+        return id < active && id < applied_seg;
+    }
+
+    // Call after the segment's last relocation is applied (or when it held nothing live).
+    void retireSegment(uint32_t id) {
+        uint64_t e;
+        {
+            std::lock_guard<std::mutex> lk(seq_mu_); // checkpoint() holds it for its whole run
+            e = pager_->committedEpoch();
+        }
+        const uint64_t retire_epoch = readers_.retire();
+        std::lock_guard<std::mutex> lk(gc_mu_);
+        SegStats& st = segs_[id];
+        st.state = SegmentState::WaitingForCheckpoints;
+        st.ready_at_epoch = e + 2;
+        st.retire_epoch = retire_epoch;
+    }
+
+    void advanceLifecycle(GcReport* rep) {
+        const uint64_t committed = pager_->committedEpoch();
+        // 1. Unlink segments a committed superblock lists as condemned.
+        std::vector<uint32_t> to_unlink;
+        {
+            std::lock_guard<std::mutex> lk(gc_mu_);
+            for (const auto& [id, st] : segs_)
+                if (st.state == SegmentState::Condemned && st.condemned_epoch != 0 &&
+                    st.condemned_epoch <= committed)
+                    to_unlink.push_back(id);
+        }
+        for (uint32_t id : to_unlink) {
+            if (opts_.on_gc_before_unlink) opts_.on_gc_before_unlink(id);
+            const std::string path = segmentPath(id);
+            if (::unlink(path.c_str()) != 0 && errno != ENOENT) fatal("unlink failed for " + path);
+            if (opts_.on_gc_after_unlink_before_dirsync) opts_.on_gc_after_unlink_before_dirsync(id);
+            if (vlog::sync_directory(vlog_dir_) != 0)
+                fatal("fsync of directory " + vlog_dir_ + " failed after unlinking " + path);
+            std::lock_guard<std::mutex> lk(gc_mu_);
+            segs_.erase(id); // gone from now on (the oldest-segment rule may move past it)
+            condemned_.erase(std::remove(condemned_.begin(), condemned_.end(), id),
+                             condemned_.end());
+            gc_totals_.segments_unlinked++;
+            rep->unlinked++;
+        }
+        // 2. Condemn retired segments that are ready, while the list has room.
+        std::vector<std::pair<uint32_t, uint64_t>> waiting; // id, retire_epoch
+        {
+            std::lock_guard<std::mutex> lk(gc_mu_);
+            for (const auto& [id, st] : segs_)
+                if (st.state == SegmentState::WaitingForCheckpoints &&
+                    committed >= st.ready_at_epoch && cp_replay_cur_ > id &&
+                    (!cp_has_older_ || cp_replay_older_ > id))
+                    waiting.emplace_back(id, st.retire_epoch);
+        }
+        for (const auto& [id, retire_epoch] : waiting) {
+            if (readers_.pinnedBefore(retire_epoch)) continue; // a reader may hold a VPtr into it
+            std::lock_guard<std::mutex> lk(gc_mu_);
+            if (condemned_.size() >= kMaxCondemned) break;
+            SegStats& st = segs_[id];
+            st.state = SegmentState::Condemned;
+            st.condemned_epoch = 0; // set by the checkpoint that writes the list
+            condemned_.push_back(id);
+            rep->condemned++;
+        }
+    }
+
+    // Open (valid superblock only): unlinks segments the current slot lists as condemned, or below
+    // its oldest_live_segment, that exist again. Never the replay or anchor segment or above.
+    uint32_t removeCondemnedAtOpen(const SuperblockRecord& cur) {
+        uint32_t removed = 0;
+        for (uint32_t id : listVLogSegments(vlog_dir_)) {
+            bool listed = false;
+            for (uint32_t i = 0; i < cur.gc.count; ++i) listed = listed || cur.gc.ids[i] == id;
+            if (!listed && id >= cur.sb.oldest_live_segment) continue;
+            if (id >= cur.sb.replay_segment_id || id == cur.ext.vlog_first_segment) continue;
+            const std::string path = segmentPath(id);
+            if (::unlink(path.c_str()) != 0) fatal("unlink failed for " + path);
+            removed++;
+        }
+        if (removed && vlog::sync_directory(vlog_dir_) != 0)
+            fatal("fsync of directory " + vlog_dir_ + " failed");
+        return removed;
+    }
 
     // Lowest segment id present (segments leave segs_ only after their unlink is durable).
     uint32_t oldestSegment() const {
@@ -879,6 +1054,14 @@ private:
     std::unordered_map<std::string, std::vector<vlog::VPtr>> chains_; // keys with a Delta head
     GcStats gc_totals_;                                               // scalar totals only
     GcOpenStats gc_open_;
+    uint32_t gc_open_removed_ = 0;
+    std::vector<uint32_t> condemned_; // written into the next superblock (<= kMaxCondemned)
+    // replay_segment_id of the current and the older superblock slot (no older slot after a
+    // rebuild until the next checkpoint).
+    uint32_t cp_replay_cur_ = 0;
+    uint32_t cp_replay_older_ = 0;
+    bool cp_has_older_ = false;
+    mutable ReaderRegistry readers_;
 
     std::mutex cp_run_mu_;     // serializes checkpoint()
     mutable std::mutex cp_mu_; // guards the fields below

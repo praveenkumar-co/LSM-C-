@@ -7,9 +7,11 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace bpt {
@@ -73,6 +75,7 @@ struct GcOpenStats {
     uint64_t head_reads = 0;  // small preads of an index head (header + key + DeltaPrefix)
     uint64_t chain_reads = 0; // small preads of Delta bases
     double ms = 0;
+    uint32_t segments_removed = 0; // condemned segments found again and unlinked by open
 };
 
 // What one GC pass did.
@@ -92,6 +95,101 @@ struct GcReport {
     uint32_t condemned = 0; // segments added to the condemned list by this pass
     uint32_t unlinked = 0;  // segments unlinked by this pass
     double ms = 0;
+};
+
+// Keeps segments on disk while a reader may still use them (plan section 4). Built from
+// mutexes (no lock-free code): 64 shards, each a mutex and a count of readers per epoch.
+//   pin():    a reader records the current epoch BEFORE it reads the index.
+//   retire(): GC, after the last relocation of a segment is applied, moves the epoch on and
+//             keeps the new value; a reader that pins from then on sees only the new index.
+//   pinnedBefore(e): some reader that pinned before retire() returned e is still reading, so it
+//             may hold a VPtr into the retired segment; the segment must stay.
+// epoch_ changes only with every shard lock held, so reading it under one shard lock is safe.
+class ReaderRegistry {
+public:
+    static constexpr size_t kShards = 64;
+    struct Pin {
+        size_t shard = 0;
+        uint64_t epoch = 0;
+    };
+
+    Pin pin() {
+        const size_t sh = std::hash<std::thread::id>{}(std::this_thread::get_id()) % kShards;
+        std::lock_guard<std::mutex> lk(shards_[sh].mu);
+        const uint64_t e = epoch_;
+        shards_[sh].pins[e]++;
+        return Pin{sh, e};
+    }
+
+    void unpin(const Pin& p) {
+        std::lock_guard<std::mutex> lk(shards_[p.shard].mu);
+        auto it = shards_[p.shard].pins.find(p.epoch);
+        if (it == shards_[p.shard].pins.end()) {
+            errno = 0;
+            fatal("ReaderRegistry: unpin without a pin");
+        }
+        if (--it->second == 0) shards_[p.shard].pins.erase(it);
+    }
+
+    uint64_t retire() {
+        std::array<std::unique_lock<std::mutex>, kShards> locks;
+        for (size_t i = 0; i < kShards; ++i)
+            locks[i] = std::unique_lock<std::mutex>(shards_[i].mu); // ascending shard order
+        return ++epoch_;
+    }
+
+    bool pinnedBefore(uint64_t e) const {
+        for (const Shard& s : shards_) {
+            std::lock_guard<std::mutex> lk(s.mu);
+            if (!s.pins.empty() && s.pins.begin()->first < e) return true;
+        }
+        return false;
+    }
+
+    uint64_t activePins() const {
+        uint64_t n = 0;
+        for (const Shard& s : shards_) {
+            std::lock_guard<std::mutex> lk(s.mu);
+            for (const auto& kv : s.pins) n += kv.second;
+        }
+        return n;
+    }
+
+private:
+    struct Shard {
+        mutable std::mutex mu;
+        std::map<uint64_t, uint32_t> pins; // epoch -> readers
+    };
+    std::array<Shard, kShards> shards_;
+    uint64_t epoch_ = 1;
+};
+
+// RAII pin (IndexedStore::pin()). VPtrs read from the index while it is held stay readable.
+class ReadGuard {
+public:
+    ReadGuard() = default;
+    explicit ReadGuard(ReaderRegistry* r) : r_(r), p_(r->pin()) {}
+    ReadGuard(ReadGuard&& o) noexcept : r_(o.r_), p_(o.p_) { o.r_ = nullptr; }
+    ReadGuard& operator=(ReadGuard&& o) noexcept {
+        if (this != &o) {
+            release();
+            r_ = o.r_;
+            p_ = o.p_;
+            o.r_ = nullptr;
+        }
+        return *this;
+    }
+    ReadGuard(const ReadGuard&) = delete;
+    ReadGuard& operator=(const ReadGuard&) = delete;
+    ~ReadGuard() { release(); }
+    void release() {
+        if (r_) r_->unpin(p_);
+        r_ = nullptr;
+    }
+
+private:
+    ReaderRegistry* r_ = nullptr;
+    ReaderRegistry::Pin p_;
 };
 
 } // namespace bpt

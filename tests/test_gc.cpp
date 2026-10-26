@@ -1,5 +1,6 @@
 // Phase 5 tests: vLog garbage collection (docs/PHASE5_PLAN.md). Relocated entries in replay and
-// rebuild, segment-id gaps and the vLog identity anchor (P5.R, P5.G), counters (P5.A).
+// rebuild, segment-id gaps and the vLog identity anchor (P5.R, P5.G), counters (P5.A), segment
+// lifecycle, condemned list and reader pins (P5.L, P5.F).
 #include "test_common.hpp"
 
 #include "doc/Json.hpp"
@@ -15,6 +16,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <condition_variable>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -22,6 +25,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace testutil;
@@ -722,6 +726,285 @@ static void testA4ConsolidationAcrossSegments(const std::string& dir) {
          "== open-time rebuild after every step");
 }
 
+// ------------------------------------------------------------------------------------------
+// P5.L Segment lifecycle, condemned list, readers (step 3: segments made dead by overwrites;
+// GC relocation comes in step 4)
+// ------------------------------------------------------------------------------------------
+static bool segExists(const std::string& dir, uint32_t id) {
+    struct stat st;
+    return ::stat(segPath(dir + "/vlog", id).c_str(), &st) == 0;
+}
+
+// x in segment X, y next, x again: X holds only a dead version. Returns X.
+static uint32_t makeDeadSegment(IndexedStore& st, int tag) {
+    const std::string x = "x" + std::to_string(tag);
+    st.put(x, bigDoc(tag));
+    const uint32_t seg = st.tree().get(x)->vptr.segment_id;
+    st.put("y" + std::to_string(tag), bigDoc(tag + 1));
+    st.put(x, bigDoc(tag + 2));
+    CHECK(st.tree().get(x)->vptr.segment_id != seg);
+    return seg;
+}
+
+static void testL1Lifecycle(const std::string& dir) {
+    banner("P5.L1 retire -> E+2 -> condemned list -> unlink -> list cleared");
+    auto st = IndexedStore::open(dir, storeOpts());
+    const uint32_t x = makeDeadSegment(*st, 1);
+    CHECK(x == 1);
+    st->checkpoint();
+    const uint64_t e = st->pager().committedEpoch();
+    st->retireSegmentForTest(x);
+    CHECK(st->segStatsForTest(x).state == bpt::SegmentState::WaitingForCheckpoints);
+    CHECK(st->segStatsForTest(x).ready_at_epoch == e + 2);
+    CHECK(st->advanceLifecycleForTest().condemned == 0);
+    st->checkpoint(); // E + 1: slot E (which may name segment 1) is still the fallback
+    CHECK(st->advanceLifecycleForTest().condemned == 0);
+    st->checkpoint(); // E + 2
+    bpt::GcReport r = st->advanceLifecycleForTest();
+    CHECK(r.condemned == 1 && r.unlinked == 0);
+    CHECK(st->segStatsForTest(x).state == bpt::SegmentState::Condemned);
+    CHECK((st->condemnedForTest() == std::vector<uint32_t>{x}) && segExists(dir, x));
+    CHECK(st->advanceLifecycleForTest().unlinked == 0); // not in a committed superblock yet
+    st->checkpoint();
+    bpt::SuperblockRecord slot = currentSlot(dir);
+    CHECK(slot.gc.count == 1 && slot.gc.ids[0] == x);
+    countUnlinked(dir + "/vlog", x);
+    CHECK(st->advanceLifecycleForTest().unlinked == 1);
+    CHECK(!segExists(dir, x) && st->condemnedForTest().empty());
+    st->checkpoint();
+    slot = currentSlot(dir);
+    CHECK(slot.gc.count == 0 && slot.sb.oldest_live_segment == 2);
+    CHECK(st->gcStats().segments_unlinked == 1);
+    checkStoreEqualsOracle(*st, "P5.L1 live");
+    st->close();
+    st = IndexedStore::open(dir, storeOpts());
+    CHECK(!st->openInfo().rebuilt && st->gcOpenStats().segments_removed == 0);
+    checkStoreEqualsOracle(*st, "P5.L1 reopen");
+    st->close();
+    removeSuperblock(dir);
+    st = IndexedStore::open(dir, storeOpts());
+    CHECK(st->openInfo().rebuilt);
+    checkStoreEqualsOracle(*st, "P5.L1 rebuild");
+    st->close();
+    accountVLog(dir);
+    pass("P5.L1 lifecycle: condemned only at epoch E+2, unlinked only after a superblock lists "
+         "it, list cleared by the next checkpoint; reopen and rebuild match");
+}
+
+// The reader pins before its index read; a segment retired while it reads stays on disk.
+static void testF1PinBeforeIndexRead(const std::string& dir) {
+    banner("P5.F1a get() pinned before its index read keeps a retired segment");
+    std::mutex mu;
+    std::condition_variable cv;
+    bool reached = false, release = false, armed = true;
+    IndexedStore::Options o = storeOpts();
+    o.on_get_after_index_read = [&](std::string_view key) {
+        if (key != "x1") return;
+        std::unique_lock<std::mutex> lk(mu);
+        if (!armed) return;
+        armed = false;
+        reached = true;
+        cv.notify_all();
+        cv.wait(lk, [&] { return release; });
+    };
+    auto st = IndexedStore::open(dir, o);
+    st->put("x1", bigDoc(1));
+    const uint32_t x = st->tree().get("x1")->vptr.segment_id;
+    st->put("y1", bigDoc(2));
+    std::optional<std::string> got;
+    std::thread reader([&] { got = st->get("x1"); });
+    {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&] { return reached; });
+    }
+    // The reader holds a VPtr into segment x. Overwrite x1 so x is dead, retire x, and let more
+    // than two checkpoints pass.
+    st->put("x1", bigDoc(3));
+    st->put("y2", bigDoc(4));
+    st->retireSegmentForTest(x);
+    for (int i = 0; i < 3; ++i) {
+        st->checkpoint();
+        CHECK(st->advanceLifecycleForTest().condemned == 0);
+    }
+    CHECK(st->segStatsForTest(x).state == bpt::SegmentState::WaitingForCheckpoints);
+    CHECK(segExists(dir, x));
+    // A get() that pins after the retirement does not hold the segment.
+    CHECK(st->get("x1") == bigDoc(3));
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        release = true;
+    }
+    cv.notify_all();
+    reader.join();
+    CHECK(got == bigDoc(1)); // the version it found in the index, read from segment x
+    CHECK(st->activeReadPinsForTest() == 0);
+    CHECK(st->advanceLifecycleForTest().condemned == 1);
+    st->checkpoint();
+    countUnlinked(dir + "/vlog", x);
+    CHECK(st->advanceLifecycleForTest().unlinked == 1);
+    checkStoreEqualsOracle(*st, "P5.F1a");
+    st->close();
+    accountVLog(dir);
+    pass("P5.F1a reader pinned before its index read: retired segment kept through 3 "
+         "checkpoints, reader gets its document, segment unlinked after it unpins");
+}
+
+static void testF2ScanPin(const std::string& dir) {
+    banner("P5.F2 scan() + pin() keeps VPtrs readable");
+    auto st = IndexedStore::open(dir, storeOpts());
+    st->put("a", bigDoc(1));
+    st->put("b", bigDoc(2));
+    bpt::ReadGuard guard = st->pin();
+    bpt::BPTree::ScanResult refs = st->scan("a", "c", 10);
+    CHECK(refs.size() == 2);
+    const uint32_t x = refs[0].second.vptr.segment_id;
+    st->put("a", bigDoc(3));
+    st->put("c", bigDoc(4));
+    st->retireSegmentForTest(x);
+    for (int i = 0; i < 3; ++i) {
+        st->checkpoint();
+        CHECK(st->advanceLifecycleForTest().condemned == 0);
+    }
+    std::vector<uint8_t> pl;
+    rawEntry(dir + "/vlog", refs[0].second.vptr, &pl);
+    CHECK(std::string(pl.begin(), pl.end()) == bigDoc(1));
+    guard.release();
+    CHECK(st->advanceLifecycleForTest().condemned == 1);
+    st->checkpoint();
+    countUnlinked(dir + "/vlog", x);
+    CHECK(st->advanceLifecycleForTest().unlinked == 1 && !segExists(dir, x));
+    checkStoreEqualsOracle(*st, "P5.F2");
+    st->close();
+    accountVLog(dir);
+    pass("P5.F2 scan() + pin(): VPtrs stay readable across 3 checkpoints; unlinked after release");
+}
+
+// Runs the lifecycle until segment x is unlinked (it must be dead and retired-eligible).
+static void reclaim(IndexedStore& st, const std::string& dir, uint32_t x) {
+    st.retireSegmentForTest(x);
+    for (int i = 0; i < 6 && segExists(dir, x); ++i) {
+        st.checkpoint();
+        if (st.segStatsForTest(x).state == bpt::SegmentState::Condemned &&
+            st.segStatsForTest(x).condemned_epoch != 0)
+            countUnlinked(dir + "/vlog", x);
+        st.advanceLifecycleForTest();
+    }
+    CHECK(!segExists(dir, x));
+}
+
+static void flipSlotByte(const std::string& dir, int slot, size_t off) {
+    const std::string path = dir + "/superblock.db";
+    int fd = ::open(path.c_str(), O_RDWR);
+    CHECK(fd >= 0);
+    uint8_t b;
+    CHECK(::pread(fd, &b, 1, slot * bpt::kSuperSlotSize + off) == 1);
+    b ^= 0x40;
+    CHECK(::pwrite(fd, &b, 1, slot * bpt::kSuperSlotSize + off) == 1);
+    CHECK(::fsync(fd) == 0 && ::close(fd) == 0);
+    accountBytes(1, "superblock byte flip");
+}
+
+static void testG2NewestSlotCorrupt(const std::string& dir) {
+    banner("P5.G2 newest superblock slot corrupt after reclamation");
+    auto st = IndexedStore::open(dir, storeOpts());
+    const uint32_t x = makeDeadSegment(*st, 1);
+    st->put("z", bigDoc(9));
+    reclaim(*st, dir, x);
+    st->put("w", bigDoc(10));
+    st->close();
+    bpt::SuperblockManager m(dir + "/superblock.db");
+    bpt::SuperblockManager::LoadResult lr = m.load();
+    CHECK(lr.status == bpt::SuperblockManager::LoadResult::Status::Ok && lr.has_older);
+    flipSlotByte(dir, lr.current_slot, 20);
+    st = IndexedStore::open(dir, storeOpts());
+    CHECK(!st->openInfo().rebuilt && st->openInfo().initial_status == bpt::OpenStatus::Ok);
+    CHECK(st->openInfo().checkpoint_seq == lr.older.sb.checkpoint_seq);
+    for (const auto& [k, ref] : st->tree().scanFrom("", SIZE_MAX)) CHECK(segExists(dir, ref.vptr.segment_id));
+    CHECK(st->get("w") == bigDoc(10) && st->get("z") == bigDoc(9) && st->get("x1") == bigDoc(3));
+    checkStoreEqualsOracle(*st, "P5.G2");
+    st->close();
+    accountVLog(dir);
+    pass("P5.G2 newest slot corrupt after reclamation: the older slot opens (no rebuild), every "
+         "segment its tree references exists, data matches the oracle");
+}
+
+static void testL2CleanupAtOpen(const std::string& dir) {
+    banner("P5.L2 a condemned segment still present at open is unlinked");
+    auto st = IndexedStore::open(dir, storeOpts());
+    const uint32_t x = makeDeadSegment(*st, 1);
+    const uint32_t keep = makeDeadSegment(*st, 5); // dead too, but never condemned
+    st->retireSegmentForTest(x);
+    st->checkpoint();
+    st->checkpoint();
+    CHECK(st->advanceLifecycleForTest().condemned == 1);
+    st->checkpoint(); // the list now names x; "crash" before the unlink
+    CHECK(currentSlot(dir).gc.count == 1);
+    st.reset(); // no close(): no further checkpoint
+    countUnlinked(dir + "/vlog", x);
+    st = IndexedStore::open(dir, storeOpts());
+    CHECK(!st->openInfo().rebuilt && st->gcOpenStats().segments_removed == 1);
+    CHECK(!segExists(dir, x) && segExists(dir, keep));
+    checkStoreEqualsOracle(*st, "P5.L2");
+    st->close();
+    accountVLog(dir);
+    pass("P5.L2 crash after the condemning checkpoint: open unlinks only the listed segment");
+}
+
+static void testL3CondemnedListLimit(const std::string& dir) {
+    banner("P5.L3 condemned list: format and the 32-id limit");
+    // Format: 32 ids round-trip; an empty list leaves bytes 96..4095 zero; damage is rejected.
+    {
+        std::vector<uint8_t> slot(bpt::kSuperSlotSize);
+        bpt::SuperblockRecord r;
+        r.sb.epoch = 3;
+        r.sb.index_page_count = 4;
+        r.sb.index_root_page = 1;
+        r.sb.replay_segment_id = 1;
+        r.sb.replay_offset = vlog::kBlockSize;
+        r.gc.count = bpt::kMaxCondemned;
+        for (uint32_t i = 0; i < bpt::kMaxCondemned; ++i) r.gc.ids[i] = 100 + i;
+        bpt::encodeSlot(r, slot.data());
+        bpt::SuperblockRecord got;
+        CHECK(bpt::decodeSlot(slot.data(), slot.size(), &got) == bpt::SlotState::Valid);
+        CHECK(got.gc.count == 32 && got.gc.ids[31] == 131);
+        slot[bpt::kSuperGcOffset + 20] ^= 1;
+        CHECK(bpt::decodeSlot(slot.data(), slot.size(), nullptr) == bpt::SlotState::BadCrc);
+        r.gc.count = 0;
+        bpt::encodeSlot(r, slot.data());
+        CHECK(std::all_of(slot.begin() + 96, slot.end(), [](uint8_t b) { return b == 0; }));
+    }
+    auto st = IndexedStore::open(dir, storeOpts());
+    std::vector<uint32_t> dead;
+    for (int i = 0; i < 35; ++i) {
+        st->put("x", bigDoc(i));
+        dead.push_back(st->tree().get("x")->vptr.segment_id);
+    }
+    dead.pop_back(); // the live version
+    st->put("y", bigDoc(99));
+    CHECK(dead.size() == 34);
+    for (uint32_t id : dead) st->retireSegmentForTest(id);
+    st->checkpoint();
+    st->checkpoint();
+    bpt::GcReport r = st->advanceLifecycleForTest();
+    CHECK(r.condemned == 32 && st->condemnedForTest().size() == 32);
+    CHECK(st->advanceLifecycleForTest().condemned == 0); // full: nothing more
+    st->checkpoint();
+    CHECK(currentSlot(dir).gc.count == 32);
+    for (size_t i = 0; i < 32; ++i) countUnlinked(dir + "/vlog", dead[i]);
+    r = st->advanceLifecycleForTest();
+    CHECK(r.unlinked == 32 && r.condemned == 2); // room again
+    st->checkpoint();
+    CHECK(currentSlot(dir).gc.count == 2);
+    for (size_t i = 32; i < 34; ++i) countUnlinked(dir + "/vlog", dead[i]);
+    CHECK(st->advanceLifecycleForTest().unlinked == 2);
+    for (uint32_t id : dead) CHECK(!segExists(dir, id));
+    checkStoreEqualsOracle(*st, "P5.L3");
+    st->close();
+    accountVLog(dir);
+    pass("P5.L3 condemned list: 32 ids round-trip, damage rejected; with 34 ready segments GC "
+         "condemns 32, waits for room, then the last 2");
+}
+
 int main() {
     std::string dir = setupRun("gc_test");
     Cleaner cleaner{dir};
@@ -735,6 +1018,12 @@ int main() {
     testA2Erase(dir + "/a2");
     testA3DeltaKillsNothing(dir + "/a3");
     testA4ConsolidationAcrossSegments(dir + "/a4");
+    testL1Lifecycle(dir + "/l1");
+    testF1PinBeforeIndexRead(dir + "/f1a");
+    testF2ScanPin(dir + "/f2");
+    testG2NewestSlotCorrupt(dir + "/g2");
+    testL2CleanupAtOpen(dir + "/l2");
+    testL3CondemnedListLimit(dir + "/l3");
     printBudget();
     return 0;
 }

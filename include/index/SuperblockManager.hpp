@@ -5,7 +5,10 @@
 //   [0, 64)   vlog::Superblock (VLogFormat.hpp, unchanged); its CRC32C covers bytes [0, 60)
 //   [64, 96)  SuperblockExt: binds the slot to one index.db (nonce) and one vLog (identity);
 //             its own CRC32C covers its first 28 bytes
-//   [96, 4096) zero
+//   [96, 240) SuperblockGcExt, only when GC has condemned segments (else zero, so a slot with no
+//             condemned segments is byte-identical to one written before Phase 5): ids of
+//             segments GC decided to unlink (at most kMaxCondemned); its own CRC32C
+//   [240, 4096) zero
 //
 // Read:  decode both slots; the valid slot with the highest epoch is current. The other slot,
 //        if valid and older, is the previous checkpoint (kept so its pages are never reused
@@ -37,6 +40,8 @@ namespace bpt {
 constexpr uint32_t kSuperblockFormatVersion = 1;
 constexpr uint32_t kSuperSlotSize = 4096;
 constexpr uint64_t kSuperExtMagic = 0x3154584542505553ULL; // "SUPBEXT1" (LE bytes)
+constexpr uint64_t kSuperGcMagic = 0x3130434742505553ULL;  // "SUPBGC01" (LE bytes)
+constexpr uint32_t kMaxCondemned = 32; // GC condemns no more segments while the list is full
 
 #pragma pack(push, 1)
 struct SuperblockExt {           // at offset 64 of each slot
@@ -48,13 +53,27 @@ struct SuperblockExt {           // at offset 64 of each slot
 };
 #pragma pack(pop)
 
+#pragma pack(push, 1)
+struct SuperblockGcExt {         // at offset 96 of a slot; all zero when count == 0
+    uint64_t magic;              // kSuperGcMagic
+    uint32_t count;              // 1..kMaxCondemned
+    uint32_t ids[kMaxCondemned]; // condemned segment ids; unused entries are 0
+    uint32_t crc32c;             // over the 140 bytes above
+};
+#pragma pack(pop)
+
+static_assert(sizeof(SuperblockGcExt) == 144);
+static_assert(offsetof(SuperblockGcExt, crc32c) == 140);
 static_assert(sizeof(SuperblockExt) == 32);
 static_assert(offsetof(SuperblockExt, crc32c) == 28);
-static_assert(sizeof(vlog::Superblock) + sizeof(SuperblockExt) <= kSuperSlotSize);
+static_assert(sizeof(vlog::Superblock) + sizeof(SuperblockExt) + sizeof(SuperblockGcExt) <=
+              kSuperSlotSize);
+constexpr size_t kSuperGcOffset = sizeof(vlog::Superblock) + sizeof(SuperblockExt); // 96
 
 struct SuperblockRecord {
     vlog::Superblock sb{};
     SuperblockExt ext{};
+    SuperblockGcExt gc{}; // count == 0: no condemned segments (the block is not written)
 };
 
 enum class SlotState { Valid, Short, BadCrc, BadFields };
@@ -84,6 +103,16 @@ inline void encodeSlot(SuperblockRecord rec, uint8_t* slot) {
     std::memset(slot, 0, kSuperSlotSize);
     std::memcpy(slot, &rec.sb, sizeof(rec.sb));
     std::memcpy(slot + sizeof(rec.sb), &rec.ext, sizeof(rec.ext));
+    if (rec.gc.count > 0) {
+        if (rec.gc.count > kMaxCondemned) {
+            errno = 0;
+            fatal("superblock condemned list longer than " + std::to_string(kMaxCondemned));
+        }
+        for (uint32_t i = rec.gc.count; i < kMaxCondemned; ++i) rec.gc.ids[i] = 0;
+        rec.gc.magic = kSuperGcMagic;
+        rec.gc.crc32c = vlog::crc32c(&rec.gc, offsetof(SuperblockGcExt, crc32c));
+        std::memcpy(slot + kSuperGcOffset, &rec.gc, sizeof(rec.gc));
+    }
 }
 
 // Checks CRCs and field bounds. n is the number of bytes available for this slot.
@@ -109,6 +138,24 @@ inline SlotState decodeSlot(const uint8_t* slot, size_t n, SuperblockRecord* out
         return SlotState::BadFields;
     if (r.sb.replay_offset < vlog::kBlockSize || r.sb.replay_offset % vlog::kEntryAlign != 0)
         return SlotState::BadFields;
+    // Condemned list: all zero (none), or a block with its magic, CRC and 1..32 non-zero ids.
+    // Bytes past n count as zero; a partly present non-zero block is Short.
+    uint8_t gcb[sizeof(SuperblockGcExt)] = {0};
+    const size_t have = n > kSuperGcOffset ? std::min(n - kSuperGcOffset, sizeof(gcb)) : 0;
+    std::memcpy(gcb, slot + kSuperGcOffset, have);
+    const bool any = std::any_of(gcb, gcb + sizeof(gcb), [](uint8_t b) { return b != 0; });
+    if (any) {
+        if (have < sizeof(gcb)) return SlotState::Short;
+        std::memcpy(&r.gc, gcb, sizeof(r.gc));
+        if (r.gc.crc32c != vlog::crc32c(&r.gc, offsetof(SuperblockGcExt, crc32c)))
+            return SlotState::BadCrc;
+        if (r.gc.magic != kSuperGcMagic || r.gc.count == 0 || r.gc.count > kMaxCondemned)
+            return SlotState::BadFields;
+        for (uint32_t i = 0; i < kMaxCondemned; ++i)
+            if ((i < r.gc.count) != (r.gc.ids[i] != 0)) return SlotState::BadFields;
+    } else {
+        r.gc = SuperblockGcExt{};
+    }
     if (out) *out = r;
     return SlotState::Valid;
 }

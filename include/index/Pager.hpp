@@ -168,6 +168,7 @@ public:
         uint32_t vlog_first_segment = 0; // vLog identity: anchor segment (IndexRecovery.hpp)
         uint64_t vlog_created_ns = 0;
         uint32_t oldest_live_segment = 0; // lowest segment id present (0: use vlog_first_segment)
+        std::vector<uint32_t> condemned;  // segments GC decided to unlink (<= kMaxCondemned)
     };
 
     struct CheckpointStats {
@@ -406,6 +407,13 @@ public:
         rec.ext.index_nonce = nonce_;
         rec.ext.vlog_first_segment = ci.vlog_first_segment;
         rec.ext.vlog_created_ns = ci.vlog_created_ns;
+        if (ci.condemned.size() > kMaxCondemned) {
+            errno = 0;
+            fatal("checkpoint with more than " + std::to_string(kMaxCondemned) +
+                  " condemned segments");
+        }
+        rec.gc.count = static_cast<uint32_t>(ci.condemned.size());
+        for (size_t i = 0; i < ci.condemned.size(); ++i) rec.gc.ids[i] = ci.condemned[i];
         sbm.commit(rec);
         epoch_++;
         // Everything allocated so far is now part of a committed tree.
