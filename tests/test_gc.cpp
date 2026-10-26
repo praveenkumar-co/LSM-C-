@@ -1,7 +1,7 @@
 // Phase 5 tests: vLog garbage collection (docs/PHASE5_PLAN.md). Relocated entries in replay and
 // rebuild, segment-id gaps and the vLog identity anchor (P5.R, P5.G), counters (P5.A), segment
 // lifecycle, condemned list and reader pins (P5.L, P5.F), GC passes (P5.B, C, D, G3), races
-// (P5.E) and kill -9 at GC points (P5.H).
+// (P5.E), kill -9 at GC points (P5.H) and the background GC thread (P5.I).
 #include "test_common.hpp"
 
 #include "doc/Json.hpp"
@@ -1787,6 +1787,125 @@ static void testH(const std::string& base_dir) {
 #endif
 }
 
+// ------------------------------------------------------------------------------------------
+// P5.I Background GC thread + 8 foreground threads
+// ------------------------------------------------------------------------------------------
+static void testI1BackgroundGcThreads(const std::string& dir) {
+    banner("P5.I1 background GC thread + 8 foreground threads");
+    IndexedStore::Options o = gcOpts();
+    o.gc_enabled = true;
+    o.gc_interval_ms = 1;
+    o.gc_batch_bytes = 8 * 1024;
+    auto st = IndexedStore::open(dir, o);
+    const int kThreads = 8, kOwn = 12, kShared = 8;
+    const int kOps = kQuick ? 60 : 400;
+    // Each thread owns keys (their final state is checked exactly) and also hits shared keys
+    // (checked against the oracle).
+    std::vector<std::map<std::string, std::optional<std::string>>> expect(kThreads);
+    std::atomic<uint64_t> gets{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            std::mt19937 rng(1000 + t);
+            auto& mine = expect[t];
+            for (int i = 0; i < kOps; ++i) {
+                const bool shared = rng() % 4 == 0;
+                const std::string k = shared ? "s" + std::to_string(rng() % kShared)
+                                             : "t" + std::to_string(t) + "_" +
+                                                   std::to_string(rng() % kOwn);
+                const int op = static_cast<int>(rng() % 10);
+                if (op < 4) {
+                    const std::string d = padDoc(10 + static_cast<int>(rng() % 80), 200 + rng() % 700);
+                    st->put(k, d);
+                    if (!shared) mine[k] = d;
+                } else if (op < 6) {
+                    try {
+                        bpt::UpdateResult u = st->update(k, {doc::inc("n", 1)});
+                        if (!shared && u.written) mine[k] = applyToCopy(*mine[k], {doc::inc("n", 1)});
+                    } catch (const doc::NotFoundError&) {
+                        if (!shared) CHECK(!mine.count(k) || !mine[k]);
+                    }
+                } else if (op < 7) {
+                    st->erase(k);
+                    if (!shared) mine[k] = std::nullopt;
+                } else {
+                    std::optional<std::string> got = st->get(k); // must never fail mid-GC
+                    if (!shared && mine.count(k)) CHECK(got == mine[k]);
+                    if (got) CHECK(doc::parse(*got).isObject());
+                    gets++;
+                }
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    st->stopGc();
+    const bpt::GcStats g = st->gcStats();
+    for (int t = 0; t < kThreads; ++t)
+        for (const auto& [k, d] : expect[t]) CHECK(st->get(k) == d);
+    checkStoreEqualsOracle(*st, "P5.I1");
+    expectCountersExact(*st, "P5.I1");
+    gcUntilIdle(*st);
+    std::map<std::string, std::string> docs;
+    std::vector<std::string> absent;
+    for (int t = 0; t < kThreads; ++t)
+        for (const auto& [k, d] : expect[t]) {
+            if (d) docs[k] = *d; else absent.push_back(k);
+        }
+    for (int j = 0; j < kShared; ++j)
+        if (auto d = st->get("s" + std::to_string(j))) docs["s" + std::to_string(j)] = *d;
+    closeCounted(st);
+    rebuildMatches(dir, docs, absent, "P5.I1 rebuild");
+    pass("P5.I1 GC thread + 8 threads (put/update/erase/get): owned keys exact, oracle and "
+             "counters match, no get() failed",
+         std::to_string(kThreads * kOps) + " ops, " + std::to_string(gets.load()) + " gets, " +
+             std::to_string(g.passes) + " GC passes, " + std::to_string(g.segments_unlinked) +
+             " segments unlinked");
+}
+
+static void testI2OptionsAndRateLimit(const std::string& dir) {
+    banner("P5.I2 GC options are validated; the rate limit paces relocation");
+    auto bad = [&](auto set) {
+        IndexedStore::Options o = gcOpts();
+        set(o);
+        expectThrow<std::invalid_argument>([&] { (void)IndexedStore::open(dir + "_bad", o); },
+                                           "bad GC option");
+    };
+    bad([](IndexedStore::Options& o) { o.gc_threshold = 0; });
+    bad([](IndexedStore::Options& o) { o.gc_threshold = 1; });
+    bad([](IndexedStore::Options& o) { o.gc_batch_bytes = 0; });
+    bad([](IndexedStore::Options& o) {
+        o.gc_enabled = true;
+        o.gc_interval_ms = 0;
+    });
+    CHECK(!std::filesystem::exists(dir + "_bad")); // rejected before anything is created
+    // 1 MB/s: relocating 3 x 1016 bytes in batches of one key must take at least ~2.9 ms.
+    IndexedStore::Options o = gcOpts();
+    o.gc_rate_mb_s = 1;
+    o.gc_batch_bytes = 1;
+    auto st = IndexedStore::open(dir, o);
+    const uint32_t s = fillSegment(*st, "a", 10);
+    st->put("a3", smallDoc(33)); // a0..a2 live: ratio 0.75, below a threshold of 0.8
+    st->put("z", smallDoc(34));
+    st->stopGc();
+    closeCounted(st);
+    o.gc_threshold = 0.8;
+    st = IndexedStore::open(dir, o);
+    const auto t0 = std::chrono::steady_clock::now();
+    bpt::GcReport r = st->runGcPass();
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(r.victim == s && r.keys_relocated == 3 && r.batches == 3);
+    const double floor_ms = double(r.bytes_written) / (1024.0 * 1024.0) * 1000.0;
+    CHECK(ms >= floor_ms * 0.9);
+    gcUntilIdle(*st);
+    checkStoreEqualsOracle(*st, "P5.I2");
+    closeCounted(st);
+    pass("P5.I2 bad gc_threshold / gc_batch_bytes / gc_interval_ms rejected; at 1 MB/s a pass "
+         "writing " + std::to_string(r.bytes_written) + " bytes took " +
+         std::to_string(ms).substr(0, 5) + " ms (floor " + std::to_string(floor_ms).substr(0, 4) +
+         " ms)");
+}
+
 int main() {
     std::string dir = setupRun("gc_test");
     Cleaner cleaner{dir};
@@ -1821,6 +1940,8 @@ int main() {
     testE1UserWriteDuringRelocation(dir + "/e1");
     testE2EraseVsRelocation(dir + "/e2");
     testH(dir + "/h");
+    testI1BackgroundGcThreads(dir + "/i1");
+    testI2OptionsAndRateLimit(dir + "/i2");
     printBudget();
     return 0;
 }

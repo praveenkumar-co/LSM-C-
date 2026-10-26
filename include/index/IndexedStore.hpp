@@ -164,7 +164,11 @@ public:
         uint16_t delta_chain_cap = vlog::kMaxDeltaChain;
         // Largest document put() and update() accept; 0 = the largest payload the vLog accepts.
         uint32_t max_document_bytes = 0;
-        // GC (plan sections 2, 3). runGcPass() runs one pass on the caller's thread.
+        // GC (plan sections 2, 3, 6). runGcPass() runs one pass on the caller's thread; with
+        // gc_enabled a background thread runs passes every gc_interval_ms until nothing is
+        // left to do, and requests the checkpoints that move retired segments on.
+        bool gc_enabled = false;
+        uint32_t gc_interval_ms = 1000;
         double gc_threshold = 0.5;              // victims: live/total below this, in (0, 1)
         uint64_t gc_batch_bytes = 1024 * 1024;  // relocations per appendRelocated (one fsync)
         uint32_t gc_rate_mb_s = 32;             // GC vLog writes per second (0: no limit)
@@ -191,6 +195,8 @@ public:
         if (!(opts.gc_threshold > 0.0 && opts.gc_threshold < 1.0))
             throw std::invalid_argument("gc_threshold must be in (0, 1)");
         if (opts.gc_batch_bytes == 0) throw std::invalid_argument("gc_batch_bytes must be > 0");
+        if (opts.gc_enabled && opts.gc_interval_ms == 0)
+            throw std::invalid_argument("gc_interval_ms must be > 0 with gc_enabled");
         if (::mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) fatal("mkdir failed for " + dir);
         std::unique_ptr<IndexedStore> s(new IndexedStore(dir, opts));
         Pager::Options po;
@@ -241,6 +247,7 @@ public:
         s->cp_replay_older_ = older_replay;
         if (opts.auto_checkpoint)
             s->checkpointer_ = std::thread([p = s.get()] { p->checkpointerLoop(); });
+        if (opts.gc_enabled) s->gc_thread_ = std::thread([p = s.get()] { p->gcLoop(); });
         return s;
     }
 
@@ -249,7 +256,10 @@ public:
 
     // Without close(): the checkpointer stops without a final checkpoint; the vLog is fsynced and
     // closed. The next open recovers from the last superblock plus the vLog.
-    ~IndexedStore() { stopCheckpointer(); }
+    ~IndexedStore() {
+        stopGc();
+        stopCheckpointer();
+    }
 
     // Returns the seq of the acked write. Throws std::invalid_argument for a bad key or an
     // oversize document (nothing is written in that case).
@@ -460,6 +470,7 @@ public:
     // Clean close: callers must have stopped all other operations.
     void close() {
         if (closed_) fatal("IndexedStore::close called twice");
+        stopGc();
         stopCheckpointer();
         checkpoint(CheckpointTrigger::Close);
         closed_ = true;
@@ -513,6 +524,17 @@ public:
         std::lock_guard<std::mutex> lk(gc_mu_);
         gc_totals_.passes++;
         return rep;
+    }
+
+    // Stops the background GC thread (no-op without gc_enabled). close() calls it. A pass in
+    // progress finishes first; its rate-limit sleep is cut short.
+    void stopGc() {
+        {
+            std::lock_guard<std::mutex> lk(gc_thread_mu_);
+            gc_stop_ = true;
+        }
+        gc_cv_.notify_all();
+        if (gc_thread_.joinable()) gc_thread_.join();
     }
 
     // True while some segment waits for checkpoints, or is condemned but not yet unlinked.
@@ -968,8 +990,32 @@ private:
         }
         locks.clear(); // release the stripes before sleeping
         if (opts_.gc_rate_mb_s > 0) {
+            // Token bucket of one batch: sleep as long as the batch's bytes take at the rate.
             const double secs = double(written) / (double(opts_.gc_rate_mb_s) * 1024 * 1024);
-            std::this_thread::sleep_for(std::chrono::duration<double>(secs));
+            std::unique_lock<std::mutex> lk(gc_thread_mu_);
+            gc_cv_.wait_for(lk, std::chrono::duration<double>(secs), [&] { return gc_stop_; });
+        }
+    }
+
+    // Background GC (plan section 6): every gc_interval_ms, passes until there is no victim and
+    // nothing waits; a manual checkpoint after a pass that left segments waiting moves their
+    // epochs on. Foreground operations wait at most on one stripe that a batch holds.
+    void gcLoop() {
+        std::unique_lock<std::mutex> lk(gc_thread_mu_);
+        while (!gc_stop_) {
+            gc_cv_.wait_for(lk, std::chrono::milliseconds(opts_.gc_interval_ms),
+                            [&] { return gc_stop_; });
+            if (gc_stop_) break;
+            lk.unlock();
+            for (int i = 0; i < 64; ++i) {
+                GcReport r = runGcPass();
+                const bool pending = gcPending();
+                if (r.action == GcReport::Action::None && !pending) break;
+                if (pending) checkpoint(CheckpointTrigger::Manual);
+                std::lock_guard<std::mutex> g(gc_thread_mu_);
+                if (gc_stop_) break;
+            }
+            lk.lock();
         }
     }
 
@@ -1395,6 +1441,10 @@ private:
     bool cp_has_older_ = false;
     mutable ReaderRegistry readers_;
     std::mutex gc_run_mu_; // one GC pass at a time
+    std::mutex gc_thread_mu_; // guards gc_stop_
+    std::condition_variable gc_cv_;
+    bool gc_stop_ = false;
+    std::thread gc_thread_;
 
     std::mutex cp_run_mu_;     // serializes checkpoint()
     mutable std::mutex cp_mu_; // guards the fields below
