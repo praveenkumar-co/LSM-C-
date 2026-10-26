@@ -1,5 +1,5 @@
 // Phase 5 tests: vLog garbage collection (docs/PHASE5_PLAN.md). Relocated entries in replay and
-// rebuild, segment-id gaps and the vLog identity anchor (P5.R, P5.G).
+// rebuild, segment-id gaps and the vLog identity anchor (P5.R, P5.G), counters (P5.A).
 #include "test_common.hpp"
 
 #include "doc/Json.hpp"
@@ -583,6 +583,145 @@ static void testG5OldAnchor(const std::string& dir) {
          "anchors the replay segment; a changed anchor header is still a VLogMismatch");
 }
 
+// ------------------------------------------------------------------------------------------
+// P5.A Counters
+// ------------------------------------------------------------------------------------------
+static std::map<uint32_t, uint64_t> liveMap(IndexedStore& st) {
+    std::map<uint32_t, uint64_t> m;
+    for (const auto& si : st.gcStats().segments) m[si.id] = si.live_bytes;
+    return m;
+}
+static std::map<uint32_t, uint64_t> totalMap(IndexedStore& st) {
+    std::map<uint32_t, uint64_t> m;
+    for (const auto& si : st.gcStats().segments) m[si.id] = si.total_bytes;
+    return m;
+}
+static void expectCountersExact(IndexedStore& st, const char* what) {
+    const std::string why = st.verifyCountersForTest();
+    if (!why.empty()) std::cerr << what << ": " << why << "\n";
+    CHECK(why.empty());
+}
+// Reopens and checks the open-time rebuild gives the same live bytes per segment.
+static void reopenSameLive(std::unique_ptr<IndexedStore>& st, const std::string& dir,
+                           const IndexedStore::Options& o) {
+    const std::map<uint32_t, uint64_t> before = liveMap(*st);
+    st->close();
+    st = IndexedStore::open(dir, o);
+    std::map<uint32_t, uint64_t> after = liveMap(*st);
+    for (const auto& [id, live] : before) CHECK(after[id] == live);
+    for (const auto& [id, live] : after) CHECK(before.count(id) || live == 0);
+    expectCountersExact(*st, "after reopen");
+}
+
+static void testA1Overwrite(const std::string& dir) {
+    banner("P5.A1 overwrite moves bytes out of live");
+    auto st = IndexedStore::open(dir, storeOpts());
+    st->put("k", bigDoc(1));
+    const vlog::VPtr v1 = st->tree().get("k")->vptr;
+    st->put("filler", bigDoc(2));
+    expectCountersExact(*st, "after 2 puts");
+    CHECK(liveMap(*st)[v1.segment_id] == v1.length);
+    st->put("k", bigDoc(3));
+    const vlog::VPtr v2 = st->tree().get("k")->vptr;
+    CHECK(v2.segment_id != v1.segment_id);
+    std::map<uint32_t, uint64_t> live = liveMap(*st), total = totalMap(*st);
+    CHECK(live[v1.segment_id] == 0 && total[v1.segment_id] == v1.length);
+    CHECK(live[v2.segment_id] == v2.length && total[v2.segment_id] == v2.length);
+    expectCountersExact(*st, "after overwrite");
+    reopenSameLive(st, dir, storeOpts());
+    st->close();
+    accountVLog(dir);
+    pass("P5.A1 overwrite: the old version leaves live_bytes of its segment; reopen agrees");
+}
+
+// k: Full in s1, Delta in s2, Delta in s3 (fillers move the writer between segments).
+struct Chain3 {
+    vlog::VPtr full, d1, d2, f1, f2;
+};
+static Chain3 buildChain3(IndexedStore& st) {
+    Chain3 c;
+    st.put("k", padDoc(1, 2900));
+    c.full = st.tree().get("k")->vptr;
+    st.put("f1", bigDoc(2));
+    c.f1 = st.tree().get("f1")->vptr;
+    CHECK(st.update("k", {doc::inc("n", 1)}).chain_depth == 1);
+    c.d1 = st.tree().get("k")->vptr;
+    st.put("f2", bigDoc(3));
+    c.f2 = st.tree().get("f2")->vptr;
+    CHECK(st.update("k", {doc::inc("n", 1)}).chain_depth == 2);
+    c.d2 = st.tree().get("k")->vptr;
+    CHECK(c.full.segment_id < c.d1.segment_id && c.d1.segment_id < c.d2.segment_id);
+    CHECK(c.d1.segment_id == c.f1.segment_id && c.d2.segment_id == c.f2.segment_id);
+    return c;
+}
+
+static void testA2Erase(const std::string& dir) {
+    banner("P5.A2 erase kills the whole chain; the tombstone counts in total only");
+    auto st = IndexedStore::open(dir, storeOpts());
+    Chain3 c = buildChain3(*st);
+    expectCountersExact(*st, "chain built");
+    std::map<uint32_t, uint64_t> total0 = totalMap(*st);
+    CHECK(st->erase("k").existed);
+    std::map<uint32_t, uint64_t> live = liveMap(*st), total = totalMap(*st);
+    CHECK(live[c.full.segment_id] == 0);
+    CHECK(live[c.d1.segment_id] == c.f1.length);
+    CHECK(live[c.d2.segment_id] == c.f2.length);
+    const uint64_t tomb = total[c.d2.segment_id] - total0[c.d2.segment_id];
+    CHECK(tomb == vlog::entry_size(1, 0)); // tombstone of key "k": header + padded key
+    expectCountersExact(*st, "after erase");
+    reopenSameLive(st, dir, storeOpts());
+    st->close();
+    accountVLog(dir);
+    pass("P5.A2 erase: chain bytes leave live_bytes in all 3 segments; tombstone in total only");
+}
+
+static void testA3DeltaKillsNothing(const std::string& dir) {
+    banner("P5.A3 a Delta append kills nothing");
+    auto st = IndexedStore::open(dir, storeOpts());
+    st->put("k", padDoc(1, 2900));
+    const vlog::VPtr base = st->tree().get("k")->vptr;
+    st->put("f1", bigDoc(2));
+    std::map<uint32_t, uint64_t> before = liveMap(*st);
+    CHECK(st->update("k", {doc::inc("n", 1)}).chain_depth == 1);
+    const vlog::VPtr d = st->tree().get("k")->vptr;
+    std::map<uint32_t, uint64_t> after = liveMap(*st);
+    for (const auto& [id, live] : after) {
+        const uint64_t want = before[id] + (id == d.segment_id ? d.length : 0);
+        CHECK(live == want);
+    }
+    CHECK(after[base.segment_id] == base.length); // the base stays live
+    expectCountersExact(*st, "after delta");
+    reopenSameLive(st, dir, storeOpts());
+    st->close();
+    accountVLog(dir);
+    pass("P5.A3 Delta append: only the Delta's bytes are added; its base stays live");
+}
+
+static void testA4ConsolidationAcrossSegments(const std::string& dir) {
+    banner("P5.A4 consolidation kills a chain spanning 3 segments");
+    IndexedStore::Options o = storeOpts();
+    o.delta_chain_cap = 2;
+    auto st = IndexedStore::open(dir, o);
+    Chain3 c = buildChain3(*st);
+    expectCountersExact(*st, "chain built");
+    reopenSameLive(st, dir, o); // chains_ rebuilt from the index
+    bpt::UpdateResult u = st->update("k", {doc::inc("n", 1)});
+    CHECK(u.consolidated && u.chain_depth == 0);
+    const vlog::VPtr full2 = st->tree().get("k")->vptr;
+    std::map<uint32_t, uint64_t> live = liveMap(*st);
+    CHECK(live[c.full.segment_id] == 0);
+    CHECK(live[c.d1.segment_id] == c.f1.length);
+    CHECK(live[c.d2.segment_id] == c.f2.length + (full2.segment_id == c.d2.segment_id ? full2.length : 0));
+    CHECK(live[full2.segment_id] >= full2.length);
+    expectCountersExact(*st, "after consolidation");
+    reopenSameLive(st, dir, o);
+    CHECK(st->gcOpenStats().keys_walked == 3 && st->gcOpenStats().chain_reads == 0);
+    st->close();
+    accountVLog(dir);
+    pass("P5.A4 consolidation: a chain over 3 segments dies in all 3; counters == recount and "
+         "== open-time rebuild after every step");
+}
+
 int main() {
     std::string dir = setupRun("gc_test");
     Cleaner cleaner{dir};
@@ -592,6 +731,10 @@ int main() {
     testR4ConsolidatedCopy(dir + "/r4");
     testG1SegmentGaps(dir + "/g1");
     testG5OldAnchor(dir + "/g5");
+    testA1Overwrite(dir + "/a1");
+    testA2Erase(dir + "/a2");
+    testA3DeltaKillsNothing(dir + "/a3");
+    testA4ConsolidationAcrossSegments(dir + "/a4");
     printBudget();
     return 0;
 }

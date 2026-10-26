@@ -33,12 +33,20 @@
 // Triggers: a background thread checkpoints after checkpoint_bytes of vLog writes (default
 // 4 MiB) or checkpoint_interval_ms (default 30 s), and close() checkpoints.
 //
+// GC counters (docs/PHASE5_PLAN.md section 1): per segment, total_bytes (every entry) and
+// live_bytes (index heads and their Delta chains), guarded by gc_mu_ (a leaf lock). Every write
+// updates them under its stripe lock after its index update: a Full entry or a tombstone kills the
+// key's whole previous chain, a Delta kills nothing. chains_ holds the chain VPtrs of keys whose
+// head is a Delta, so put() and erase() find the chain to kill without reading the vLog. Open
+// rebuilds both from the index (one small read per key, plus one per Delta hop).
+//
 // Directory layout: <dir>/vlog/vlog_%08u.log, <dir>/index.db, <dir>/superblock.db.
 
 #include "doc/Json.hpp"
 #include "doc/Update.hpp"
 #include "index/BPTree.hpp"
 #include "index/DeltaCodec.hpp"
+#include "index/GcTypes.hpp"
 #include "index/IndexRecovery.hpp"
 #include "index/Pager.hpp"
 #include "vlog/VLogReader.hpp"
@@ -56,10 +64,13 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 namespace bpt {
 
@@ -191,10 +202,7 @@ public:
         s->last_cp_time_ = std::chrono::steady_clock::now();
         s->vlog_bytes_at_cp_ = 0;
         s->anchor_ = s->open_info_.vid;
-        {
-            std::vector<uint32_t> present = listVLogSegments(s->vlog_dir_);
-            s->oldest_segment_ = present.empty() ? 0 : present.front();
-        }
+        s->rebuildCounters();
         if (opts.auto_checkpoint)
             s->checkpointer_ = std::thread([p = s.get()] { p->checkpointerLoop(); });
         return s;
@@ -219,7 +227,11 @@ public:
         std::lock_guard<std::mutex> stripe(stripeFor(key));
         vlog::AppendResult ar =
             appendOrDie(vlog::EntryType::Full, key, doc.data(), static_cast<uint32_t>(doc.size()));
+        // After the append: reading the index waits while a checkpoint holds the tree, and the
+        // append must not wait for that. The stripe keeps the key's chain unchanged until here.
+        const std::vector<vlog::VPtr> old = currentChain(key);
         applyInOrder(key, vlog::EntryType::Full, ar, nullptr);
+        accountReplace(key, old, &ar.vptr);
         noteVLogBytes();
         return ar.seq;
     }
@@ -228,8 +240,10 @@ public:
         checkKey(key);
         std::lock_guard<std::mutex> stripe(stripeFor(key));
         vlog::AppendResult ar = appendOrDie(vlog::EntryType::Tombstone, key, nullptr, 0);
+        const std::vector<vlog::VPtr> old = currentChain(key); // after the append, as in put()
         bool had = false;
         applyInOrder(key, vlog::EntryType::Tombstone, ar, &had);
+        accountReplace(key, old, nullptr);
         noteVLogBytes();
         return EraseResult{ar.seq, had};
     }
@@ -279,6 +293,7 @@ public:
                 appendOrDie(vlog::EntryType::Full, key, next_bytes.data(),
                             static_cast<uint32_t>(next_bytes.size()), vlog::kFlagConsolidated);
             applyInOrder(key, vlog::EntryType::Full, ar, nullptr);
+            accountReplace(key, v.chain, &ar.vptr);
             r = UpdateResult{ar.seq, true, true, 0};
         } else {
             vlog::DeltaPrefix pre{};
@@ -289,6 +304,7 @@ public:
             vlog::AppendResult ar = appendOrDie(vlog::EntryType::Delta, key, enc.data(),
                                                 static_cast<uint32_t>(enc.size()), 0, &pre);
             applyInOrder(key, vlog::EntryType::Delta, ar, nullptr, ref->seq);
+            accountDelta(key, v.chain, ar.vptr);
             r = UpdateResult{ar.seq, true, false, depth};
         }
         noteVLogBytes();
@@ -398,6 +414,60 @@ public:
     }
 
     const OpenIndexResult& openInfo() const { return open_info_; }
+
+    // GC counters and totals (plan section 1). The segment the writer appends to is Active.
+    GcStats gcStats() const {
+        const uint32_t active = writer_ ? writer_->getCurrentSegmentId() : 0;
+        std::lock_guard<std::mutex> lk(gc_mu_);
+        GcStats g = gc_totals_;
+        g.segments.clear();
+        g.total_bytes = g.live_bytes = g.disk_bytes = 0;
+        for (const auto& [id, st] : segs_) {
+            SegmentInfo si{id, st.total_bytes, st.live_bytes, st.state};
+            if (id == active) si.state = SegmentState::Active;
+            g.segments.push_back(si);
+            g.total_bytes += st.total_bytes;
+            g.live_bytes += st.live_bytes;
+            g.disk_bytes += st.total_bytes + vlog::kBlockSize;
+        }
+        g.space_amplification = g.live_bytes ? double(g.disk_bytes) / double(g.live_bytes) : 0.0;
+        return g;
+    }
+    const GcOpenStats& gcOpenStats() const { return gc_open_; }
+
+    // Test-only: recomputes the counters from the index and the segment files and compares them
+    // with the in-memory ones. "" if equal, else the first difference. Callers must have stopped
+    // all writes.
+    std::string verifyCountersForTest() const {
+        CounterScan cs = scanCounters();
+        std::lock_guard<std::mutex> lk(gc_mu_);
+        for (const auto& [id, st] : segs_) {
+            const uint64_t file_total = segmentEntryBytes(id);
+            if (st.total_bytes != file_total)
+                return "segment " + std::to_string(id) + " total_bytes " +
+                       std::to_string(st.total_bytes) + ", file has " + std::to_string(file_total);
+            auto it = cs.live.find(id);
+            const uint64_t want = it == cs.live.end() ? 0 : it->second;
+            if (st.live_bytes != want)
+                return "segment " + std::to_string(id) + " live_bytes " +
+                       std::to_string(st.live_bytes) + ", recount " + std::to_string(want);
+        }
+        for (const auto& [id, live] : cs.live)
+            if (!segs_.count(id)) return "live bytes in untracked segment " + std::to_string(id);
+        for (uint32_t id : listVLogSegments(vlog_dir_))
+            if (!segs_.count(id)) return "segment " + std::to_string(id) + " is not tracked";
+        if (cs.chains.size() != chains_.size())
+            return "chains: " + std::to_string(chains_.size()) + " tracked, recount " +
+                   std::to_string(cs.chains.size());
+        for (const auto& [k, c] : cs.chains) {
+            auto it = chains_.find(k);
+            if (it == chains_.end() || it->second.size() != c.size()) return "chain of " + k;
+            for (size_t i = 0; i < c.size(); ++i)
+                if (std::memcmp(&c[i], &it->second[i], sizeof(vlog::VPtr)) != 0)
+                    return "chain of " + k;
+        }
+        return "";
+    }
     BPTree& tree() { return *tree_; }
     Pager& pager() { return *pager_; }
     uint64_t vlogBytesWritten() const { return writer_ ? writer_->getTotalBytesWritten() : 0; }
@@ -423,9 +493,14 @@ private:
         uint32_t reads = 0;                // vLog entries read
         std::vector<uint8_t> full_payload; // the Full base entry's payload
         std::vector<DecodedDelta> deltas;  // newest first
+        std::vector<vlog::VPtr> chain;     // every entry read, head first (the Full base last)
     };
 
-    uint32_t oldestSegment() const { return oldest_segment_; }
+    // Lowest segment id present (segments leave segs_ only after their unlink is durable).
+    uint32_t oldestSegment() const {
+        std::lock_guard<std::mutex> lk(gc_mu_);
+        return segs_.empty() ? 0 : segs_.begin()->first;
+    }
 
     std::mutex& stripeFor(std::string_view key) {
         return stripes_[std::hash<std::string_view>{}(key) % kStripes];
@@ -462,6 +537,7 @@ private:
                     where);
             }
             v.reads++;
+            v.chain.push_back(at);
             const uint64_t seq = h.seq;
             if (seq != want_seq || k != key)
                 throw VLogReadError("vLog entry does not match (seq " + std::to_string(seq) +
@@ -539,12 +615,178 @@ private:
                                    uint32_t len, uint8_t flags = 0,
                                    const vlog::DeltaPrefix* prefix = nullptr) {
         if (closed_) fatal("IndexedStore used after close");
+        vlog::AppendResult ar;
         try {
-            return writer_->append(type, std::string(key), data, len, flags, 0, prefix);
+            ar = writer_->append(type, std::string(key), data, len, flags, 0, prefix);
         } catch (const std::exception& e) {
             errno = 0;
             fatal(std::string("vLog append failed: ") + e.what());
         }
+        noteAppended(ar.vptr);
+        return ar;
+    }
+
+    // ---- GC counters (gc_mu_ is a leaf lock: nothing else is taken while it is held) ----
+
+    void noteAppended(const vlog::VPtr& p) {
+        std::lock_guard<std::mutex> lk(gc_mu_);
+        segs_[p.segment_id].total_bytes += p.length;
+    }
+
+    void killLocked(const std::vector<vlog::VPtr>& chain) {
+        for (const vlog::VPtr& p : chain) {
+            auto it = segs_.find(p.segment_id);
+            if (it == segs_.end()) continue;
+            it->second.live_bytes -= std::min<uint64_t>(it->second.live_bytes, p.length);
+        }
+    }
+
+    // The key's current chain (head first), from the index and chains_. Caller holds the stripe.
+    std::vector<vlog::VPtr> currentChain(std::string_view key) const {
+        std::optional<vlog::IndexValueRef> ref = tree_->get(key);
+        if (!ref) return {};
+        std::lock_guard<std::mutex> lk(gc_mu_);
+        auto it = chains_.find(std::string(key));
+        if (it != chains_.end() && !it->second.empty() &&
+            std::memcmp(&it->second.front(), &ref->vptr, sizeof(vlog::VPtr)) == 0)
+            return it->second;
+        return {ref->vptr};
+    }
+
+    // A Full entry (head = nullptr: a tombstone) replaced the key's chain old.
+    void accountReplace(std::string_view key, const std::vector<vlog::VPtr>& old,
+                        const vlog::VPtr* head) {
+        std::lock_guard<std::mutex> lk(gc_mu_);
+        killLocked(old);
+        if (head) segs_[head->segment_id].live_bytes += head->length;
+        chains_.erase(std::string(key));
+    }
+
+    // A Delta entry was added on top of the chain old: nothing dies.
+    void accountDelta(std::string_view key, const std::vector<vlog::VPtr>& old,
+                      const vlog::VPtr& head) {
+        std::lock_guard<std::mutex> lk(gc_mu_);
+        segs_[head.segment_id].live_bytes += head.length;
+        std::vector<vlog::VPtr> c;
+        c.reserve(old.size() + 1);
+        c.push_back(head);
+        c.insert(c.end(), old.begin(), old.end());
+        chains_[std::string(key)] = std::move(c);
+    }
+
+    // Entry bytes in a segment file (its size minus the 4 KiB header); 0 if it is missing.
+    uint64_t segmentEntryBytes(uint32_t id) const {
+        struct stat st;
+        const std::string path = segmentPath(id);
+        if (::stat(path.c_str(), &st) != 0) {
+            if (errno == ENOENT) return 0;
+            fatal("stat failed for " + path);
+        }
+        const uint64_t size = static_cast<uint64_t>(st.st_size);
+        return size > vlog::kBlockSize ? size - vlog::kBlockSize : 0;
+    }
+
+    std::string segmentPath(uint32_t id) const {
+        char name[32];
+        std::snprintf(name, sizeof(name), "/vlog_%08u.log", id);
+        return vlog_dir_ + name;
+    }
+
+    // Small preads of entry heads (header + key + DeltaPrefix), one fd per segment.
+    class HeadReader {
+    public:
+        explicit HeadReader(const IndexedStore& st) : st_(st) {}
+        ~HeadReader() {
+            for (auto& [id, fd] : fds_)
+                if (fd >= 0 && ::close(fd) != 0) fatal("close failed for a vLog segment");
+        }
+        // False if the head cannot be read or does not hold this key and seq.
+        bool read(const vlog::VPtr& p, std::string_view key, uint64_t seq, uint8_t* type,
+                  vlog::DeltaPrefix* prefix) {
+            auto it = fds_.find(p.segment_id);
+            if (it == fds_.end()) {
+                int f = ::open(st_.segmentPath(p.segment_id).c_str(), O_RDONLY);
+                if (f < 0 && errno != ENOENT) fatal("open failed for a vLog segment");
+                it = fds_.emplace(p.segment_id, f).first;
+            }
+            const int fd = it->second;
+            if (fd < 0) return false;
+            uint8_t buf[sizeof(vlog::EntryHeader) + kMaxKeyLen + 8 + sizeof(vlog::DeltaPrefix)];
+            const size_t want = std::min<size_t>(sizeof(buf), p.length);
+            const ssize_t r = ::pread(fd, buf, want, p.offset);
+            if (r < 0) fatal("pread failed for a vLog segment");
+            if (static_cast<size_t>(r) < sizeof(vlog::EntryHeader)) return false;
+            vlog::EntryHeader h;
+            std::memcpy(&h, buf, sizeof(h));
+            const uint32_t poff = vlog::payload_offset(h.key_len);
+            if (h.total_len != p.length || h.seq != seq || h.key_len != key.size() ||
+                sizeof(vlog::EntryHeader) + h.key_len > static_cast<size_t>(r) ||
+                std::memcmp(buf + sizeof(vlog::EntryHeader), key.data(), key.size()) != 0)
+                return false;
+            *type = h.type;
+            if (h.type == static_cast<uint8_t>(vlog::EntryType::Delta)) {
+                if (poff + sizeof(vlog::DeltaPrefix) > static_cast<size_t>(r)) return false;
+                std::memcpy(prefix, buf + poff, sizeof(*prefix));
+            }
+            return true;
+        }
+
+    private:
+        const IndexedStore& st_;
+        std::map<uint32_t, int> fds_;
+    };
+
+    struct CounterScan {
+        std::map<uint32_t, uint64_t> live;
+        std::unordered_map<std::string, std::vector<vlog::VPtr>> chains;
+        GcOpenStats stats;
+    };
+
+    // Walks every key of the index and its Delta chain (plan section 1, open-time rebuild).
+    CounterScan scanCounters() const {
+        const auto t0 = std::chrono::steady_clock::now();
+        CounterScan cs;
+        HeadReader hr(*this);
+        std::string from;
+        while (true) {
+            BPTree::ScanResult batch = tree_->scanFrom(from, 4096);
+            for (const auto& [key, ref] : batch) {
+                cs.stats.keys_walked++;
+                std::vector<vlog::VPtr> chain{ref.vptr};
+                uint8_t type = 0;
+                vlog::DeltaPrefix pre{};
+                cs.stats.head_reads++;
+                if (hr.read(ref.vptr, key, ref.seq, &type, &pre)) {
+                    while (type == static_cast<uint8_t>(vlog::EntryType::Delta) &&
+                           chain.size() <= vlog::kMaxDeltaChain) {
+                        const vlog::VPtr base = pre.base;
+                        cs.stats.chain_reads++;
+                        if (!hr.read(base, key, pre.base_seq, &type, &pre)) break;
+                        chain.push_back(base);
+                    }
+                }
+                for (const vlog::VPtr& p : chain) cs.live[p.segment_id] += p.length;
+                if (chain.size() > 1) cs.chains[key] = std::move(chain);
+            }
+            if (batch.size() < 4096) break;
+            from = batch.back().first;
+            from.push_back('\0'); // the smallest key after the last one
+        }
+        cs.stats.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                t0)
+                          .count();
+        return cs;
+    }
+
+    // Open: total_bytes from the segment sizes, live_bytes and chains_ from the index.
+    void rebuildCounters() {
+        CounterScan cs = scanCounters();
+        std::lock_guard<std::mutex> lk(gc_mu_);
+        segs_.clear();
+        for (uint32_t id : listVLogSegments(vlog_dir_)) segs_[id].total_bytes = segmentEntryBytes(id);
+        for (const auto& [id, live] : cs.live) segs_[id].live_bytes = live;
+        chains_ = std::move(cs.chains);
+        gc_open_ = cs.stats;
     }
 
     // delta_base_seq: the Delta's base (Delta entries only). A live Delta whose base is not the
@@ -631,7 +873,12 @@ private:
     uint32_t last_applied_end_ = vlog::kBlockSize;
     uint64_t last_cp_seq_ = 0; // checkpoint_seq of the last superblock (guarded by seq_mu_)
     VLogIdentity anchor_;      // identity the next superblock records (guarded by seq_mu_)
-    uint32_t oldest_segment_ = 0; // lowest segment id present (guarded by seq_mu_)
+
+    mutable std::mutex gc_mu_; // leaf lock: guards the GC fields below
+    std::map<uint32_t, SegStats> segs_;
+    std::unordered_map<std::string, std::vector<vlog::VPtr>> chains_; // keys with a Delta head
+    GcStats gc_totals_;                                               // scalar totals only
+    GcOpenStats gc_open_;
 
     std::mutex cp_run_mu_;     // serializes checkpoint()
     mutable std::mutex cp_mu_; // guards the fields below
