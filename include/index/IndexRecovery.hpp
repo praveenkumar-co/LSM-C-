@@ -8,22 +8,30 @@
 // Open, in two parts:
 //   planIndexOpen (read-only, BEFORE the vLog writer opens): index.db header valid, superblock
 //     valid (newest valid slot), superblock nonce == index.db nonce, superblock vLog identity ==
-//     this vLog, index.db not shorter than the committed page count, every page of the committed
+//     this vLog (the anchor segment the superblock names exists and has the recorded
+//     created_unix_ns), index.db not shorter than the committed page count, every page of the committed
 //     tree passes its CRC and structure checks, and the replay segment exists and is at least
 //     replay_offset long (else VLogBehindError: acked entries are gone; nothing is modified).
 //     The plan gives the writer its tail-scan start: (replay_segment_id, replay_offset).
 //   openIndexFromPlan (after the writer opened): ftruncate index.db to index_page_count (drops
 //     pages written after the checkpoint), open the tree at index_root_page, rebuild the free
 //     list, and replay the vLog from the replay point (should_apply(); Delta entries follow the
-//     delta rule in BPTree::apply). Before replaying, a read-only pass checks every Delta's base
-//     against the committed tree plus the tail, so a bad Delta fails the open (VLogCorruptError)
-//     before anything is written.
+//     delta rule in BPTree::apply; an entry with kFlagRelocated applies only if the key is at
+//     that seq). Before replaying, a read-only pass checks every Delta's base against the
+//     committed tree plus the tail, so a bad Delta fails the open (VLogCorruptError) before
+//     anything is written. Seqs must rise in file order, except for kFlagRelocated entries (GC
+//     copies keep their original seq).
 // Copy-on-write (Pager.hpp) keeps the committed tree's pages unchanged until the next superblock
 // commits, so after a crash the superblock still names an intact tree.
 //
 // Rebuild (any check fails):
 //   1. unlink a leftover index.db.rebuild, create it (O_CREAT | O_EXCL)
-//   2. apply every vLog entry, in file order, through BPTree::apply
+//   2. pass 1: every vLog entry, in any order: per key the highest seq wins; on an equal seq a
+//      consolidated Full > relocated Full > original Full > Delta (rebuildWinnerRank). A winning
+//      tombstone removes the key and is remembered (seq per erased key) so an older entry met
+//      later in the file cannot bring the key back. Pass 2: every key whose winner is a Delta has
+//      its chain walked back to a Full base (key, seq == base_seq, depth); a broken chain is the
+//      only corruption (VLogCorruptError). Orphan Deltas that lost to a Full are ignored.
 //   3. write back all pages, F_FULLFSYNC
 //   4. delete superblock.db (directory fsynced)
 //   5. rename index.db.rebuild -> index.db, fsync the directory
@@ -65,7 +73,10 @@ struct RecoveryHooks {
     std::function<void()> on_close_after_flush; // close checkpoint: after the index fsync
 };
 
-// Identity of a vLog directory: id and created_unix_ns of its lowest-id segment.
+// Identity of a vLog directory: id and created_unix_ns of one of its segments (the anchor). The
+// superblock records the replay segment as anchor; GC never unlinks it, so the check survives
+// GC. Superblocks written before Phase 5 name the lowest segment, which still exists in a store
+// GC never ran on, so they keep matching.
 struct VLogIdentity {
     uint32_t first_segment = 0;
     uint64_t created_ns = 0;
@@ -86,6 +97,7 @@ struct OpenIndexResult {
     uint64_t last_seq = 0;
     uint32_t last_segment = 0;
     uint32_t last_end = vlog::kBlockSize;
+    uint32_t oldest_segment = 0; // lowest segment id present at open (after the rebuild's scan)
 
     Pager::CommitInfo commitInfo() const {
         Pager::CommitInfo ci;
@@ -94,6 +106,7 @@ struct OpenIndexResult {
         ci.replay_offset = last_end;
         ci.vlog_first_segment = vid.first_segment;
         ci.vlog_created_ns = vid.created_ns;
+        ci.oldest_live_segment = oldest_segment;
         return ci;
     }
 };
@@ -126,15 +139,19 @@ inline std::vector<uint32_t> listVLogSegments(const std::string& vlog_dir) {
     return ids;
 }
 
-inline VLogIdentity readVLogIdentity(const std::string& vlog_dir) {
+// Identity of segment seg_id. A missing or unreadable segment gives {0, 0}, which never matches
+// a recorded identity.
+inline VLogIdentity readSegmentIdentity(const std::string& vlog_dir, uint32_t seg_id) {
     VLogIdentity id;
-    std::vector<uint32_t> segs = listVLogSegments(vlog_dir);
-    if (segs.empty()) return id;
+    if (seg_id == 0) return id;
     char name[32];
-    std::snprintf(name, sizeof(name), "/vlog_%08u.log", segs[0]);
+    std::snprintf(name, sizeof(name), "/vlog_%08u.log", seg_id);
     std::string path = vlog_dir + name;
     int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) fatal("open failed for " + path);
+    if (fd < 0) {
+        if (errno == ENOENT) return id;
+        fatal("open failed for " + path);
+    }
     vlog::SegmentHeader h;
     ssize_t r = ::pread(fd, &h, sizeof(h), 0);
     if (r < 0) fatal("pread of segment header failed for " + path);
@@ -143,9 +160,23 @@ inline VLogIdentity readVLogIdentity(const std::string& vlog_dir) {
         h.crc32c != vlog::crc32c(&h, offsetof(vlog::SegmentHeader, crc32c))) {
         return id; // unreadable identity: never matches a recorded one
     }
+    if (h.segment_id != seg_id) return id;
     id.first_segment = h.segment_id;
     id.created_ns = h.created_unix_ns;
     return id;
+}
+
+// Identity of the lowest-id segment (a new store, or a rebuild with no entries).
+inline VLogIdentity readVLogIdentity(const std::string& vlog_dir) {
+    std::vector<uint32_t> segs = listVLogSegments(vlog_dir);
+    return segs.empty() ? VLogIdentity{} : readSegmentIdentity(vlog_dir, segs[0]);
+}
+
+// The anchor a superblock written now should record: the segment holding the replay point, or
+// the lowest segment while nothing has been applied.
+inline VLogIdentity anchorIdentity(const std::string& vlog_dir, uint32_t replay_segment) {
+    return replay_segment != 0 ? readSegmentIdentity(vlog_dir, replay_segment)
+                               : readVLogIdentity(vlog_dir);
 }
 
 // Thrown when the committed index reflects vLog entries that the vLog no longer has
@@ -246,9 +277,11 @@ struct BootCheck {
     uint64_t reachable_pages = 0; // pages of the current tree
 };
 
-// Read-only checks of index.db + superblock.db. vid == nullptr skips the vLog identity check.
+// Read-only checks of index.db + superblock.db. vlog_dir == nullptr skips the vLog identity
+// check; otherwise the anchor segment the superblock names must exist with the recorded
+// created_unix_ns (*vid_out gets it).
 inline BootCheck checkCommittedIndex(const std::string& dir, SuperblockManager& sbm,
-                                     const VLogIdentity* vid) {
+                                     const std::string* vlog_dir, VLogIdentity* vid_out = nullptr) {
     BootCheck bc;
     const std::string path = dir + "/index.db";
     OpenStatus hs = Pager::readHeader(path, &bc.header);
@@ -272,10 +305,14 @@ inline BootCheck checkCommittedIndex(const std::string& dir, SuperblockManager& 
         bc.status = OpenStatus::IndexMismatch;
         return bc;
     }
-    if (vid && (cur.ext.vlog_first_segment != vid->first_segment ||
-                cur.ext.vlog_created_ns != vid->created_ns)) {
-        bc.status = OpenStatus::VLogMismatch;
-        return bc;
+    if (vlog_dir) {
+        const VLogIdentity anchor = readSegmentIdentity(*vlog_dir, cur.ext.vlog_first_segment);
+        if (anchor.first_segment == 0 || anchor.first_segment != cur.ext.vlog_first_segment ||
+            anchor.created_ns != cur.ext.vlog_created_ns) {
+            bc.status = OpenStatus::VLogMismatch;
+            return bc;
+        }
+        if (vid_out) *vid_out = anchor;
     }
     // decodeSlot already checked these bounds; the casts below cannot lose bits.
     const uint32_t page_count = static_cast<uint32_t>(cur.sb.index_page_count);
@@ -430,6 +467,28 @@ inline void replayVLogFrom(const std::string& vlog_dir, BPTree& tree, uint32_t f
         for (const vlog::RecoveredEntry& e : sr.entries) {
             res->vlog_entries_scanned++;
             const uint64_t seq = e.header.seq;
+            const uint8_t flags = e.header.flags;
+            res->last_segment = e.vptr.segment_id;
+            res->last_end = e.vptr.offset + e.vptr.length;
+            if (flags & vlog::kFlagRelocated) {
+                // A GC copy keeps its original seq, so it is exempt from the order checks. It
+                // applies only if the key is still at that seq (relocation rule).
+                const auto rtype = static_cast<vlog::EntryType>(e.header.type);
+                if (rtype == vlog::EntryType::Delta)
+                    throw VLogCorruptError("Delta entry with kFlagRelocated at segment " +
+                                           std::to_string(e.vptr.segment_id) + " offset " +
+                                           std::to_string(e.vptr.offset) +
+                                           " (GC never relocates a Delta). Nothing was modified.");
+                BPTree::ApplyResult ar = tree.apply(e.key, rtype, seq, flags, e.vptr);
+                if (ar == BPTree::ApplyResult::InvalidKey) {
+                    errno = 0;
+                    fatal("vLog holds a key the index cannot store (length " +
+                          std::to_string(e.key.size()) + ")");
+                }
+                if (ar == BPTree::ApplyResult::Applied) res->vlog_entries_applied++;
+                if (hooks.on_rebuild_entry) hooks.on_rebuild_entry(res->vlog_entries_applied);
+                continue;
+            }
             if (first && expect_next && seq != after_seq + 1) {
                 errno = 0;
                 fatal("vLog entry after the replay point has seq " + std::to_string(seq) +
@@ -443,8 +502,6 @@ inline void replayVLogFrom(const std::string& vlog_dir, BPTree& tree, uint32_t f
             first = false;
             prev_seq = seq;
             res->last_seq = seq;
-            res->last_segment = e.vptr.segment_id;
-            res->last_end = e.vptr.offset + e.vptr.length;
             if (seq <= after_seq) continue;
             const auto type = static_cast<vlog::EntryType>(e.header.type);
             const uint64_t base_seq = type == vlog::EntryType::Delta ? deltaBaseSeq(e) : 0;
@@ -463,6 +520,158 @@ inline void replayVLogFrom(const std::string& vlog_dir, BPTree& tree, uint32_t f
             if (ar == BPTree::ApplyResult::Applied) res->vlog_entries_applied++;
             if (hooks.on_rebuild_entry) hooks.on_rebuild_entry(res->vlog_entries_applied);
         }
+    }
+}
+
+// Tie-break between entries of one key with the same seq (a version and its GC copy):
+// consolidated Full 3 > relocated Full 2 > original Full 1 > Delta 0. Tombstones: relocated 2,
+// original 1 (a tombstone never shares its seq with a document entry).
+inline int rebuildWinnerRank(uint8_t type, uint8_t flags) {
+    switch (static_cast<vlog::EntryType>(type)) {
+    case vlog::EntryType::Full:
+        if (flags & vlog::kFlagConsolidated) return 3;
+        return (flags & vlog::kFlagRelocated) ? 2 : 1;
+    case vlog::EntryType::Delta:
+        return 0;
+    case vlog::EntryType::Tombstone:
+        return (flags & vlog::kFlagRelocated) ? 2 : 1;
+    }
+    return -1;
+}
+
+// Walks the chain of a key whose winning entry is the Delta at ref, back to its Full base: each
+// hop must be readable (CRC), carry this key and the expected seq, and lower the depth by one.
+// Throws VLogCorruptError naming the key and the base seq otherwise.
+inline void checkWinningChain(vlog::VLogReader& reader, const std::string& key,
+                              const vlog::IndexValueRef& ref) {
+    uint64_t want_seq = ref.seq;
+    vlog::VPtr at = ref.vptr;
+    int want_depth = -1;
+    uint64_t head_seq = ref.seq, from_seq = ref.seq;
+    vlog::VPtr from = ref.vptr;
+    auto fail = [&](const std::string& what) {
+        throw VLogCorruptError("Delta chain of key \"" + key + "\" (head seq " +
+                               std::to_string(head_seq) + "): the Delta with seq " +
+                               std::to_string(from_seq) + " at segment " +
+                               std::to_string(from.segment_id) + " offset " +
+                               std::to_string(from.offset) + " has base seq " +
+                               std::to_string(want_seq) + " at segment " +
+                               std::to_string(at.segment_id) + " offset " +
+                               std::to_string(at.offset) + ", but " + what +
+                               ". Nothing was modified.");
+    };
+    while (true) {
+        vlog::EntryHeader h;
+        std::string k;
+        std::vector<uint8_t> payload;
+        if (!reader.readEntry(at, h, k, payload))
+            fail("that entry is unreadable (missing segment, bad bounds, or CRC mismatch)");
+        const uint64_t seq = h.seq;
+        if (k != key || seq != want_seq)
+            fail("the entry there is key \"" + k + "\" seq " + std::to_string(seq));
+        if (h.type == static_cast<uint8_t>(vlog::EntryType::Full)) {
+            if (want_depth > 0) fail("the chain reaches a Full entry early");
+            return;
+        }
+        if (h.type != static_cast<uint8_t>(vlog::EntryType::Delta))
+            fail("the entry there is a tombstone");
+        vlog::DeltaPrefix p;
+        if (!readDeltaPrefix(payload, &p)) fail("the Delta there is too short for its prefix");
+        const int depth = p.chain_depth;
+        if (depth < 1 || depth > vlog::kMaxDeltaChain ||
+            (want_depth >= 0 && depth != want_depth) || p.base_seq >= seq)
+            fail("the Delta there has a bad chain depth or base");
+        from_seq = seq;
+        from = at;
+        want_seq = p.base_seq;
+        at = p.base;
+        want_depth = depth - 1;
+    }
+}
+
+// Full rebuild into tree (see the header comment, step 2). Independent of file order.
+inline void rebuildFromVLog(const std::string& vlog_dir, BPTree& tree, Pager& pager,
+                            const RecoveryHooks& hooks, OpenIndexResult* res) {
+    std::vector<uint32_t> segs = listVLogSegments(vlog_dir);
+    vlog::VLogReader reader(vlog_dir);
+    std::map<std::string, uint64_t> erased;  // key -> seq of its winning tombstone
+    std::map<std::string, bool> delta_heads; // keys whose current winner is a Delta
+    uint64_t max_seq = 0;
+    for (size_t i = 0; i < segs.size(); ++i) {
+        vlog::ScanResult sr = reader.scanSegment(segs[i], i + 1 == segs.size(), vlog::kBlockSize);
+        for (const vlog::RecoveredEntry& e : sr.entries) {
+            res->vlog_entries_scanned++;
+            const uint64_t seq = e.header.seq;
+            const uint8_t type = e.header.type, flags = e.header.flags;
+            res->last_segment = e.vptr.segment_id;
+            res->last_end = e.vptr.offset + e.vptr.length;
+            const int rank = rebuildWinnerRank(type, flags);
+            if (rank < 0 || (type == static_cast<uint8_t>(vlog::EntryType::Delta) &&
+                             (flags & vlog::kFlagRelocated)))
+                throw VLogCorruptError("vLog entry of unknown type or a relocated Delta at segment " +
+                                       std::to_string(e.vptr.segment_id) + " offset " +
+                                       std::to_string(e.vptr.offset) + ". Nothing was modified.");
+            if (seq > max_seq) {
+                max_seq = seq;
+                if (seq > pager.maxAppliedSeq()) pager.setMaxAppliedSeq(seq);
+            }
+            if (!validKeyLen(e.key.size())) {
+                errno = 0;
+                fatal("vLog holds a key the index cannot store (length " +
+                      std::to_string(e.key.size()) + ")");
+            }
+            bool wins;
+            std::optional<vlog::IndexValueRef> cur = tree.get(e.key);
+            if (cur) {
+                if (seq != cur->seq) {
+                    wins = seq > cur->seq;
+                } else {
+                    vlog::EntryHeader ch;
+                    std::string ck;
+                    std::vector<uint8_t> cp;
+                    if (!reader.readEntry(cur->vptr, ch, ck, cp)) {
+                        errno = 0;
+                        fatal("rebuild: cannot re-read an entry it scanned at segment " +
+                              std::to_string(cur->vptr.segment_id));
+                    }
+                    wins = rank > rebuildWinnerRank(ch.type, ch.flags);
+                }
+            } else {
+                auto it = erased.find(e.key);
+                wins = it == erased.end() || seq > it->second;
+            }
+            if (!wins) continue;
+            if (type == static_cast<uint8_t>(vlog::EntryType::Tombstone)) {
+                if (cur) tree.erase(e.key);
+                erased[e.key] = seq;
+                delta_heads.erase(e.key);
+            } else {
+                vlog::IndexValueRef r{};
+                r.seq = seq;
+                r.kind = 1;
+                r.vptr = e.vptr;
+                if (tree.put(e.key, r) == BPTree::PutStatus::InvalidKey) {
+                    errno = 0;
+                    fatal("rebuild: put failed for a valid key");
+                }
+                erased.erase(e.key);
+                if (type == static_cast<uint8_t>(vlog::EntryType::Delta))
+                    delta_heads[e.key] = true;
+                else
+                    delta_heads.erase(e.key);
+            }
+            res->vlog_entries_applied++;
+            if (hooks.on_rebuild_entry) hooks.on_rebuild_entry(res->vlog_entries_applied);
+        }
+    }
+    res->last_seq = max_seq;
+    for (const auto& kv : delta_heads) {
+        std::optional<vlog::IndexValueRef> ref = tree.get(kv.first);
+        if (!ref) {
+            errno = 0;
+            fatal("rebuild: a Delta winner is missing from the tree");
+        }
+        checkWinningChain(reader, kv.first, *ref);
     }
 }
 
@@ -489,9 +698,8 @@ struct IndexOpenPlan {
 inline IndexOpenPlan planIndexOpen(const std::string& dir, const std::string& vlog_dir,
                                    const Pager::Options& opts) {
     IndexOpenPlan plan;
-    plan.vid = readVLogIdentity(vlog_dir);
     plan.sbm.reset(new SuperblockManager(dir + "/superblock.db", sbOpts(opts)));
-    plan.bc = checkCommittedIndex(dir, *plan.sbm, &plan.vid);
+    plan.bc = checkCommittedIndex(dir, *plan.sbm, &vlog_dir, &plan.vid);
     if (plan.bc.status != OpenStatus::Ok) return plan;
     const vlog::Superblock& sb = plan.bc.sb.current.sb;
     plan.from_checkpoint = true;
@@ -545,24 +753,30 @@ inline OpenIndexResult openIndexFromPlan(IndexOpenPlan plan, const std::string& 
                         plan.checkpoint_seq);
         replayVLogFrom(vlog_dir, tree, plan.replay_segment, plan.replay_offset, plan.checkpoint_seq,
                        /*expect_next=*/true, hooks, &res);
+        if (res.last_segment != plan.replay_segment)
+            res.vid = anchorIdentity(vlog_dir, res.last_segment);
         return res;
     }
 
     auto t0 = std::chrono::steady_clock::now();
     res.rebuilt = true;
-    res.vid =
-        readVLogIdentity(vlog_dir); // after the writer opened (it may have removed a ghost segment)
     if (::unlink(tmp.c_str()) != 0 && errno != ENOENT)
         fatal("unlink of leftover " + tmp + " failed");
     std::unique_ptr<Pager> np = Pager::create(tmp, opts);
     try {
         BPTree tree(*np);
-        replayVLogFrom(vlog_dir, tree, 0, vlog::kBlockSize, 0, /*expect_next=*/false, hooks, &res);
+        rebuildFromVLog(vlog_dir, tree, *np, hooks, &res);
     } catch (const VLogCorruptError&) {
         np.reset();
         if (::unlink(tmp.c_str()) != 0) fatal("unlink of " + tmp + " failed");
         if (vlog::sync_directory(dir) != 0) fatal("fsync of directory " + dir + " failed");
         throw;
+    }
+    // After the writer opened (it may have removed a ghost segment).
+    res.vid = anchorIdentity(vlog_dir, res.last_segment);
+    {
+        std::vector<uint32_t> present = listVLogSegments(vlog_dir);
+        res.oldest_segment = present.empty() ? 0 : present.front();
     }
     np->flushAndSync();
     res.sbm->remove(); // after the rebuilt index is durable; see the header comment

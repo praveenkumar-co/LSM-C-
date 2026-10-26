@@ -190,6 +190,11 @@ public:
             s->open_info_.rebuilt ? s->open_info_.last_seq : s->open_info_.checkpoint_seq;
         s->last_cp_time_ = std::chrono::steady_clock::now();
         s->vlog_bytes_at_cp_ = 0;
+        s->anchor_ = s->open_info_.vid;
+        {
+            std::vector<uint32_t> present = listVLogSegments(s->vlog_dir_);
+            s->oldest_segment_ = present.empty() ? 0 : present.front();
+        }
         if (opts.auto_checkpoint)
             s->checkpointer_ = std::thread([p = s.get()] { p->checkpointerLoop(); });
         return s;
@@ -337,8 +342,19 @@ public:
             ci.checkpoint_seq = last_applied_seq_;
             ci.replay_segment = last_applied_segment_;
             ci.replay_offset = last_applied_end_;
-            ci.vlog_first_segment = open_info_.vid.first_segment;
-            ci.vlog_created_ns = open_info_.vid.created_ns;
+            // vLog identity anchor: the replay segment (GC never unlinks it).
+            if (last_applied_segment_ != 0 && anchor_.first_segment != last_applied_segment_) {
+                VLogIdentity a = readSegmentIdentity(vlog_dir_, last_applied_segment_);
+                if (a.first_segment == 0) {
+                    errno = 0;
+                    fatal("checkpoint: replay segment " + std::to_string(last_applied_segment_) +
+                          " has no readable header");
+                }
+                anchor_ = a;
+            }
+            ci.vlog_first_segment = anchor_.first_segment;
+            ci.vlog_created_ns = anchor_.created_ns;
+            ci.oldest_live_segment = oldestSegment();
             std::function<void()> hook;
             if (trigger == CheckpointTrigger::Close && opts_.hooks.on_close_after_flush) {
                 hook = opts_.hooks.on_close_after_flush;
@@ -408,6 +424,8 @@ private:
         std::vector<uint8_t> full_payload; // the Full base entry's payload
         std::vector<DecodedDelta> deltas;  // newest first
     };
+
+    uint32_t oldestSegment() const { return oldest_segment_; }
 
     std::mutex& stripeFor(std::string_view key) {
         return stripes_[std::hash<std::string_view>{}(key) % kStripes];
@@ -612,6 +630,8 @@ private:
     uint32_t last_applied_segment_ = 0;
     uint32_t last_applied_end_ = vlog::kBlockSize;
     uint64_t last_cp_seq_ = 0; // checkpoint_seq of the last superblock (guarded by seq_mu_)
+    VLogIdentity anchor_;      // identity the next superblock records (guarded by seq_mu_)
+    uint32_t oldest_segment_ = 0; // lowest segment id present (guarded by seq_mu_)
 
     std::mutex cp_run_mu_;     // serializes checkpoint()
     mutable std::mutex cp_mu_; // guards the fields below

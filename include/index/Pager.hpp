@@ -165,8 +165,9 @@ public:
         uint64_t checkpoint_seq = 0; // every vLog entry with seq <= this is reflected in the tree
         uint32_t replay_segment = 0; // redo scan starts here (0: from the first segment)
         uint32_t replay_offset = vlog::kBlockSize;
-        uint32_t vlog_first_segment = 0; // vLog identity
+        uint32_t vlog_first_segment = 0; // vLog identity: anchor segment (IndexRecovery.hpp)
         uint64_t vlog_created_ns = 0;
+        uint32_t oldest_live_segment = 0; // lowest segment id present (0: use vlog_first_segment)
     };
 
     struct CheckpointStats {
@@ -400,7 +401,8 @@ public:
         rec.sb.replay_offset = ci.replay_offset;
         rec.sb.index_root_page = root_;
         rec.sb.index_page_count = page_count_;
-        rec.sb.oldest_live_segment = ci.vlog_first_segment;
+        rec.sb.oldest_live_segment =
+            ci.oldest_live_segment ? ci.oldest_live_segment : ci.vlog_first_segment;
         rec.ext.index_nonce = nonce_;
         rec.ext.vlog_first_segment = ci.vlog_first_segment;
         rec.ext.vlog_created_ns = ci.vlog_created_ns;

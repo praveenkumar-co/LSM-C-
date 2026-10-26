@@ -3,7 +3,7 @@
 // the flush leader: it writes everything staged so far with one write() and one F_FULLFSYNC,
 // then acks every request in that batch. append() returns only after its entry is durable.
 // Startup scans existing segments (from an optional start point) to find the highest seq, then
-// always opens a new segment.
+// always opens a new segment. appendRelocated writes GC copies that keep their original seq.
 
 #include "CRC32.hpp"
 #include "VLogFormat.hpp"
@@ -127,7 +127,8 @@ public:
             flushStagingBufferLocked();
             openNewSegmentLocked();
         }
-        // seq and offset are assigned under the same lock, so file order == seq order.
+        // seq and offset are assigned under the same lock, so file order == seq order for every
+        // entry without kFlagRelocated (appendRelocated keeps a GC copy's original seq).
         current_seq_++;
         hdr.seq = current_seq_;
         const VPtr assigned_vptr{current_segment_id_, current_offset_, total_len};
@@ -143,50 +144,93 @@ public:
         req.vptr = assigned_vptr;
         req.assigned_seq = hdr.seq;
         pending_requests_.push_back(&req);
-
-        if (flush_in_progress_) {
-            // A leader is writing; it (or the next leader) will include this request.
-            while (!req.done && !fatal_error_) req.cv.wait(lock);
-            if (req.failed || fatal_error_)
-                throw std::runtime_error("Fatal: F_FULLFSYNC batch commit failed");
-            return AppendResult{req.vptr, req.assigned_seq};
-        }
-
-        // This thread is the leader: flush batches until no request is waiting.
-        while (!pending_requests_.empty()) {
-            flush_in_progress_ = true;
-            std::vector<uint8_t> batch_bytes;
-            batch_bytes.swap(staging_buffer_);
-            std::vector<Request*> batch(pending_requests_.begin(), pending_requests_.end());
-            pending_requests_.clear();
-            const int fd = current_fd_;
-            lock.unlock(); // other threads keep staging entries during the write + fsync
-            bool ok = false;
-            if (!batch_bytes.empty() && fd >= 0) {
-                ok = write(fd, batch_bytes.data(), batch_bytes.size()) ==
-                         static_cast<ssize_t>(batch_bytes.size()) &&
-                     full_fsync(fd) == 0;
-            }
-            lock.lock();
-            if (!ok) {
-                // Never retried: after a failed fsync the page cache state is unknown.
-                for (Request* r : batch) pending_requests_.push_back(r);
-                failAllAndAbortLocked("write or F_FULLFSYNC failed for a commit batch");
-            }
-            total_fsyncs_++;
-            total_ops_ += batch.size();
-            for (Request* r : batch) {
-                r->done = true;
-                r->failed = false;
-                r->cv.notify_one();
-            }
-            if (pending_requests_.empty()) {
-                flush_in_progress_ = false;
-                cv_.notify_all();
-                break;
-            }
-        }
+        commitLocked(lock, req);
         return AppendResult{req.vptr, req.assigned_seq};
+    }
+
+    // A GC copy of an existing version (see appendRelocated).
+    struct RelocatedEntry {
+        EntryType type;
+        std::string key;
+        uint64_t seq;     // the original version's seq, not a new one
+        uint8_t flags;    // must include kFlagRelocated
+        uint32_t raw_len; // 0 = payload size
+        std::vector<uint8_t> payload;
+    };
+
+    // Appends GC copies that keep their original seq. current_seq_ does not move, so entries with
+    // kFlagRelocated are the only ones whose seq can be lower than an entry before them in the
+    // file. The batch shares one write + F_FULLFSYNC with the group commit (a rollover inside the
+    // batch adds one). Returns one VPtr per entry once all of them are durable. Throws
+    // std::invalid_argument, writing nothing, if an entry lacks kFlagRelocated, has seq 0 or a seq
+    // above the last assigned one, an empty or oversize key, or is longer than kMaxEntryLen.
+    std::vector<VPtr> appendRelocated(const std::vector<RelocatedEntry>& batch) {
+        std::vector<std::vector<uint8_t>> bufs;
+        bufs.reserve(batch.size());
+        uint64_t batch_bytes = 0;
+        for (const RelocatedEntry& r : batch) {
+            if (!(r.flags & kFlagRelocated))
+                throw std::invalid_argument("appendRelocated: entry without kFlagRelocated");
+            if (r.seq == 0) throw std::invalid_argument("appendRelocated: seq 0");
+            if (r.key.empty() || r.key.size() > UINT16_MAX)
+                throw std::invalid_argument("appendRelocated: bad key length");
+            const uint64_t total = entry_size(static_cast<uint16_t>(r.key.size()),
+                                              static_cast<uint32_t>(r.payload.size()));
+            if (r.payload.size() > kMaxEntryLen || total > kMaxEntryLen)
+                throw std::invalid_argument("appendRelocated: entry longer than kMaxEntryLen");
+            const uint16_t k_len = static_cast<uint16_t>(r.key.size());
+            const uint32_t p_len = static_cast<uint32_t>(r.payload.size());
+            std::vector<uint8_t> buf(total, 0);
+            EntryHeader hdr;
+            std::memset(&hdr, 0, sizeof(hdr));
+            hdr.total_len = static_cast<uint32_t>(total);
+            hdr.seq = r.seq;
+            hdr.type = static_cast<uint8_t>(r.type);
+            hdr.flags = r.flags;
+            hdr.key_len = k_len;
+            hdr.payload_len = p_len;
+            hdr.raw_len = r.raw_len > 0 ? r.raw_len : p_len;
+            std::memcpy(buf.data() + sizeof(EntryHeader), r.key.data(), k_len);
+            if (p_len > 0) std::memcpy(buf.data() + payload_offset(k_len), r.payload.data(), p_len);
+            std::memcpy(buf.data(), &hdr, sizeof(hdr));
+            const uint32_t crc = crc32c(buf.data() + 4, buf.size() - 4);
+            std::memcpy(buf.data(), &crc, sizeof(crc));
+            batch_bytes += total;
+            bufs.push_back(std::move(buf));
+        }
+        std::vector<VPtr> out;
+        if (batch.empty()) return out;
+        out.reserve(batch.size());
+
+        Request req;
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (fatal_error_) throw std::runtime_error("Fatal: VLogWriter in fatal error state");
+        for (const RelocatedEntry& r : batch)
+            if (r.seq > current_seq_)
+                throw std::invalid_argument("appendRelocated: seq " + std::to_string(r.seq) +
+                                            " above the last assigned seq " +
+                                            std::to_string(current_seq_));
+        if (options_.max_bytes > 0 && total_bytes_written_ + batch_bytes > options_.max_bytes) {
+            fatal_error_ = true;
+            throw std::runtime_error("Fatal: Hard write cap exceeded (" +
+                                     std::to_string(total_bytes_written_ + batch_bytes) + " > " +
+                                     std::to_string(options_.max_bytes) + ")");
+        }
+        for (const std::vector<uint8_t>& buf : bufs) {
+            const uint32_t total_len = static_cast<uint32_t>(buf.size());
+            if (current_offset_ + total_len > options_.segment_size_limit) {
+                while (flush_in_progress_) cv_.wait(lock);
+                flushStagingBufferLocked();
+                openNewSegmentLocked();
+            }
+            out.push_back(VPtr{current_segment_id_, current_offset_, total_len});
+            staging_buffer_.insert(staging_buffer_.end(), buf.begin(), buf.end());
+            current_offset_ += total_len;
+            total_bytes_written_ += total_len;
+        }
+        pending_requests_.push_back(&req);
+        commitLocked(lock, req);
+        return out;
     }
 
     uint64_t getCurrentSeq() const {
@@ -233,6 +277,53 @@ private:
         bool failed{false};
         std::condition_variable cv;
     };
+
+    // Waits until req is durable: as a follower while another thread leads, or as the leader,
+    // which flushes batches until no request is waiting. Called with req already queued.
+    void commitLocked(std::unique_lock<std::mutex>& lock, Request& req) {
+        if (flush_in_progress_) {
+            // A leader is writing; it (or the next leader) will include this request.
+            while (!req.done && !fatal_error_) req.cv.wait(lock);
+            if (req.failed || fatal_error_)
+                throw std::runtime_error("Fatal: F_FULLFSYNC batch commit failed");
+            return;
+        }
+
+        // This thread is the leader: flush batches until no request is waiting.
+        while (!pending_requests_.empty()) {
+            flush_in_progress_ = true;
+            std::vector<uint8_t> batch_bytes;
+            batch_bytes.swap(staging_buffer_);
+            std::vector<Request*> batch(pending_requests_.begin(), pending_requests_.end());
+            pending_requests_.clear();
+            const int fd = current_fd_;
+            lock.unlock(); // other threads keep staging entries during the write + fsync
+            bool ok = false;
+            if (!batch_bytes.empty() && fd >= 0) {
+                ok = write(fd, batch_bytes.data(), batch_bytes.size()) ==
+                         static_cast<ssize_t>(batch_bytes.size()) &&
+                     full_fsync(fd) == 0;
+            }
+            lock.lock();
+            if (!ok) {
+                // Never retried: after a failed fsync the page cache state is unknown.
+                for (Request* r : batch) pending_requests_.push_back(r);
+                failAllAndAbortLocked("write or F_FULLFSYNC failed for a commit batch");
+            }
+            total_fsyncs_++;
+            total_ops_ += batch.size();
+            for (Request* r : batch) {
+                r->done = true;
+                r->failed = false;
+                r->cv.notify_one();
+            }
+            if (pending_requests_.empty()) {
+                flush_in_progress_ = false;
+                cv_.notify_all();
+                break;
+            }
+        }
+    }
 
     std::string getSegmentPath(uint32_t seg_id) const {
         char buf[64];
