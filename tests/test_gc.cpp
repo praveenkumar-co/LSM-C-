@@ -1,6 +1,7 @@
 // Phase 5 tests: vLog garbage collection (docs/PHASE5_PLAN.md). Relocated entries in replay and
 // rebuild, segment-id gaps and the vLog identity anchor (P5.R, P5.G), counters (P5.A), segment
-// lifecycle, condemned list and reader pins (P5.L, P5.F), GC passes (P5.B, C, D, G3).
+// lifecycle, condemned list and reader pins (P5.L, P5.F), GC passes (P5.B, C, D, G3), races
+// (P5.E) and kill -9 at GC points (P5.H).
 #include "test_common.hpp"
 
 #include "doc/Json.hpp"
@@ -13,10 +14,13 @@
 #include "vlog/VLogWriter.hpp"
 
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstring>
 #include <filesystem>
@@ -1450,6 +1454,339 @@ static void testD5KeptTombstonesNotChurned(const std::string& dir) {
          "copying them again; rebuild keeps the erased keys absent");
 }
 
+// ------------------------------------------------------------------------------------------
+// P5.E Races, P5.H crashes
+// ------------------------------------------------------------------------------------------
+static std::string applyToCopy(const std::string& before, const Ops& ops) {
+    Value v = doc::parse(before);
+    doc::applyOps(v, ops);
+    return doc::serialize(v);
+}
+
+static bool before(const vlog::VPtr& a, const vlog::VPtr& b) {
+    return a.segment_id != b.segment_id ? a.segment_id < b.segment_id : a.offset < b.offset;
+}
+
+// Every entry of key k in the vLog, in file order.
+static std::vector<vlog::RecoveredEntry> entriesOf(const std::string& vdir, const std::string& k) {
+    std::vector<vlog::RecoveredEntry> out;
+    std::vector<uint32_t> segs = bpt::listVLogSegments(vdir);
+    vlog::VLogReader reader(vdir);
+    for (size_t i = 0; i < segs.size(); ++i)
+        for (auto& e : reader.scanSegment(segs[i], i + 1 == segs.size()).entries)
+            if (e.key == k) out.push_back(std::move(e));
+    return out;
+}
+
+static void testE1UserWriteDuringRelocation(const std::string& base_dir) {
+    banner("P5.E1 put / update / erase while GC relocates the same key");
+    CHECK(::mkdir(base_dir.c_str(), 0755) == 0);
+    const char* names[] = {"put", "update", "erase"};
+    for (int op = 0; op < 3; ++op) {
+        const std::string dir = base_dir + "/" + names[op];
+        std::thread user;
+        std::atomic<bool> done{false};
+        bool done_during_hook = true;
+        IndexedStore* sp = nullptr;
+        const Ops ops = {doc::inc("n", 5)};
+        IndexedStore::Options o = gcOpts();
+        o.on_gc_after_append = [&](uint32_t, size_t) {
+            if (user.joinable()) return;
+            user = std::thread([&, op] {
+                if (op == 0) sp->put("a0", smallDoc(77));
+                if (op == 1) sp->update("a0", ops);
+                if (op == 2) CHECK(sp->erase("a0").existed);
+                done = true;
+            });
+            // GC holds a0's stripe until its apply: the user write must still be waiting.
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            done_during_hook = done.load();
+        };
+        auto st = IndexedStore::open(dir, o);
+        sp = st.get();
+        const uint32_t s = fillSegment(*st, "a", 10);
+        for (int i = 1; i < 4; ++i) st->put("a" + std::to_string(i), smallDoc(20 + i));
+        bpt::GcReport r = st->runGcPass();
+        CHECK(r.victim == s && r.keys_relocated == 1);
+        user.join();
+        CHECK(!done_during_hook);
+        // The user's entry follows the relocated copy in the file and in seq.
+        std::vector<vlog::RecoveredEntry> es = entriesOf(dir + "/vlog", "a0");
+        const vlog::RecoveredEntry* copy = nullptr;
+        for (const auto& e : es)
+            if (e.header.flags & vlog::kFlagRelocated) copy = &e;
+        CHECK(copy != nullptr);
+        const vlog::RecoveredEntry& last = es.back();
+        CHECK(!(last.header.flags & vlog::kFlagRelocated) && before(copy->vptr, last.vptr));
+        CHECK(last.header.seq > copy->header.seq);
+        std::map<std::string, std::string> docs;
+        std::vector<std::string> absent;
+        if (op == 0) CHECK(st->get("a0") == smallDoc(77));
+        if (op == 1) CHECK(st->get("a0") == applyToCopy(smallDoc(10), ops));
+        if (op == 2) CHECK(!st->get("a0"));
+        gcUntilIdle(*st);
+        checkStoreEqualsOracle(*st, "P5.E1");
+        expectCountersExact(*st, "P5.E1");
+        for (const auto& [k, ref] : st->tree().scanFrom("", SIZE_MAX)) docs[k] = *st->get(k);
+        if (op == 2) absent.push_back("a0");
+        closeCounted(st);
+        rebuildMatches(dir, docs, absent, "P5.E1 rebuild");
+    }
+    pass("P5.E1 put, update and erase on a key GC is relocating wait for its stripe and land "
+         "after the copy; none is lost (live, after GC, after a rebuild)",
+         "3 ops");
+}
+
+// Erase of K at a staged point of GC's relocation of K; then the erased key's tombstone is
+// collected out of the vLog (its segment becomes the oldest) and a rebuild must not bring K back.
+static void eraseVsRelocationOnce(const std::string& dir, int when, std::mt19937* rng) {
+    std::thread user;
+    IndexedStore* sp = nullptr;
+    auto erase_k = [&] { CHECK(sp->erase("a0").existed); };
+    IndexedStore::Options o = gcOpts();
+    if (when == 1)
+        o.on_gc_after_append = [&](uint32_t, size_t) {
+            if (!user.joinable()) user = std::thread(erase_k);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        };
+    if (when == 2)
+        o.on_gc_after_apply = [&](uint32_t) {
+            if (!user.joinable()) user = std::thread(erase_k);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        };
+    auto st = IndexedStore::open(dir, o);
+    sp = st.get();
+    fillSegment(*st, "a", 10);
+    for (int i = 1; i < 4; ++i) st->put("a" + std::to_string(i), smallDoc(20 + i));
+    if (when == 0) erase_k();
+    if (when == 4) // random timing: the erase races the pass
+        user = std::thread([&] {
+            std::this_thread::sleep_for(std::chrono::microseconds((*rng)() % 4000));
+            erase_k();
+        });
+    st->runGcPass();
+    if (user.joinable()) user.join();
+    if (when == 3) erase_k();
+    CHECK(!st->get("a0"));
+    // No relocated copy of K lies after K's tombstone.
+    std::vector<vlog::RecoveredEntry> es = entriesOf(dir + "/vlog", "a0");
+    const vlog::RecoveredEntry* tomb = nullptr;
+    for (const auto& e : es)
+        if (e.header.type == static_cast<uint8_t>(vlog::EntryType::Tombstone) &&
+            !(e.header.flags & vlog::kFlagRelocated))
+            tomb = &e;
+    CHECK(tomb != nullptr);
+    for (const auto& e : es)
+        if ((e.header.flags & vlog::kFlagRelocated) &&
+            e.header.type == static_cast<uint8_t>(vlog::EntryType::Full))
+            CHECK(before(e.vptr, tomb->vptr) && e.header.seq < tomb->header.seq);
+    // Let the tombstone's segment become the oldest: erase every other key, then seal segments
+    // with junk that is written and erased again, so no older segment stays live. GC then
+    // collects oldest first and drops the tombstones there.
+    std::vector<std::string> absent{"a0"};
+    for (int i = 1; i < 4; ++i) {
+        CHECK(st->erase("a" + std::to_string(i)).existed);
+        absent.push_back("a" + std::to_string(i));
+    }
+    int rounds = 0;
+    for (; rounds < 10 && !entriesOf(dir + "/vlog", "a0").empty(); ++rounds) {
+        st->put("junk", bigDoc(60 + rounds)); // fills the writer's segment: the next write rolls
+        st->erase("junk");
+        gcUntilIdle(*st);
+    }
+    if (!entriesOf(dir + "/vlog", "a0").empty()) {
+        for (const auto& e : entriesOf(dir + "/vlog", "a0"))
+            std::cerr << "left: seg " << e.vptr.segment_id << " type " << int(e.header.type)
+                      << " flags " << int(e.header.flags) << " seq " << e.header.seq << "\n";
+        for (const auto& si : st->gcStats().segments)
+            std::cerr << "  seg " << si.id << " total " << si.total_bytes << " live "
+                      << si.live_bytes << " kept " << si.kept_tombstone_bytes << " "
+                      << bpt::toString(si.state) << "\n";
+    }
+    CHECK(entriesOf(dir + "/vlog", "a0").empty()); // every version and the tombstone are gone
+    CHECK(st->tree().size() == 0);
+    closeCounted(st);
+    absent.push_back("junk");
+    rebuildMatches(dir, {}, absent, "P5.E2 rebuild");
+}
+
+static void testE2EraseVsRelocation(const std::string& base_dir) {
+    banner("P5.E2 erase vs relocation");
+    CHECK(::mkdir(base_dir.c_str(), 0755) == 0);
+    std::mt19937 rng(77);
+    int runs = 0;
+    for (int when = 0; when < 4; ++when, ++runs)
+        eraseVsRelocationOnce(base_dir + "/w" + std::to_string(when), when, &rng);
+    const int kRandom = kQuick ? 2 : 12;
+    for (int i = 0; i < kRandom; ++i, ++runs)
+        eraseVsRelocationOnce(base_dir + "/r" + std::to_string(i), 4, &rng);
+    pass("P5.E2 erase before / during append / during apply / after GC, and racing at random: "
+         "no relocated copy after the tombstone; after the tombstone is dropped, rebuild keeps "
+         "the key absent",
+         std::to_string(runs) + " interleavings");
+}
+
+#ifndef TSAN_BUILD
+struct CrashExpect {
+    std::map<std::string, std::string> docs;
+    std::vector<std::string> absent;
+};
+
+// Deterministic workload: the child runs it on a store, the parent only computes the result.
+// Leaves victims with a relocatable Full, a chain whose base is in a victim, and a tombstone.
+static CrashExpect crashWorkload(IndexedStore* st) {
+    CrashExpect ex;
+    auto put = [&](const std::string& k, const std::string& d) {
+        if (st) st->put(k, d);
+        ex.docs[k] = d;
+        ex.absent.erase(std::remove(ex.absent.begin(), ex.absent.end(), k), ex.absent.end());
+    };
+    auto upd = [&](const std::string& k, const Ops& ops) {
+        if (st) st->update(k, ops);
+        ex.docs[k] = applyToCopy(ex.docs[k], ops);
+    };
+    for (const char* p : {"a", "b", "c"})
+        for (int i = 0; i < 4; ++i) put(p + std::to_string(i), smallDoc(10 + (p[0] - 'a') * 10 + i));
+    upd("a0", {doc::inc("n", 1)});
+    upd("a0", {doc::set("name", Value::string("crash"))});
+    if (st) CHECK(st->erase("b0").existed);
+    ex.docs.erase("b0");
+    ex.absent.push_back("b0");
+    for (int i = 1; i < 4; ++i) put("a" + std::to_string(i), smallDoc(40 + i));
+    put("b1", smallDoc(51));
+    put("b2", smallDoc(52));
+    put("c1", smallDoc(53));
+    put("z", smallDoc(54));
+    return ex;
+}
+
+static void copyDir(const std::string& from, const std::string& to) {
+    std::filesystem::copy(from, to, std::filesystem::copy_options::recursive);
+    uint64_t n = 0;
+    for (const auto& e : std::filesystem::recursive_directory_iterator(to))
+        if (e.is_regular_file()) n += e.file_size();
+    accountBytes(n, "directory copy");
+}
+
+static void expectState(IndexedStore& st, const CrashExpect& ex, const char* what) {
+    for (const auto& [k, d] : ex.docs) {
+        if (st.get(k) != d) std::cerr << what << ": key " << k << " wrong\n";
+        CHECK(st.get(k) == d);
+    }
+    for (const std::string& k : ex.absent) {
+        if (st.get(k)) std::cerr << what << ": erased key " << k << " came back\n";
+        CHECK(!st.get(k));
+    }
+    CHECK(st.tree().size() == ex.docs.size());
+}
+
+static void testHCrashes(const std::string& base_dir) {
+    banner("P5.H kill -9 at GC points");
+    CHECK(::mkdir(base_dir.c_str(), 0755) == 0);
+    const char* names[] = {"H1 mid-relocation (after appendRelocated, before the applies)",
+                           "H2 after relocation, before a checkpoint",
+                           "H3 between the 2 checkpoints",
+                           "H4 after unlink, before the directory fsync",
+                           "H5 after the condemning checkpoint, before the unlink"};
+    const CrashExpect ex = crashWorkload(nullptr);
+    for (int point = 0; point < 5; ++point) {
+        const std::string dir = base_dir + "/h" + std::to_string(point + 1);
+        std::cout.flush();
+        pid_t pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            childExpectsAbort();
+            IndexedStore* sp = nullptr;
+            auto die = [&] {
+                accountBytes(sp->vlogBytesWritten(), "crash child vLog");
+                raise(SIGKILL);
+            };
+            IndexedStore::Options o = gcOpts();
+            if (point == 0) o.on_gc_after_append = [&](uint32_t, size_t) { die(); };
+            if (point == 3) o.on_gc_after_unlink_before_dirsync = [&](uint32_t) { die(); };
+            if (point == 4) o.on_gc_before_unlink = [&](uint32_t) { die(); };
+            auto st = IndexedStore::open(dir, o);
+            sp = st.get();
+            crashWorkload(sp);
+            st->checkpoint();
+            if (point == 0) {
+                st->runGcPass();
+            } else if (point == 1) {
+                CHECK(st->runGcPass().action == bpt::GcReport::Action::Relocated);
+                die();
+            } else if (point == 2) {
+                CHECK(st->runGcPass().action == bpt::GcReport::Action::Relocated);
+                st->checkpoint();
+                die();
+            } else {
+                for (int i = 0; i < 50; ++i) {
+                    st->runGcPass();
+                    st->checkpoint();
+                }
+            }
+            _exit(3); // the kill point was never reached
+        }
+        int status = 0;
+        CHECK(waitpid(pid, &status, 0) == pid);
+        if (!(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL))
+            std::cerr << names[point] << ": child status " << status << "\n";
+        CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+
+        // Both superblock slots: their replay and anchor segments exist.
+        bpt::SuperblockManager m(dir + "/superblock.db");
+        bpt::SuperblockManager::LoadResult lr = m.load();
+        CHECK(lr.status == bpt::SuperblockManager::LoadResult::Status::Ok);
+        std::vector<bpt::SuperblockRecord> slots{lr.current};
+        if (lr.has_older) slots.push_back(lr.older);
+        for (const auto& sl : slots) {
+            // replay segment 0: replay from the first segment (a slot from before any entry).
+            if (sl.sb.replay_segment_id != 0) CHECK(segExists(dir, sl.sb.replay_segment_id));
+            CHECK(segExists(dir, sl.ext.vlog_first_segment));
+        }
+        // The older slot alone (newest slot damaged in a copy) also gives every acked write.
+        if (lr.has_older) {
+            const std::string cp = dir + "_older";
+            copyDir(dir, cp);
+            flipSlotByte(cp, lr.current_slot, 20);
+            auto st = IndexedStore::open(cp, gcOpts());
+            CHECK(!st->openInfo().rebuilt);
+            expectState(*st, ex, names[point]);
+            closeCounted(st);
+        }
+        // Open: only segments the current slot condemned may disappear.
+        const std::vector<uint32_t> before_open = bpt::listVLogSegments(dir + "/vlog");
+        std::vector<uint32_t> listed(lr.current.gc.ids, lr.current.gc.ids + lr.current.gc.count);
+        auto st = IndexedStore::open(dir, gcOpts());
+        CHECK(!st->openInfo().rebuilt);
+        for (uint32_t id : before_open) {
+            const bool is_listed = std::find(listed.begin(), listed.end(), id) != listed.end();
+            CHECK(segExists(dir, id) == !is_listed);
+        }
+        if (point == 4) CHECK(st->gcOpenStats().segments_removed == 1);
+        expectState(*st, ex, names[point]);
+        checkStoreEqualsOracle(*st, names[point]);
+        expectCountersExact(*st, names[point]);
+        // GC continues from here to idle.
+        gcUntilIdle(*st);
+        expectState(*st, ex, names[point]);
+        closeCounted(st);
+        rebuildMatches(dir, ex.docs, ex.absent, names[point]);
+        pass(std::string("P5.") + names[point] +
+             ": acked writes intact, no resurrection, both slots' segments present, rebuild "
+             "matches");
+    }
+}
+#endif
+
+static void testH(const std::string& base_dir) {
+#ifdef TSAN_BUILD
+    skip("P5.H1-H5 kill -9 at GC points", "fork + kill -9 not run under ThreadSanitizer");
+    (void)base_dir;
+#else
+    testHCrashes(base_dir);
+#endif
+}
+
 int main() {
     std::string dir = setupRun("gc_test");
     Cleaner cleaner{dir};
@@ -1481,6 +1818,9 @@ int main() {
     testD5KeptTombstonesNotChurned(dir + "/d5");
     testF1ReaderDuringGc(dir + "/f1");
     testG3ManyPasses(dir + "/g3");
+    testE1UserWriteDuringRelocation(dir + "/e1");
+    testE2EraseVsRelocation(dir + "/e2");
+    testH(dir + "/h");
     printBudget();
     return 0;
 }

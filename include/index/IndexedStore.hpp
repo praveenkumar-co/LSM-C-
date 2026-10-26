@@ -705,7 +705,8 @@ private:
     // Eligible: Sealed, below the writer's segment and below the segment of the last applied entry
     // (so every entry in it is applied). Fast path: the lowest such id with live_bytes == 0 and
     // no kept tombstones. Otherwise the lowest ratio (live + kept tombstone bytes) / total below
-    // gc_threshold; ties: the lowest id. 0: none.
+    // gc_threshold; ties: the lowest id. 0: none. In the oldest segment kept tombstones count as
+    // free: they are dropped there.
     uint32_t pickVictim(bool* fast, double* ratio) {
         const uint32_t active = writer_->getCurrentSegmentId();
         uint32_t applied_seg;
@@ -716,16 +717,17 @@ private:
         std::lock_guard<std::mutex> lk(gc_mu_);
         uint32_t best = 0;
         double best_ratio = 2.0;
+        const uint32_t oldest = segs_.empty() ? 0 : segs_.begin()->first;
         for (const auto& [id, st] : segs_) {
             if (id >= active || id >= applied_seg) break; // ascending: the rest are newer
             if (st.state != SegmentState::Sealed) continue;
-            if (st.live_bytes == 0 && st.kept_tombstone_bytes == 0) {
+            const uint64_t kept = id == oldest ? 0 : st.kept_tombstone_bytes;
+            if (st.live_bytes == 0 && kept == 0) {
                 *fast = true;
                 *ratio = 0;
                 return id;
             }
-            const double r =
-                double(st.live_bytes + st.kept_tombstone_bytes) / double(st.total_bytes);
+            const double r = double(st.live_bytes + kept) / double(st.total_bytes);
             if (r < opts_.gc_threshold && r < best_ratio) {
                 best = id;
                 best_ratio = r;
