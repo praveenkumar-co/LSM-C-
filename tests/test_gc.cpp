@@ -1,6 +1,6 @@
 // Phase 5 tests: vLog garbage collection (docs/PHASE5_PLAN.md). Relocated entries in replay and
 // rebuild, segment-id gaps and the vLog identity anchor (P5.R, P5.G), counters (P5.A), segment
-// lifecycle, condemned list and reader pins (P5.L, P5.F).
+// lifecycle, condemned list and reader pins (P5.L, P5.F), GC passes (P5.B, C, D, G3).
 #include "test_common.hpp"
 
 #include "doc/Json.hpp"
@@ -23,6 +23,7 @@
 #include <fstream>
 #include <map>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -1005,6 +1006,450 @@ static void testL3CondemnedListLimit(const std::string& dir) {
          "condemns 32, waits for room, then the last 2");
 }
 
+// ------------------------------------------------------------------------------------------
+// P5.B, C, D, F1, G3: GC passes (runGcPass)
+// ------------------------------------------------------------------------------------------
+// GC tests count vLog bytes from the writer (segments GC unlinked are gone from disk).
+static IndexedStore::Options gcOpts(uint32_t seg_limit = 8 * 1024) {
+    IndexedStore::Options o = storeOpts(seg_limit);
+    o.gc_rate_mb_s = 0;
+    return o;
+}
+static void closeCounted(std::unique_ptr<IndexedStore>& st) {
+    accountBytes(st->vlogBytesWritten(), "vLog bytes written by this store");
+    st->close();
+    st.reset();
+}
+
+// GC passes and checkpoints until no victim is left and nothing waits (at most max_rounds).
+static uint32_t gcUntilIdle(IndexedStore& st, int max_rounds = 1000) {
+    uint32_t unlinked = 0;
+    for (int i = 0; i < max_rounds; ++i) {
+        bpt::GcReport r = st.runGcPass();
+        unlinked += r.unlinked;
+        if (r.action == bpt::GcReport::Action::None && !st.gcPending()) return unlinked;
+        if (i + 3 >= max_rounds)
+            std::cerr << "gcUntilIdle round " << i << ": action " << int(r.action) << " victim "
+                      << r.victim << " ratio " << r.victim_live_ratio << " relocated "
+                      << r.keys_relocated << " tomb kept " << r.tombstones_kept << " condemned "
+                      << r.condemned << " unlinked " << r.unlinked << "\n";
+        st.checkpoint();
+    }
+    if (st.gcPending()) {
+        std::cerr << "gcUntilIdle: still pending after " << max_rounds << " rounds; epoch "
+                  << st.pager().committedEpoch() << ", condemned list "
+                  << st.condemnedForTest().size() << ", read pins " << st.activeReadPinsForTest()
+                  << "\n";
+        for (const auto& si : st.gcStats().segments) {
+            const bpt::SegStats ss = st.segStatsForTest(si.id);
+            if (si.state != bpt::SegmentState::Sealed && si.state != bpt::SegmentState::Active)
+                std::cerr << "  segment " << si.id << " " << bpt::toString(si.state)
+                          << " ready_at " << ss.ready_at_epoch << " condemned_epoch "
+                          << ss.condemned_epoch << "\n";
+        }
+    }
+    CHECK(!st.gcPending());
+    return unlinked;
+}
+
+// 976-byte documents: entries of 1016 bytes (keys up to 8 bytes), so exactly four fill an
+// 8 KiB segment and not even a tombstone fits after them. ids 10..99 give equal sizes.
+static std::string smallDoc(int id) { return padDoc(id, 937); }
+static uint32_t segOf(IndexedStore& st, const std::string& k) {
+    return st.tree().get(k)->vptr.segment_id;
+}
+
+static void rebuildMatches(const std::string& dir, const std::map<std::string, std::string>& docs,
+                           const std::vector<std::string>& absent, const char* what) {
+    removeSuperblock(dir);
+    auto st = IndexedStore::open(dir, gcOpts());
+    CHECK(st->openInfo().rebuilt);
+    for (const auto& [k, d] : docs) {
+        if (st->get(k) != d) std::cerr << what << ": key " << k << " differs after rebuild\n";
+        CHECK(st->get(k) == d);
+    }
+    for (const std::string& k : absent) {
+        if (st->get(k)) std::cerr << what << ": key " << k << " came back after rebuild\n";
+        CHECK(!st->get(k));
+    }
+    checkStoreEqualsOracle(*st, what);
+    expectCountersExact(*st, what);
+    closeCounted(st);
+}
+
+static void testB1NeededTombstone(const std::string& dir) {
+    banner("P5.B1 0-live segment with a needed tombstone is not deleted without relocating it");
+    auto st = IndexedStore::open(dir, gcOpts());
+    const std::string md = padDoc(1, 1450); // two per segment
+    st->put("a", padDoc(11, 1450));
+    st->put("k", md);
+    const uint32_t s1 = segOf(*st, "a");
+    CHECK(segOf(*st, "k") == s1);
+    st->put("f", padDoc(12, 1450));
+    CHECK(st->erase("k").existed); // tombstone in s2
+    st->put("g", padDoc(13, 1450));
+    const uint32_t s2 = segOf(*st, "f");
+    CHECK(s2 == s1 + 1 && segOf(*st, "g") == s2);
+    st->put("f", padDoc(14, 1450));
+    st->put("g", padDoc(15, 1450));
+    st->put("z", padDoc(16, 1450));
+    CHECK(st->segStatsForTest(s2).live_bytes == 0);
+    bpt::GcReport r = st->runGcPass();
+    CHECK(r.victim == s2 && r.action == bpt::GcReport::Action::Relocated);
+    CHECK(r.tombstones_kept == 1 && r.keys_relocated == 0 && !r.counter_mismatch);
+    gcUntilIdle(*st);
+    CHECK(!segExists(dir, s2) && segExists(dir, s1)); // s1 still holds k's old version
+    std::map<std::string, std::string> docs{{"a", padDoc(11, 1450)}, {"f", padDoc(14, 1450)},
+                                            {"g", padDoc(15, 1450)}, {"z", padDoc(16, 1450)}};
+    checkStoreEqualsOracle(*st, "P5.B1 live");
+    expectCountersExact(*st, "P5.B1");
+    closeCounted(st);
+    rebuildMatches(dir, docs, {"k"}, "P5.B1 rebuild");
+    pass("P5.B1 0-live segment above an older one holding k's old version: its tombstone is "
+         "relocated (no fast path); rebuild after the unlink keeps k absent");
+}
+
+static void testB2WrongCounter(const std::string& dir) {
+    banner("P5.B2 the verification scan catches a wrong counter");
+    auto st = IndexedStore::open(dir, gcOpts());
+    st->put("x", bigDoc(1));
+    const uint32_t s1 = segOf(*st, "x");
+    st->put("y", bigDoc(2));
+    st->put("z", bigDoc(3));
+    st->setLiveBytesForTest(s1, 0); // wrong: x is live in s1
+    bpt::GcReport r = st->runGcPass();
+    CHECK(r.victim == s1 && r.counter_mismatch && r.action == bpt::GcReport::Action::Relocated);
+    CHECK(r.keys_relocated == 1);
+    CHECK(st->gcStats().counter_mismatches == 1);
+    expectCountersExact(*st, "P5.B2 after the recount");
+    gcUntilIdle(*st);
+    CHECK(!segExists(dir, s1) && st->get("x") == bigDoc(1));
+    checkStoreEqualsOracle(*st, "P5.B2");
+    closeCounted(st);
+    rebuildMatches(dir, {{"x", bigDoc(1)}, {"y", bigDoc(2)}, {"z", bigDoc(3)}}, {}, "P5.B2 rebuild");
+    pass("P5.B2 live_bytes forced to 0 on a live segment: scan finds x, counter_mismatches == 1, "
+         "x relocated, nothing lost");
+}
+
+static void testB3DeadSegment(const std::string& dir) {
+    banner("P5.B3 a dead segment takes the fast path");
+    auto st = IndexedStore::open(dir, gcOpts());
+    const uint32_t x = makeDeadSegment(*st, 1);
+    st->put("w", bigDoc(7));
+    bpt::GcReport r = st->runGcPass();
+    CHECK(r.victim == x && r.action == bpt::GcReport::Action::FastPath);
+    CHECK(r.bytes_written == 0 && r.bytes_scanned > 0 && r.entries_scanned == 1);
+    CHECK(st->gcStats().verify_scans == 1);
+    gcUntilIdle(*st);
+    CHECK(!segExists(dir, x));
+    checkStoreEqualsOracle(*st, "P5.B3");
+    closeCounted(st);
+    pass("P5.B3 dead segment: fast path, 0 bytes written, verification scan " +
+             std::to_string(r.bytes_scanned) + " bytes",
+         "pass " + std::to_string(r.ms).substr(0, 5) + " ms");
+}
+
+// Four ~1 KB documents per segment: prefix p, ids base..base+3. Returns the segment.
+static uint32_t fillSegment(IndexedStore& st, const std::string& p, int base) {
+    for (int i = 0; i < 4; ++i) st.put(p + std::to_string(i), smallDoc(base + i));
+    const uint32_t s = segOf(st, p + "0");
+    for (int i = 1; i < 4; ++i) CHECK(segOf(st, p + std::to_string(i)) == s);
+    return s;
+}
+
+static void testC1Threshold(const std::string& dir) {
+    banner("P5.C1 threshold respected");
+    auto st = IndexedStore::open(dir, gcOpts());
+    const uint32_t a = fillSegment(*st, "a", 10);
+    const uint32_t b = fillSegment(*st, "b", 20);
+    fillSegment(*st, "c", 30);
+    st->put("a0", smallDoc(40)); // A: 3 of 4 live (0.75)
+    st->put("b0", smallDoc(41));
+    st->put("b1", smallDoc(42)); // B: 2 of 4 live (0.5, not below 0.5)
+    st->put("d", smallDoc(43));
+    CHECK(st->runGcPass().action == bpt::GcReport::Action::None);
+    st->put("b2", smallDoc(44)); // B: 1 of 4 (0.25)
+    bpt::GcReport r = st->runGcPass();
+    CHECK(r.victim == b && r.action == bpt::GcReport::Action::Relocated && r.keys_relocated == 1);
+    CHECK(r.victim_live_ratio > 0.24 && r.victim_live_ratio < 0.26);
+    gcUntilIdle(*st);
+    CHECK(segExists(dir, a) && !segExists(dir, b));
+    checkStoreEqualsOracle(*st, "P5.C1");
+    expectCountersExact(*st, "P5.C1");
+    closeCounted(st);
+    pass("P5.C1 threshold 0.5: segments at 0.75 and 0.5 are left alone; at 0.25 relocated");
+}
+
+static void testC2ActiveNeverChosen(const std::string& dir) {
+    banner("P5.C2 the active segment is never a victim");
+    auto st = IndexedStore::open(dir, gcOpts());
+    st->put("k", smallDoc(10));
+    st->put("k", smallDoc(11));
+    st->erase("k");
+    const uint32_t active = st->tree().get("k") ? 0 : st->gcStats().segments.back().id;
+    CHECK(st->segStatsForTest(active).live_bytes == 0 &&
+          st->segStatsForTest(active).total_bytes > 0);
+    CHECK(st->gcStats().segments.back().state == bpt::SegmentState::Active);
+    CHECK(st->runGcPass().action == bpt::GcReport::Action::None);
+    CHECK(segExists(dir, active));
+    closeCounted(st);
+    pass("P5.C2 a 0-live active segment (also the last applied one) is never picked");
+}
+
+static void testC3TieOldest(const std::string& dir) {
+    banner("P5.C3 equal ratios: the oldest segment first");
+    auto st = IndexedStore::open(dir, gcOpts());
+    const uint32_t a = fillSegment(*st, "a", 10);
+    const uint32_t b = fillSegment(*st, "b", 20);
+    for (int i = 1; i < 4; ++i) st->put("b" + std::to_string(i), smallDoc(50 + i));
+    for (int i = 1; i < 4; ++i) st->put("a" + std::to_string(i), smallDoc(60 + i));
+    st->put("d", smallDoc(70));
+    CHECK(st->segStatsForTest(a).live_bytes == st->segStatsForTest(b).live_bytes);
+    CHECK(st->runGcPass().victim == a);
+    CHECK(st->runGcPass().victim == b);
+    gcUntilIdle(*st);
+    checkStoreEqualsOracle(*st, "P5.C3");
+    closeCounted(st);
+    pass("P5.C3 two segments at 0.25: the lower id is picked first");
+}
+
+static void testD1FullRelocated(const std::string& dir) {
+    banner("P5.D1 a Full head is copied with its original seq");
+    auto st = IndexedStore::open(dir, gcOpts());
+    const uint32_t s = fillSegment(*st, "a", 10);
+    const vlog::IndexValueRef before = *st->tree().get("a0");
+    for (int i = 1; i < 4; ++i) st->put("a" + std::to_string(i), smallDoc(20 + i));
+    bpt::GcReport r = st->runGcPass();
+    CHECK(r.victim == s && r.keys_relocated == 1 && r.chains_consolidated == 0 && r.batches == 1);
+    const vlog::IndexValueRef after = *st->tree().get("a0");
+    CHECK(after.seq == before.seq && after.vptr.segment_id != s);
+    std::vector<uint8_t> pl;
+    vlog::EntryHeader h = rawEntry(dir + "/vlog", after.vptr, &pl);
+    CHECK(h.flags == vlog::kFlagRelocated && h.type == static_cast<uint8_t>(vlog::EntryType::Full));
+    uint64_t seq = 0;
+    CHECK(st->get("a0", &seq) == smallDoc(10) && seq == before.seq);
+    CHECK(std::string(pl.begin(), pl.end()) == smallDoc(10));
+    gcUntilIdle(*st);
+    checkStoreEqualsOracle(*st, "P5.D1");
+    expectCountersExact(*st, "P5.D1");
+    closeCounted(st);
+    pass("P5.D1 Full relocated: kFlagRelocated, same seq, same bytes from get()");
+}
+
+static void testD2ChainAcrossVictim(const std::string& dir) {
+    banner("P5.D2 a chain spanning victim and non-victim segments");
+    auto st = IndexedStore::open(dir, gcOpts());
+    const uint32_t s = fillSegment(*st, "a", 10); // a0 is the chain's Full base
+    fillSegment(*st, "b", 20);
+    CHECK(st->update("a0", {doc::inc("n", 1)}).chain_depth == 1);
+    CHECK(st->update("a0", {doc::set("name", Value::string("moved"))}).chain_depth == 2);
+    for (int i = 1; i < 4; ++i) st->put("a" + std::to_string(i), smallDoc(30 + i));
+    const vlog::IndexValueRef head = *st->tree().get("a0");
+    CHECK(head.vptr.segment_id != s);
+    const std::string want = *st->get("a0");
+    bpt::GcReport r = st->runGcPass();
+    CHECK(r.victim == s && r.keys_relocated == 1 && r.chains_consolidated == 1);
+    const vlog::IndexValueRef after = *st->tree().get("a0");
+    CHECK(after.seq == head.seq);
+    vlog::EntryHeader h = rawEntry(dir + "/vlog", after.vptr);
+    CHECK(h.flags == (vlog::kFlagRelocated | vlog::kFlagConsolidated));
+    bpt::ReadStats rs;
+    uint64_t seq = 0;
+    CHECK(st->get("a0", &seq, &rs) == want && seq == head.seq && rs.chain_depth == 0);
+    CHECK(st->update("a0", {doc::inc("n", 1)}).chain_depth == 1);
+    expectCountersExact(*st, "P5.D2");
+    gcUntilIdle(*st);
+    CHECK(!segExists(dir, s));
+    checkStoreEqualsOracle(*st, "P5.D2");
+    std::map<std::string, std::string> docs;
+    for (const auto& [k, ref] : st->tree().scanFrom("", SIZE_MAX)) docs[k] = *st->get(k);
+    closeCounted(st);
+    rebuildMatches(dir, docs, {}, "P5.D2 rebuild");
+    pass("P5.D2 chain base in the victim, deltas elsewhere: one consolidated Full (head seq), "
+         "same bytes, update() continues; rebuild matches");
+}
+
+static void testD3D4Tombstones(const std::string& dir) {
+    banner("P5.D3 tombstone relocated from a non-oldest victim; P5.D4 dropped from the oldest");
+    auto st = IndexedStore::open(dir, gcOpts());
+    // s1: k, a1, a2, a3 (a1, a2 stay live: ratio 0.5, never a victim while they live).
+    st->put("k", smallDoc(10));
+    for (int i = 1; i < 4; ++i) st->put("a" + std::to_string(i), smallDoc(10 + i));
+    const uint32_t s1 = segOf(*st, "k");
+    // s2: tombstone(k), b1, b2, b3; then b2, b3 overwritten (ratio about 1/3).
+    CHECK(st->erase("k").existed);
+    for (int i = 1; i < 4; ++i) st->put("b" + std::to_string(i), smallDoc(20 + i));
+    const uint32_t s2 = segOf(*st, "b1");
+    CHECK(s2 == s1 + 1);
+    st->put("a3", smallDoc(33));
+    st->put("b2", smallDoc(34));
+    st->put("b3", smallDoc(35));
+    st->put("z", smallDoc(36));
+    bpt::GcReport r = st->runGcPass();
+    CHECK(r.victim == s2 && r.tombstones_kept == 1 && r.keys_relocated == 1);
+    gcUntilIdle(*st);
+    CHECK(!segExists(dir, s2) && segExists(dir, s1));
+    std::map<std::string, std::string> docs;
+    for (const auto& [k, ref] : st->tree().scanFrom("", SIZE_MAX)) docs[k] = *st->get(k);
+    closeCounted(st);
+    rebuildMatches(dir, docs, {"k"}, "P5.D3 rebuild");
+
+    // P5.D4: a fresh store whose oldest segment holds k, k's tombstone and a1..a3.
+    const std::string d4 = dir + "_d4";
+    st = IndexedStore::open(d4, gcOpts());
+    // 984-byte entries: k, its tombstone and a1..a3 fit in one segment.
+    st->put("k", padDoc(10, 900));
+    CHECK(st->erase("k").existed);
+    for (int i = 1; i < 4; ++i) st->put("a" + std::to_string(i), padDoc(10 + i, 900));
+    const uint32_t o1 = segOf(*st, "a1");
+    CHECK(segOf(*st, "a3") == o1 && o1 == 1);
+    st->put("a2", padDoc(42, 900));
+    st->put("a3", padDoc(43, 900));
+    st->put("z", padDoc(44, 900));
+    r = st->runGcPass();
+    CHECK(r.victim == o1 && r.tombstones_kept == 0 && r.tombstones_dropped == 1);
+    CHECK(r.keys_relocated == 1);
+    gcUntilIdle(*st);
+    docs.clear();
+    for (const auto& [k, ref] : st->tree().scanFrom("", SIZE_MAX)) docs[k] = *st->get(k);
+    closeCounted(st);
+    rebuildMatches(d4, docs, {"k"}, "P5.D4 rebuild");
+    pass("P5.D3 tombstone in a non-oldest victim relocated; rebuild keeps k absent");
+    pass("P5.D4 tombstone in the oldest segment dropped; rebuild keeps k absent");
+}
+
+static void testF1ReaderDuringGc(const std::string& dir) {
+    banner("P5.F1 reader holds an index ref while GC relocates and 2 checkpoints pass");
+    std::mutex mu;
+    std::condition_variable cv;
+    bool reached = false, release = false, armed = true;
+    IndexedStore::Options o = gcOpts();
+    o.on_get_after_index_read = [&](std::string_view key) {
+        if (key != "a0") return;
+        std::unique_lock<std::mutex> lk(mu);
+        if (!armed) return;
+        armed = false;
+        reached = true;
+        cv.notify_all();
+        cv.wait(lk, [&] { return release; });
+    };
+    auto st = IndexedStore::open(dir, o);
+    const uint32_t s = fillSegment(*st, "a", 10);
+    for (int i = 1; i < 4; ++i) st->put("a" + std::to_string(i), smallDoc(20 + i));
+    std::optional<std::string> got;
+    std::thread reader([&] { got = st->get("a0"); });
+    {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&] { return reached; });
+    }
+    bpt::GcReport r = st->runGcPass(); // relocates a0 while the reader holds its old VPtr
+    CHECK(r.victim == s && r.keys_relocated == 1);
+    for (int i = 0; i < 3; ++i) {
+        st->checkpoint();
+        CHECK(st->runGcPass().condemned == 0);
+    }
+    CHECK(segExists(dir, s));
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        release = true;
+    }
+    cv.notify_all();
+    reader.join();
+    CHECK(got == smallDoc(10));
+    gcUntilIdle(*st);
+    CHECK(!segExists(dir, s));
+    checkStoreEqualsOracle(*st, "P5.F1");
+    closeCounted(st);
+    pass("P5.F1 reader with an old index ref: GC relocates, 3 checkpoints pass, segment kept "
+         "until the reader is done; it gets the right document");
+}
+
+static void testG3ManyPasses(const std::string& dir) {
+    banner("P5.G3 full rebuild after many GC passes equals the live state");
+    if (kQuick) {
+        skip("P5.G3 rebuild after 20 GC passes", "full mode only (multi-pass)");
+        return;
+    }
+    auto st = IndexedStore::open(dir, gcOpts(16 * 1024));
+    std::mt19937 rng(5);
+    const int kKeys = 300;
+    int passes = 0;
+    for (int round = 0; round < 20; ++round) {
+        for (int i = 0; i < 400; ++i) {
+            const std::string k = "k" + std::to_string(rng() % kKeys);
+            const int op = static_cast<int>(rng() % 10);
+            if (op < 4) {
+                st->put(k, padDoc(10 + static_cast<int>(rng() % 80), 300 + rng() % 600));
+            } else if (op < 8) {
+                if (st->get(k)) st->update(k, {doc::inc("n", 1)});
+            } else {
+                st->erase(k);
+            }
+        }
+        for (int p = 0; p < 6; ++p) {
+            bpt::GcReport r = st->runGcPass();
+            passes++;
+            if (r.action == bpt::GcReport::Action::None && !st->gcPending()) break;
+            st->checkpoint();
+        }
+        expectCountersExact(*st, "P5.G3 round");
+    }
+    gcUntilIdle(*st);
+    std::map<std::string, std::string> docs;
+    std::vector<std::string> absent;
+    for (int i = 0; i < kKeys; ++i) {
+        const std::string k = "k" + std::to_string(i);
+        if (auto d = st->get(k)) docs[k] = *d; else absent.push_back(k);
+    }
+    const uint64_t unlinked = st->gcStats().segments_unlinked;
+    checkStoreEqualsOracle(*st, "P5.G3 live");
+    closeCounted(st);
+    rebuildMatches(dir, docs, absent, "P5.G3 rebuild");
+    pass("P5.G3 " + std::to_string(passes) + " GC passes, " + std::to_string(unlinked) +
+         " segments unlinked: full rebuild == live state == oracle");
+}
+
+// A segment holding only tombstones GC kept is not picked again and rewritten in a loop while
+// an older segment that needs them stays.
+static void testD5KeptTombstonesNotChurned(const std::string& dir) {
+    banner("P5.D5 kept tombstones are not relocated again and again");
+    auto st = IndexedStore::open(dir, gcOpts());
+    // s1: a (live) + old versions of t0..t2: ratio about 0.7, never a victim.
+    st->put("a", padDoc(11, 2000));
+    for (int i = 0; i < 3; ++i) st->put("t" + std::to_string(i), padDoc(20 + i, 200));
+    const uint32_t s1 = segOf(*st, "a");
+    CHECK(segOf(*st, "t2") == s1);
+    // s2: h + the tombstones of t0..t2; then h is overwritten, so s2 is 0-live but its
+    // tombstones are needed (s1 is older and holds t0..t2).
+    st->put("h", bigDoc(30));
+    const uint32_t s2 = segOf(*st, "h");
+    CHECK(s2 == s1 + 1);
+    for (int i = 0; i < 3; ++i) CHECK(st->erase("t" + std::to_string(i)).existed);
+    st->put("h", bigDoc(31));
+    st->put("z", bigDoc(32));
+    CHECK(st->segStatsForTest(s2).live_bytes == 0);
+    gcUntilIdle(*st);
+    CHECK(!segExists(dir, s2));
+    const bpt::GcStats g1 = st->gcStats();
+    CHECK(g1.relocated_entries >= 3); // the 3 tombstones, kept because s1 is older
+    // Seal the segment holding the kept tombstones and run GC to idle again: nothing is copied.
+    for (int i = 0; i < 4; ++i) st->put("g" + std::to_string(i), bigDoc(40 + i));
+    for (int i = 0; i < 4; ++i) st->put("g" + std::to_string(i), bigDoc(50 + i));
+    gcUntilIdle(*st);
+    const bpt::GcStats g2 = st->gcStats();
+    uint64_t kept = 0;
+    for (const auto& si : g2.segments) kept += si.kept_tombstone_bytes;
+    CHECK(kept == 3 * vlog::entry_size(2, 0));
+    CHECK(g2.relocated_entries - g1.relocated_entries <= 4); // the g copies at most, never t*
+    CHECK(segExists(dir, s1));
+    std::map<std::string, std::string> docs;
+    for (const auto& [k, ref] : st->tree().scanFrom("", SIZE_MAX)) docs[k] = *st->get(k);
+    closeCounted(st);
+    rebuildMatches(dir, docs, {"t0", "t1", "t2"}, "P5.D5 rebuild");
+    pass("P5.D5 a segment of kept tombstones counts them as occupied: GC reaches idle without "
+         "copying them again; rebuild keeps the erased keys absent");
+}
+
 int main() {
     std::string dir = setupRun("gc_test");
     Cleaner cleaner{dir};
@@ -1024,6 +1469,18 @@ int main() {
     testG2NewestSlotCorrupt(dir + "/g2");
     testL2CleanupAtOpen(dir + "/l2");
     testL3CondemnedListLimit(dir + "/l3");
+    testB1NeededTombstone(dir + "/b1");
+    testB2WrongCounter(dir + "/b2");
+    testB3DeadSegment(dir + "/b3");
+    testC1Threshold(dir + "/c1");
+    testC2ActiveNeverChosen(dir + "/c2");
+    testC3TieOldest(dir + "/c3");
+    testD1FullRelocated(dir + "/d1");
+    testD2ChainAcrossVictim(dir + "/d2");
+    testD3D4Tombstones(dir + "/d3");
+    testD5KeptTombstonesNotChurned(dir + "/d5");
+    testF1ReaderDuringGc(dir + "/f1");
+    testG3ManyPasses(dir + "/g3");
     printBudget();
     return 0;
 }

@@ -39,6 +39,10 @@ inline const char* toString(SegmentState s) {
 struct SegStats {
     uint64_t total_bytes = 0; // sum of total_len of every entry (the 4 KiB header excluded)
     uint64_t live_bytes = 0;  // sum of total_len of live entries (index heads and their chains)
+    // Tombstones GC relocated into this segment because they were still needed. Not liveness
+    // (erased keys are not in the index): victim selection counts them as occupied, so a
+    // segment of kept tombstones is not picked again and rewritten in a loop. In memory only.
+    uint64_t kept_tombstone_bytes = 0;
     SegmentState state = SegmentState::Sealed;
     uint64_t ready_at_epoch = 0;  // WaitingForCheckpoints: committed epoch needed (E + 2)
     uint64_t retire_epoch = 0;    // WaitingForCheckpoints: reader epoch at retirement
@@ -51,6 +55,7 @@ struct SegmentInfo {
     uint64_t total_bytes = 0;
     uint64_t live_bytes = 0;
     SegmentState state = SegmentState::Sealed;
+    uint64_t kept_tombstone_bytes = 0;
 };
 
 struct GcStats {

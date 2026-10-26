@@ -164,7 +164,13 @@ public:
         uint16_t delta_chain_cap = vlog::kMaxDeltaChain;
         // Largest document put() and update() accept; 0 = the largest payload the vLog accepts.
         uint32_t max_document_bytes = 0;
+        // GC (plan sections 2, 3). runGcPass() runs one pass on the caller's thread.
+        double gc_threshold = 0.5;              // victims: live/total below this, in (0, 1)
+        uint64_t gc_batch_bytes = 1024 * 1024;  // relocations per appendRelocated (one fsync)
+        uint32_t gc_rate_mb_s = 32;             // GC vLog writes per second (0: no limit)
         // Test-only hooks.
+        std::function<void(uint32_t victim, size_t entries)> on_gc_after_append;
+        std::function<void(uint32_t victim)> on_gc_after_apply;
         std::function<void(std::string_view key)> on_get_after_index_read;
         std::function<void(uint32_t segment)> on_gc_before_unlink;
         std::function<void(uint32_t segment)> on_gc_after_unlink_before_dirsync;
@@ -182,6 +188,9 @@ public:
         if (opts.max_document_bytes > doc::kMaxDocBytes)
             throw std::invalid_argument("max_document_bytes above " +
                                         std::to_string(doc::kMaxDocBytes));
+        if (!(opts.gc_threshold > 0.0 && opts.gc_threshold < 1.0))
+            throw std::invalid_argument("gc_threshold must be in (0, 1)");
+        if (opts.gc_batch_bytes == 0) throw std::invalid_argument("gc_batch_bytes must be > 0");
         if (::mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) fatal("mkdir failed for " + dir);
         std::unique_ptr<IndexedStore> s(new IndexedStore(dir, opts));
         Pager::Options po;
@@ -472,7 +481,7 @@ public:
         g.segments.clear();
         g.total_bytes = g.live_bytes = g.disk_bytes = 0;
         for (const auto& [id, st] : segs_) {
-            SegmentInfo si{id, st.total_bytes, st.live_bytes, st.state};
+            SegmentInfo si{id, st.total_bytes, st.live_bytes, st.state, st.kept_tombstone_bytes};
             if (id == active) si.state = SegmentState::Active;
             g.segments.push_back(si);
             g.total_bytes += st.total_bytes;
@@ -483,6 +492,44 @@ public:
         return g;
     }
     const GcOpenStats& gcOpenStats() const { return gc_open_; }
+
+    // One GC pass (plan sections 2-4): advance segment lifecycles (unlink what a committed
+    // superblock condemned, condemn what is ready), then pick at most one victim and either retire
+    // it without copying (fast path, after a verification scan) or relocate its live data in
+    // batches and retire it. Safe while other threads use the store; one pass at a time.
+    GcReport runGcPass() {
+        std::lock_guard<std::mutex> run(gc_run_mu_);
+        const auto t0 = std::chrono::steady_clock::now();
+        GcReport rep;
+        advanceLifecycle(&rep);
+        bool fast = false;
+        const uint32_t victim = pickVictim(&fast, &rep.victim_live_ratio);
+        if (victim != 0) {
+            rep.victim = victim;
+            collectVictim(victim, fast, &rep);
+        }
+        rep.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                     .count();
+        std::lock_guard<std::mutex> lk(gc_mu_);
+        gc_totals_.passes++;
+        return rep;
+    }
+
+    // True while some segment waits for checkpoints, or is condemned but not yet unlinked.
+    bool gcPending() const {
+        std::lock_guard<std::mutex> lk(gc_mu_);
+        for (const auto& [id, st] : segs_)
+            if (st.state == SegmentState::WaitingForCheckpoints ||
+                st.state == SegmentState::Condemned || st.state == SegmentState::Migrating)
+                return true;
+        return false;
+    }
+
+    // Test-only: overwrite a segment's live_bytes (to show the verification scan catches it).
+    void setLiveBytesForTest(uint32_t id, uint64_t live) {
+        std::lock_guard<std::mutex> lk(gc_mu_);
+        segs_[id].live_bytes = live;
+    }
 
     // Test-only: retires a Sealed segment that holds nothing live (as GC does after relocating
     // it). Throws std::logic_error if it is not eligible.
@@ -653,6 +700,288 @@ private:
         }
     }
 
+    // ---- GC pass (plan sections 2, 3) ----
+
+    // Eligible: Sealed, below the writer's segment and below the segment of the last applied entry
+    // (so every entry in it is applied). Fast path: the lowest such id with live_bytes == 0 and
+    // no kept tombstones. Otherwise the lowest ratio (live + kept tombstone bytes) / total below
+    // gc_threshold; ties: the lowest id. 0: none.
+    uint32_t pickVictim(bool* fast, double* ratio) {
+        const uint32_t active = writer_->getCurrentSegmentId();
+        uint32_t applied_seg;
+        {
+            std::lock_guard<std::mutex> lk(seq_mu_);
+            applied_seg = last_applied_segment_;
+        }
+        std::lock_guard<std::mutex> lk(gc_mu_);
+        uint32_t best = 0;
+        double best_ratio = 2.0;
+        for (const auto& [id, st] : segs_) {
+            if (id >= active || id >= applied_seg) break; // ascending: the rest are newer
+            if (st.state != SegmentState::Sealed) continue;
+            if (st.live_bytes == 0 && st.kept_tombstone_bytes == 0) {
+                *fast = true;
+                *ratio = 0;
+                return id;
+            }
+            const double r =
+                double(st.live_bytes + st.kept_tombstone_bytes) / double(st.total_bytes);
+            if (r < opts_.gc_threshold && r < best_ratio) {
+                best = id;
+                best_ratio = r;
+            }
+        }
+        *fast = false;
+        *ratio = best ? best_ratio : 0;
+        return best;
+    }
+
+    // Is the entry at p (of key) the key's head or in its live chain? Caller holds the stripe.
+    bool entryIsLive(const std::string& key, const vlog::VPtr& p) const {
+        for (const vlog::VPtr& c : currentChain(key))
+            if (std::memcmp(&c, &p, sizeof(p)) == 0) return true;
+        return false;
+    }
+
+    bool isOldestSegment(uint32_t id) const {
+        std::lock_guard<std::mutex> lk(gc_mu_);
+        return !segs_.empty() && segs_.begin()->first == id;
+    }
+
+    struct VictimKey {
+        std::vector<size_t> entries;         // indexes into the scan, in file order
+        bool has_tombstone = false;
+        size_t tombstone = 0;                // the tombstone with the highest seq
+        uint64_t bytes = 0;
+    };
+
+    void collectVictim(uint32_t victim, bool fast, GcReport* rep) {
+        {
+            std::lock_guard<std::mutex> lk(gc_mu_);
+            segs_[victim].state = SegmentState::Migrating;
+        }
+        vlog::VLogReader reader(vlog_dir_);
+        vlog::ScanResult sr = reader.scanSegment(victim, /*is_last_segment=*/false);
+        rep->entries_scanned = sr.entries.size();
+        rep->bytes_scanned = segmentEntryBytes(victim);
+        const bool oldest = isOldestSegment(victim);
+        std::vector<std::string> order; // keys in file order of first appearance
+        std::unordered_map<std::string, VictimKey> keys;
+        for (size_t i = 0; i < sr.entries.size(); ++i) {
+            const vlog::RecoveredEntry& e = sr.entries[i];
+            auto [it, fresh] = keys.try_emplace(e.key);
+            if (fresh) order.push_back(e.key);
+            it->second.entries.push_back(i);
+            it->second.bytes += e.vptr.length;
+            if (e.header.type == static_cast<uint8_t>(vlog::EntryType::Tombstone)) {
+                const uint64_t seq = e.header.seq;
+                if (!it->second.has_tombstone || seq > sr.entries[it->second.tombstone].header.seq)
+                    it->second.tombstone = i;
+                it->second.has_tombstone = true;
+            }
+        }
+        if (fast) {
+            // Verification scan: every entry dead by the index, and no tombstone to keep.
+            bool live = false, keep_tombstone = false;
+            for (const std::string& k : order) {
+                std::lock_guard<std::mutex> stripe(stripeFor(k));
+                const bool present = tree_->get(k).has_value();
+                for (size_t i : keys[k].entries) {
+                    const vlog::RecoveredEntry& e = sr.entries[i];
+                    if (e.header.type == static_cast<uint8_t>(vlog::EntryType::Tombstone))
+                        keep_tombstone = keep_tombstone || (!present && !oldest);
+                    else if (present && entryIsLive(k, e.vptr))
+                        live = true;
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lk(gc_mu_);
+                gc_totals_.verify_scans++;
+                gc_totals_.verify_scan_bytes += rep->bytes_scanned;
+            }
+            if (!live && !keep_tombstone) {
+                for (const std::string& k : order)
+                    if (keys[k].has_tombstone) rep->tombstones_dropped++;
+                {
+                    std::lock_guard<std::mutex> lk(gc_mu_);
+                    gc_totals_.tombstones_dropped += rep->tombstones_dropped;
+                }
+                retireSegment(victim);
+                rep->action = GcReport::Action::FastPath;
+                return;
+            }
+            if (live) {
+                // live_bytes said 0 but the index references an entry here: a counter bug.
+                rep->counter_mismatch = true;
+                recountLive();
+                std::lock_guard<std::mutex> lk(gc_mu_);
+                gc_totals_.counter_mismatches++;
+            }
+        }
+        // Relocation in batches of about gc_batch_bytes.
+        std::vector<std::string> batch;
+        uint64_t batch_bytes = 0;
+        for (const std::string& k : order) {
+            batch.push_back(k);
+            batch_bytes += keys[k].bytes;
+            if (batch_bytes >= opts_.gc_batch_bytes) {
+                relocateBatch(victim, oldest, batch, keys, sr, rep);
+                batch.clear();
+                batch_bytes = 0;
+            }
+        }
+        if (!batch.empty()) relocateBatch(victim, oldest, batch, keys, sr, rep);
+        {
+            std::lock_guard<std::mutex> lk(gc_mu_);
+            gc_totals_.tombstones_dropped += rep->tombstones_dropped;
+        }
+        retireSegment(victim);
+        rep->action = GcReport::Action::Relocated;
+    }
+
+    // Holds the batch's stripes (ascending) from the re-check through the vLog append and the
+    // index applies, so no write to these keys can land between them (plan section 3).
+    void relocateBatch(uint32_t victim, bool oldest, const std::vector<std::string>& batch,
+                       std::unordered_map<std::string, VictimKey>& keys,
+                       const vlog::ScanResult& sr, GcReport* rep) {
+        std::vector<size_t> stripes;
+        for (const std::string& k : batch) stripes.push_back(stripeIndex(k));
+        std::sort(stripes.begin(), stripes.end());
+        stripes.erase(std::unique(stripes.begin(), stripes.end()), stripes.end());
+        std::vector<std::unique_lock<std::mutex>> locks;
+        locks.reserve(stripes.size());
+        for (size_t i : stripes) locks.emplace_back(stripes_[i]);
+
+        struct Work {
+            std::string key;
+            std::vector<vlog::VPtr> old_chain; // empty for a tombstone
+            bool consolidated = false;
+        };
+        std::vector<Work> work;
+        std::vector<vlog::VLogWriter::RelocatedEntry> entries;
+        for (const std::string& k : batch) {
+            const VictimKey& vk = keys[k];
+            std::optional<vlog::IndexValueRef> ref = tree_->get(k);
+            if (!ref) {
+                if (!vk.has_tombstone) continue;
+                if (oldest) {
+                    rep->tombstones_dropped++;
+                    continue;
+                }
+                const vlog::RecoveredEntry& t = sr.entries[vk.tombstone];
+                vlog::VLogWriter::RelocatedEntry r;
+                r.type = vlog::EntryType::Tombstone;
+                r.key = k;
+                r.seq = t.header.seq;
+                r.flags = static_cast<uint8_t>(t.header.flags | vlog::kFlagRelocated);
+                r.raw_len = 0;
+                entries.push_back(std::move(r));
+                work.push_back(Work{k, {}, false});
+                continue;
+            }
+            if (vk.has_tombstone) rep->tombstones_dropped++; // the key has a newer version
+            const std::vector<vlog::VPtr> chain = currentChain(k);
+            bool touches = false;
+            for (const vlog::VPtr& p : chain) touches = touches || p.segment_id == victim;
+            if (!touches) continue; // every version of k in the victim is dead
+            vlog::VLogWriter::RelocatedEntry r;
+            r.type = vlog::EntryType::Full;
+            r.key = k;
+            r.seq = ref->seq;
+            const vlog::RecoveredEntry* e = nullptr; // the head, if it is in the victim
+            for (size_t i : vk.entries)
+                if (std::memcmp(&sr.entries[i].vptr, &ref->vptr, sizeof(vlog::VPtr)) == 0)
+                    e = &sr.entries[i];
+            if (e != nullptr && e->header.seq != ref->seq) {
+                errno = 0;
+                fatal("GC: the index head of \"" + k + "\" does not match the victim's entry");
+            }
+            if (chain.size() == 1 && e != nullptr &&
+                e->header.type == static_cast<uint8_t>(vlog::EntryType::Full)) {
+                // A Full head with no deltas: copy it byte for byte, keeping its seq.
+                r.flags = static_cast<uint8_t>(e->header.flags | vlog::kFlagRelocated);
+                r.raw_len = e->header.raw_len;
+                r.payload = e->payload;
+                work.push_back(Work{k, chain, false});
+            } else {
+                // A live chain touches the victim: one consolidated Full with the head's seq.
+                Version v = readVersion(k, *ref);
+                const std::string bytes = doc::serialize(materialize(v, k, *ref));
+                r.flags = vlog::kFlagRelocated | vlog::kFlagConsolidated;
+                r.raw_len = 0;
+                r.payload.assign(bytes.begin(), bytes.end());
+                work.push_back(Work{k, v.chain, true});
+            }
+            entries.push_back(std::move(r));
+        }
+        if (entries.empty()) return;
+        std::vector<vlog::VPtr> at;
+        try {
+            at = writer_->appendRelocated(entries);
+        } catch (const std::exception& e) {
+            errno = 0;
+            fatal(std::string("GC: vLog append failed: ") + e.what());
+        }
+        uint64_t written = 0;
+        for (const vlog::VPtr& p : at) {
+            noteAppended(p);
+            written += p.length;
+        }
+        if (opts_.on_gc_after_append) opts_.on_gc_after_append(victim, entries.size());
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const vlog::VLogWriter::RelocatedEntry& r = entries[i];
+            BPTree::ApplyResult ar;
+            {
+                std::lock_guard<std::mutex> lk(seq_mu_); // never during a checkpoint
+                ar = tree_->apply(r.key, r.type, r.seq, r.flags, at[i]);
+            }
+            if (r.type == vlog::EntryType::Tombstone) {
+                if (ar != BPTree::ApplyResult::Skipped) {
+                    errno = 0;
+                    fatal("GC: a relocated tombstone was applied");
+                }
+                {
+                    std::lock_guard<std::mutex> lk(gc_mu_);
+                    segs_[at[i].segment_id].kept_tombstone_bytes += at[i].length;
+                }
+                rep->tombstones_kept++;
+                continue;
+            }
+            if (ar != BPTree::ApplyResult::Applied) {
+                errno = 0; // the stripe was held since the re-check: the key cannot have moved
+                fatal("GC: relocation of \"" + r.key + "\" (seq " + std::to_string(r.seq) +
+                      ") was not applied");
+            }
+            accountReplace(r.key, work[i].old_chain, &at[i]);
+            rep->keys_relocated++;
+            if (work[i].consolidated) rep->chains_consolidated++;
+        }
+        if (opts_.on_gc_after_apply) opts_.on_gc_after_apply(victim);
+        rep->bytes_written += written;
+        rep->batches++;
+        {
+            std::lock_guard<std::mutex> lk(gc_mu_);
+            gc_totals_.relocated_entries += entries.size();
+            gc_totals_.relocated_bytes += written;
+        }
+        locks.clear(); // release the stripes before sleeping
+        if (opts_.gc_rate_mb_s > 0) {
+            const double secs = double(written) / (double(opts_.gc_rate_mb_s) * 1024 * 1024);
+            std::this_thread::sleep_for(std::chrono::duration<double>(secs));
+        }
+    }
+
+    // After a counter mismatch: recompute live_bytes and chains_ from the index (states kept).
+    void recountLive() {
+        CounterScan cs = scanCounters();
+        std::lock_guard<std::mutex> lk(gc_mu_);
+        for (auto& [id, st] : segs_) {
+            auto it = cs.live.find(id);
+            st.live_bytes = it == cs.live.end() ? 0 : it->second;
+        }
+        chains_ = std::move(cs.chains);
+    }
+
     // Open (valid superblock only): unlinks segments the current slot lists as condemned, or below
     // its oldest_live_segment, that exist again. Never the replay or anchor segment or above.
     uint32_t removeCondemnedAtOpen(const SuperblockRecord& cur) {
@@ -677,9 +1006,10 @@ private:
         return segs_.empty() ? 0 : segs_.begin()->first;
     }
 
-    std::mutex& stripeFor(std::string_view key) {
-        return stripes_[std::hash<std::string_view>{}(key) % kStripes];
+    static size_t stripeIndex(std::string_view key) {
+        return std::hash<std::string_view>{}(key) % kStripes;
     }
+    std::mutex& stripeFor(std::string_view key) { return stripes_[stripeIndex(key)]; }
 
     uint64_t maxDocBytes(std::string_view key) const {
         const uint64_t vlog_max =
@@ -1062,6 +1392,7 @@ private:
     uint32_t cp_replay_older_ = 0;
     bool cp_has_older_ = false;
     mutable ReaderRegistry readers_;
+    std::mutex gc_run_mu_; // one GC pass at a time
 
     std::mutex cp_run_mu_;     // serializes checkpoint()
     mutable std::mutex cp_mu_; // guards the fields below

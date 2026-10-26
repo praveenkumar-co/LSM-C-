@@ -89,6 +89,18 @@ D1–D4 and D5 are approved, with these conditions:
   - Open still does one small header read per key (32 bytes + key + prefix) to learn which heads
     are Deltas. This cost is reported in `openInfo()`.
 
+**Found during Step 4: kept tombstones.** A segment that holds only tombstones GC kept would
+count as 0 live, because tombstones are not counted as live. GC would then pick it again, copy
+the tombstones into a new segment that is again 0 live, and repeat for as long as an older
+segment needs them. G3's mixed workload hit this. The fix:
+- GC records, per segment, the bytes of tombstones it relocated there (`kept_tombstone_bytes`).
+- Victim selection treats those bytes as occupied: the fast path needs live == 0 and no kept
+  tombstones, and the ratio is (live + kept) / total.
+- Tombstone liveness is still not an index counter. This is GC's own record of what it chose to
+  keep. A kept tombstone is copied again only when other data in its segment dies.
+- The record is in memory only, so after a restart such a segment may be copied once more.
+  Test: P5.D5.
+
 ### Changes from the PHASE5_PLAN.md committed in 9cbeb58
 - A 0-live segment is no longer deleted on the counter alone. A verification scan must confirm
   it (§2), and needed tombstones block the fast path.
