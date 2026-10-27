@@ -22,3 +22,14 @@ jobs:
         run: make test-quick
       - name: make asan
         run: make asan
+
+  tsan:
+    runs-on: ubuntu-latest
+    env:
+      CXX: g++
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compiler version
+        run: $CXX --version
+      - name: make tsan
+        run: make tsan

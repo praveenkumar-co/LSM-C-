@@ -171,6 +171,7 @@ public:
         uint32_t gc_interval_ms = 1000;
         double gc_threshold = 0.5;              // victims: live/total below this, in (0, 1)
         uint64_t gc_batch_bytes = 1024 * 1024;  // relocations per appendRelocated (one fsync)
+        uint32_t gc_batch_max_stripes = 32;     // max distinct stripes held by one batch
         uint32_t gc_rate_mb_s = 32;             // GC vLog writes per second (0: no limit)
         // Test-only hooks.
         std::function<void(uint32_t victim, size_t entries)> on_gc_after_append;
@@ -178,6 +179,7 @@ public:
         std::function<void(std::string_view key)> on_get_after_index_read;
         std::function<void(uint32_t segment)> on_gc_before_unlink;
         std::function<void(uint32_t segment)> on_gc_after_unlink_before_dirsync;
+        std::function<void(uint32_t victim, size_t stripes)> on_gc_batch_stripes;
     };
 
     struct EraseResult {
@@ -195,6 +197,8 @@ public:
         if (!(opts.gc_threshold > 0.0 && opts.gc_threshold < 1.0))
             throw std::invalid_argument("gc_threshold must be in (0, 1)");
         if (opts.gc_batch_bytes == 0) throw std::invalid_argument("gc_batch_bytes must be > 0");
+        if (opts.gc_batch_max_stripes == 0)
+            throw std::invalid_argument("gc_batch_max_stripes must be > 0");
         if (opts.gc_enabled && opts.gc_interval_ms == 0)
             throw std::invalid_argument("gc_interval_ms must be > 0 with gc_enabled");
         if (::mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) fatal("mkdir failed for " + dir);
@@ -842,16 +846,20 @@ private:
                 gc_totals_.counter_mismatches++;
             }
         }
-        // Relocation in batches of about gc_batch_bytes.
+        // Relocation in batches of about gc_batch_bytes, bounded by gc_batch_max_stripes.
         std::vector<std::string> batch;
         uint64_t batch_bytes = 0;
+        std::unordered_set<size_t> batch_stripes;
         for (const std::string& k : order) {
             batch.push_back(k);
             batch_bytes += keys[k].bytes;
-            if (batch_bytes >= opts_.gc_batch_bytes) {
+            batch_stripes.insert(stripeIndex(k));
+            if (batch_bytes >= opts_.gc_batch_bytes ||
+                batch_stripes.size() >= opts_.gc_batch_max_stripes) {
                 relocateBatch(victim, oldest, batch, keys, sr, rep);
                 batch.clear();
                 batch_bytes = 0;
+                batch_stripes.clear();
             }
         }
         if (!batch.empty()) relocateBatch(victim, oldest, batch, keys, sr, rep);
@@ -872,6 +880,7 @@ private:
         for (const std::string& k : batch) stripes.push_back(stripeIndex(k));
         std::sort(stripes.begin(), stripes.end());
         stripes.erase(std::unique(stripes.begin(), stripes.end()), stripes.end());
+        if (opts_.on_gc_batch_stripes) opts_.on_gc_batch_stripes(victim, stripes.size());
         std::vector<std::unique_lock<std::mutex>> locks;
         locks.reserve(stripes.size());
         for (size_t i : stripes) locks.emplace_back(stripes_[i]);

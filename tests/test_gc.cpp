@@ -1873,6 +1873,7 @@ static void testI2OptionsAndRateLimit(const std::string& dir) {
     bad([](IndexedStore::Options& o) { o.gc_threshold = 0; });
     bad([](IndexedStore::Options& o) { o.gc_threshold = 1; });
     bad([](IndexedStore::Options& o) { o.gc_batch_bytes = 0; });
+    bad([](IndexedStore::Options& o) { o.gc_batch_max_stripes = 0; });
     bad([](IndexedStore::Options& o) {
         o.gc_enabled = true;
         o.gc_interval_ms = 0;
@@ -1904,6 +1905,76 @@ static void testI2OptionsAndRateLimit(const std::string& dir) {
          "writing " + std::to_string(r.bytes_written) + " bytes took " +
          std::to_string(ms).substr(0, 5) + " ms (floor " + std::to_string(floor_ms).substr(0, 4) +
          " ms)");
+}
+
+static void testI3BatchStripeLimit(const std::string& dir) {
+    banner("P5.I3 1,000 small documents in one victim segment: GC uses multiple batches, each <= 32 stripes");
+    IndexedStore::Options o = gcOpts(128 * 1024);
+    o.gc_batch_bytes = 1024 * 1024;
+    o.gc_batch_max_stripes = 32;
+    size_t max_stripes_seen = 0;
+    size_t batch_count = 0;
+    o.on_gc_batch_stripes = [&](uint32_t, size_t stripes) {
+        batch_count++;
+        if (stripes > max_stripes_seen) max_stripes_seen = stripes;
+    };
+    auto st = IndexedStore::open(dir, o);
+    // Write 1,000 small live documents to segment 1.
+    for (int i = 0; i < 1000; ++i) {
+        char k[16];
+        std::snprintf(k, sizeof(k), "k%04d", i);
+        st->put(k, "{\"n\":" + std::to_string(i) + "}");
+    }
+    const uint32_t victim = segOf(*st, "k0000");
+    CHECK(victim != 0);
+    for (int i = 1; i < 1000; ++i) {
+        char k[16];
+        std::snprintf(k, sizeof(k), "k%04d", i);
+        CHECK(segOf(*st, k) == victim);
+    }
+    // Write 1,200 dummy keys to segment 1.
+    for (int i = 0; i < 1200; ++i) {
+        char k[16];
+        std::snprintf(k, sizeof(k), "d%04d", i);
+        st->put(k, "{\"d\":" + std::to_string(i) + "}");
+    }
+    // Advance to the next segment by filling segment 1 if still active.
+    int rot = 0;
+    std::string rot_key = "rot0";
+    st->put(rot_key, "{\"rot\":0}");
+    while (segOf(*st, rot_key) == victim) {
+        rot++;
+        rot_key = "rot" + std::to_string(rot);
+        st->put(rot_key, "{\"rot\":" + std::to_string(rot) + "}");
+    }
+    // In the new segment, overwrite all 1,200 dummy keys and the rot keys.
+    for (int i = 0; i < 1200; ++i) {
+        char k[16];
+        std::snprintf(k, sizeof(k), "d%04d", i);
+        st->put(k, "{\"d\":999999}");
+    }
+    for (int i = 0; i <= rot; ++i) {
+        st->put("rot" + std::to_string(i), "{\"rot\":999999}");
+    }
+    st->stopGc();
+    bpt::GcReport r = st->runGcPass();
+    CHECK(r.action == bpt::GcReport::Action::Relocated);
+    CHECK(r.victim == victim);
+    CHECK(r.keys_relocated == 1000);
+    CHECK(batch_count > 1);
+    CHECK(max_stripes_seen > 0 && max_stripes_seen <= 32);
+    CHECK(r.batches > 1);
+    CHECK(batch_count >= r.batches);
+    for (int i = 0; i < 1000; ++i) {
+        char k[16];
+        std::snprintf(k, sizeof(k), "k%04d", i);
+        auto d = st->get(k);
+        CHECK(d.has_value() && *d == ("{\"n\":" + std::to_string(i) + "}"));
+    }
+    closeCounted(st);
+    pass("P5.I3 1,000 small documents in one victim segment: GC used " +
+         std::to_string(r.batches) + " written batches (" + std::to_string(batch_count) + " total), max " +
+         std::to_string(max_stripes_seen) + " stripes per batch (limit 32)");
 }
 
 int main() {
@@ -1942,6 +2013,7 @@ int main() {
     testH(dir + "/h");
     testI1BackgroundGcThreads(dir + "/i1");
     testI2OptionsAndRateLimit(dir + "/i2");
+    testI3BatchStripeLimit(dir + "/i3");
     printBudget();
     return 0;
 }

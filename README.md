@@ -100,7 +100,7 @@ gc pass       --> pick a victim segment --> copy its live data forward (stripe l
   A 0-live segment is deleted without copying only after a scan confirms every entry is dead
   (this catches counter bugs). Otherwise the lowest live ratio below `gc_threshold` (0.5), oldest
   first on a tie.
-- Relocation in batches: GC locks the batch's stripes in ascending order and holds them from the
+- Relocation in batches: GC locks the batch's stripes in ascending order (at most `gc_batch_max_stripes` = 32 distinct stripes or `gc_batch_bytes`, whichever comes first) and holds them from the
   re-check through one `appendRelocated` (one fsync) and the index updates. A Full entry is copied
   byte for byte with its original seq; a chain touching the victim becomes one consolidated Full
   entry with the head's seq. Holding the stripe across the append is what stops a relocated copy
@@ -320,7 +320,7 @@ The engine enforces strict hardware-level correctness through three complementar
 | Domain | Test ID | Description & Production Invariant Verified |
 |---|---|---|
 | **Hardware Integrity & Bit-Rot** | `B1.1`, `V1`, `SB1` | Evaluates hardware ARMv8 CRC32C. In `B1.1`, all 32,768 single-bit flips across a 4096-byte page are detected and rejected. `SB1` verifies CRC over both 4096-byte superblock slots. |
-| **Crash Safety (`kill -9`)** | `V9`, `B5.2`, `CP11`, `P4.G1`, `P4.G2` | Over 150 cumulative iterations of SIGKILL during active group commits, live tree rebuilds, and delta increments. Confirms zero data loss: 100% of acknowledged operations are recovered. |
+| **Crash Safety (`kill -9`)** | `V9`, `B5.2`, `CP11`, `P4.G1`, `P4.G2`, `P5.H` | 195 cumulative iterations of SIGKILL across active group commits, live tree rebuilds, delta updates, and 5 GC lifecycle stages (`P5.H1`–`H5`). Every acknowledged operation (42,026+ verified ops) was intact after crash recovery with zero data loss and zero dead version resurrection. |
 | **Atomic Checkpointing** | `CP1`–`CP10`, `C1`–`C4` | Ping-pong double-buffered `superblock.db` (Slot 0 at byte 0, Slot 1 at byte 4096) with monotonic epochs. Guarantees that even if power fails mid-write of one slot, the other slot remains fully valid. |
 | **Copy-on-Write B+Tree** | `C1`, `C2`, `C3` | Pages with `page_id < checkpoint_page_count` are strictly immutable. First mutation copies the root-to-leaf path (`C2`). Page reuse is delayed across 2 epochs (`C3`) to preserve both committed trees. |
 | **Torn Creation & Ghost Cleanup** | `V8`, `SB3` | If a process crashes while creating a segment or superblock (file size < 4096 or corrupt header), recovery safely unlinks the ghost file, preventing corruption on subsequent restarts. |

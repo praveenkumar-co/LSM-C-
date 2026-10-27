@@ -235,7 +235,7 @@ the apply means any erase of K appends after C. So T is always in a segment at o
 and T can only be dropped once C's segment is gone.
 
 **Batching.**
-- GC collects up to `gc_batch_bytes` (default 1 MiB) of relocations.
+- GC collects up to `gc_batch_bytes` (default 1 MiB) or `gc_batch_max_stripes` (default 32) of relocations, whichever comes first.
 - It locks their stripes in ascending stripe order (deduplicated), then re-checks every key.
 - It sends one `appendRelocated` (one fsync), applies each entry, updates counters, and unlocks.
 - No deadlock: foreground ops hold at most one stripe and never wait for a second one. A
@@ -376,6 +376,7 @@ Step 1.
 | `gc_threshold` | 0.5 | Range (0, 1) |
 | `gc_rate_mb_s` | 32 | 0 means no limit |
 | `gc_batch_bytes` | 1 MiB | |
+| `gc_batch_max_stripes` | 32 | max distinct stripes held by one batch |
 | `gc_interval_ms` | 1000 | |
 
 **One GC thread.** Each pass: pick a victim → relocate in batches → advance lifecycle states →
