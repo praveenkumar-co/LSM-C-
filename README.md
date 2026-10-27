@@ -250,21 +250,21 @@ segments, 10 rounds of 3,000 overwrites, 3,000 one-field updates, 500 erases and
 | Run | vLog on disk | Space amplification | GC bytes written | Segments unlinked |
 |---|---:|---:|---:|---:|
 | GC off, before collecting | 50.5 MB | 4.51x | - | - |
-| GC off, then collected to idle (54 passes, 1.2 s) | 13.3 MB | 1.26x | 4.8 MB | 51 |
-| GC on (background thread, 32 MB/s limit), at the end | 15.4 MB | 1.43x | 35.4 MB | 80 |
+| GC off, then collected to idle (63 passes, 6.0 s) | 13.3 MB | 1.26x | 4.9 MB | 60 |
+| GC on (background thread, 32 MB/s limit), at the end | 15.3 MB | 1.42x | 35.4 MB | 87 |
 
 Space amplification = vLog bytes on disk / live bytes. With GC running during the workload it
 wrote 7x more than collecting once at the end, because it copies data that is overwritten again
 later. The verification scans read 0.1 MB and found no counter mismatch. The next open rebuilt the
-counters in 6.0 ms (10,000 head reads, 1,985 chain reads).
+counters in 11.0 ms (10,000 head reads, 1,963 chain reads).
 
 Foreground latency, one thread, every operation timed (µs):
 
 | Operation | GC off p50 | GC off p99 | GC on p50 | GC on p99 |
 |---|---:|---:|---:|---:|
-| put | 3,065 | 4,424 | 3,014 | 5,029 |
-| update | 3,868 | 4,688 | 3,085 | 4,666 |
-| get | 39.9 | 241.4 | 26.2 | 161.8 |
+| put | 3,930 | 5,022 | 3,958 | 8,139 |
+| update | 3,916 | 5,075 | 3,991 | 5,186 |
+| get | 36.3 | 243.6 | 23.5 | 195.4 |
 
 put and update are dominated by `F_FULLFSYNC` (about 3 ms here). With GC on, put p99 rose by about
 0.6 ms; the other differences are within the run-to-run noise of a single run.
