@@ -36,7 +36,11 @@
 namespace testutil {
 
 // make test-quick builds with -DTEST_QUICK: smaller workloads and a 20 MiB budget per binary.
-#ifdef TEST_QUICK
+// A benchmark may set its own cap with -DBENCH_BUDGET_BYTES=<bytes> (tests never do).
+#if defined(BENCH_BUDGET_BYTES)
+constexpr bool kQuick = false;
+constexpr uint64_t kWriteBudgetBytes = BENCH_BUDGET_BYTES;
+#elif defined(TEST_QUICK)
 constexpr bool kQuick = true;
 constexpr uint64_t kWriteBudgetBytes = 20ULL * 1024 * 1024;
 #else

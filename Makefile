@@ -4,6 +4,7 @@
 #   make tsan        ThreadSanitizer (defines TSAN_BUILD)
 #   make test-quick  optimized build with -DTEST_QUICK: smaller workloads, under 24 MiB written
 #   make bench       delta-update and GC benchmarks (not part of any test mode)
+#   make bench-stress  100,000-key, 16-thread stress benchmark with GC and 50 kill -9 crashes
 #   make clean
 #
 # Each test binary prints one "[PASS] ..." line per test (TEST_VERBOSE=1 adds measurements) and
@@ -32,7 +33,7 @@ LIMIT_asan  := 536870912
 LIMIT_tsan  := 536870912
 LIMIT_quick := 25165824
 
-.PHONY: test asan tsan quick test-quick bench clean check-deps
+.PHONY: test asan tsan quick test-quick bench bench-stress clean check-deps
 
 # vlog/ and doc/ are bottom layers: vlog/ must not depend on index/, doc/ or legacy/, and doc/
 # (JSON and update ops) must not depend on vlog/, index/ or legacy/.
@@ -80,6 +81,14 @@ build/bench/bench_gc: bench/bench_gc.cpp $(HEADERS) Makefile
 bench: check-deps build/bench/bench_delta build/bench/bench_gc
 	./build/bench/bench_delta
 	./build/bench/bench_gc
+
+# The stress benchmark writes about 1 GB, so it sets its own write cap (2 GiB).
+build/bench/bench_stress: bench/bench_stress.cpp $(HEADERS) Makefile
+	@mkdir -p build/bench
+	$(CXX) $(CXXSTD) $(WARN) -O2 -DBENCH_BUDGET_BYTES=2147483648ULL $(INCLUDES) $(LDFLAGS) $< -o $@
+
+bench-stress: check-deps build/bench/bench_stress
+	./build/bench/bench_stress
 
 clean:
 	rm -rf build

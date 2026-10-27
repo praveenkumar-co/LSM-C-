@@ -153,6 +153,7 @@ make test        # optimized, full workloads
 make asan        # AddressSanitizer + UndefinedBehaviorSanitizer
 make tsan        # ThreadSanitizer (fork + kill -9 tests are skipped)
 make bench       # delta-update and GC benchmarks; not part of the test modes, about 390 MB written
+make bench-stress  # 100,000 keys, 16 threads, GC on/off, 50 x kill -9; about 740 MB written
 make clean
 ```
 
@@ -273,7 +274,106 @@ put and update are dominated by `F_FULLFSYNC` (about 3 ms here). With GC on, put
 
 These are single runs on one machine, not averaged benchmarks.
 
+## High-Scale Stress Benchmark
+
+`make bench-stress` (`bench/bench_stress.cpp`), one run on 2026-10-28, Apple M5, 17 GB RAM,
+macOS 27.0, Apple clang 21. Two fresh stores with the same seed, one with GC off (compacted with GC
+passes after the run) and one with the background GC thread on (32 MB/s limit):
+- load 100,000 keys x 1,000-byte documents with 16 threads;
+- B+Tree cache of 1,024 frames (4 MiB), 4 MiB segments;
+- 100,000 mixed operations on 16 threads: 35% put, 45% update (`$inc profile.score`,
+  `$set profile.tag`), 10% erase, 10% get.
+
+Each thread owns the keys `k % 16 == t`, so it knows each of its keys' exact document; all 9,440
+gets of present keys in each run (depth 0 and Delta chains) matched it byte for byte. Every
+operation was timed with `steady_clock`.
+
+**Throughput** (operations per second, 16 threads)
+
+| Phase | GC off | GC on |
+|---|---:|---:|
+| Load (100,000 puts) | 2,052 | 1,985 |
+| Mixed (100,000 operations) | 2,503 | 2,219 |
+| Mixed, writes only | 2,208 | 1,958 |
+
+**Latency** (µs; p50 / p90 / p99 / p99.9 / max)
+
+| Operation | n | GC off | GC on |
+|---|---:|---|---|
+| put | 35,145 | 6,935 / 8,087 / 12,530 / 23,558 / 149,804 | 7,124 / 8,189 / 28,683 / 124,740 / 168,354 |
+| update, Delta | 42,971 | 7,038 / 8,224 / 12,954 / 21,061 / 131,362 | 7,262 / 8,334 / 32,828 / 129,320 / 179,944 |
+| update, consolidated | 6 | 7,256 / 8,209 / 8,209 / 8,209 / 8,209 | 7,262 / 7,951 / 7,951 / 7,951 / 7,951 |
+| erase | 10,078 | 6,945 / 8,079 / 12,627 / 16,708 / 23,996 | 7,126 / 8,165 / 32,585 / 108,059 / 162,254 |
+| get, depth 0 | ~7,846 | 94 / 216 / 428 / 3,571 / 3,904 | 99 / 241 / 425 / 13,064 / 20,345 |
+| get, Delta chain (depth 1-4) | ~1,594 | 197 / 279 / 457 / 3,631 / 3,746 | 202 / 288 / 464 / 7,225 / 12,637 |
+
+- **Writes wait for `F_FULLFSYNC`.** 16 threads share each group-commit flush, so a write's p50 is
+  about 7 ms.
+- **Few consolidations.** Updates spread over 100,000 keys, so chains rarely grew past depth 4:
+  only 6 of the ~43,000 updates wrote a consolidated Full entry.
+- **GC on hurt the write tails.** It raised put p99 from 12.5 to 28.7 ms and p99.9 from 23.6 to
+  124.7 ms. With GC on, the index wrote 180.8 MB instead of 67.1 MB, because the GC thread
+  requests a checkpoint whenever a retired segment waits for epochs. A checkpoint holds the
+  sequencer and tree locks, so writers stall behind it.
+
+**Space amplification** (vLog bytes on disk / live bytes)
+
+| When | GC off | GC on |
+|---|---|---|
+| Baseline (after the load) | 104.8 MB / 104.0 MB = 1.01x | 104.9 MB / 104.0 MB = 1.01x |
+| Peak churn (after the mixed phase) | 148.3 MB / 100.6 MB = 1.47x | 148.2 MB / 100.6 MB = 1.47x |
+| After compaction | 148.2 MB / 100.6 MB = 1.47x | 148.2 MB / 100.6 MB = 1.47x |
+
+- **Compaction changed little.** The churn left about a third of every segment dead, and no
+  segment fell below the 0.5 live-ratio threshold.
+- **What GC did reclaim.** It unlinked only 0-live segments (22 with GC off, 34 with GC on) and
+  copied 0.1-0.2 MB.
+- **Counters checked.** Counter mismatches were 0 in both runs, and the counters equalled a
+  recount from the index.
+
+**Buffer pool** (1,024 frames = 4 MiB)
+
+| Measure | GC off | GC on |
+|---|---:|---:|
+| index.db at the end (free pages included) | 3,502 pages (13.7 MiB) | 2,680 pages (10.5 MiB) |
+| Tree height | 3 | 3 |
+| Page reads per mixed operation | 0.146 | 0.378 |
+| Page evictions during the mixed phase | 17,982 | 57,050 |
+| vLog bytes written: load / mixed | 104.8 / 43.6 MB | 104.9 / 43.8 MB |
+| Index bytes written: load / mixed | 4.7 / 57.6 MB | 5.4 / 174.2 MB |
+
+- **Small leaf cells.** A leaf cell holds the key and a 24-byte reference, so the index for
+  100,000 keys is 10.5-13.7 MiB (3,502 pages including free ones).
+- **Comparison (computed, not measured).** With the 1,000-byte documents in the leaves, at most 3
+  fit in a 4 KiB page, so the tree would need at least 33,333 leaf pages (130 MiB), 33x the pool.
+- **The index still does not fit.** It is 2.6-3.4x the 4 MiB pool, so the mixed phase still
+  evicted pages. Writing evicted dirty pages cost more index bytes than vLog bytes in the mixed
+  phase.
+
+**Crash resilience**
+
+The chaos store has 4,096 keys, 256 KiB segments, background GC on and checkpoints every 1 MiB of
+vLog. Each of 50 children ran 16 threads and was killed with kill -9 after 400-4,399 acks. After
+each crash the store reopened, every key was compared with the acked state, and then
+superblock.db was deleted and the full cold rebuild was compared with the recovered index.
+
+| Measure | Value |
+|---|---:|
+| Crashes | 50 |
+| Acked operations verified after recovery | 112,283 of 112,283 |
+| Operations in flight at the kill (applied / not applied) | 306 / 475 |
+| Index equal to the full cold rebuild | 50 of 50 (204,800 key comparisons) |
+| Recovery open, mean / max | 20.6 / 30.0 ms |
+| Full rebuild, mean | 124.9 ms |
+
+This run wrote 736 MB in total (cap 2 GiB).
+
 ## Known limitations
+
+- **Concurrent writers create extra small segments**: when several threads hit a segment rollover
+  together, each opens a new segment after waiting, without checking again (16 threads writing
+  20 MB with a 1 MiB limit made 79 segments, 60 of them under 512 KiB; one thread made 20). The
+  segments are valid; there are just more of them.
 
 - **GC limits**: one GC thread and one victim per pass; `index.db` never shrinks (freed pages are
   reused); open reads one small header per key to rebuild the GC counters; tombstones of erased
