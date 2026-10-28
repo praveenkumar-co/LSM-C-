@@ -216,6 +216,8 @@ struct RunResult {
     double avg_batch = 0;      // entries per group-commit write + F_FULLFSYNC (whole run)
     uint64_t cp_count = 0;     // checkpoints written (not skipped)
     double cp_stall_p50 = 0, cp_stall_max = 0, cp_stall_sum = 0; // ms the locks were held
+    double recover_ms = 0;            // open after dropping the store without close()
+    uint64_t recover_entries = 0;     // vLog entries the recovery scanned
 };
 
 RunResult run(const std::string& dir, bool gc_on) {
@@ -366,6 +368,7 @@ RunResult run(const std::string& dir, bool gc_on) {
     }
     r.vlog_bytes_written = st->vlogBytesWritten();
     r.avg_batch = st->vlogAverageBatch();
+    const uint64_t index_before_recovery = g_index_bytes.load();
     {
         std::vector<double> stalls;
         for (const bpt::CheckpointReport& c : st->checkpointReports()) stalls.push_back(c.stall_ms);
@@ -377,9 +380,20 @@ RunResult run(const std::string& dir, bool gc_on) {
             for (double x : stalls) r.cp_stall_sum += x;
         }
     }
-    st->close();
+    // Crash-style recovery time: drop the store without close() (no final checkpoint), then
+    // open it; recovery replays the vLog written since the last checkpoint.
     st.reset();
-    r.index_bytes_written = g_index_bytes.load() - index0;
+    r.index_bytes_written = index_before_recovery - index0;
+    {
+        const auto t_rec = Clock::now();
+        auto st2 = IndexedStore::open(dir, storeOpts(false));
+        r.recover_ms = since(t_rec) / 1e3;
+        r.recover_entries = st2->openInfo().vlog_entries_scanned;
+        CHECK(!st2->openInfo().rebuilt);
+        CHECK(model[0].present ? st2->get(key(0)) == model[0].doc(0) : !st2->get(key(0)));
+        accountBytes(st2->vlogBytesWritten(), "recovery open");
+        st2->close();
+    }
     accountBytes(r.vlog_bytes_written, "vLog writes");
     CHECK(bytesWritten() <= kBenchBudget);
     std::filesystem::remove_all(dir);
@@ -761,6 +775,8 @@ int main() {
         std::printf("METRIC %s cp_stall_p50_ms %.2f\n", g, r->cp_stall_p50);
         std::printf("METRIC %s cp_stall_max_ms %.2f\n", g, r->cp_stall_max);
         std::printf("METRIC %s page_reads_per_op %.4f\n", g, double(r->mixed_page_reads) / kMixedOps);
+        std::printf("METRIC %s recover_ms %.2f\n", g, r->recover_ms);
+        std::printf("METRIC %s recover_entries %llu\n", g, (unsigned long long)r->recover_entries);
     }
     std::printf("METRIC chaos recover_ms %.2f\n", cr.recover_ms_sum / std::max(1, cr.crashes));
     std::printf("METRIC chaos rebuild_ms %.2f\n", cr.rebuild_ms_sum / std::max(1, cr.crashes));

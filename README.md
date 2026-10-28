@@ -43,6 +43,13 @@ gc pass       --> pick a victim segment --> copy its live data forward (stripe l
   order is seq order, except for GC copies (`kFlagRelocated`), which keep their original seq.
 - Group commit: one thread writes everything staged so far with one `write()` and one
   `F_FULLFSYNC`, then acks the batch. A failed fsync aborts the process and is never retried.
+  Before each write the leader waits up to `group_commit_window_us` (500 µs) for more requests to
+  join, but only when the previous batch had more than one request, so a lone writer never waits.
+  Acks still come only after the fsync.
+- Segment rollover re-checks after waiting for an in-flight flush, so threads that hit a rollover
+  together open one new segment, not one each.
+- Reads use a bounded cache of open segment descriptors (64): one `pread` per entry instead of
+  open + fstat + 2 x pread + close. GC drops a segment's descriptor before unlinking it.
 - Recovery: a torn tail is truncated only in the last segment. Damage in any other segment, or a
   bad entry with valid entries after it, is treated as corruption and fails loudly.
 - Segments are created with `O_CREAT | O_EXCL` and existing segments are never appended to or
@@ -65,8 +72,12 @@ gc pass       --> pick a victim segment --> copy its live data forward (stripe l
   superblock is never used with another store's files. The identity is the replay segment's id and
   creation time (GC never deletes that segment); stores written before GC, which recorded the
   lowest segment, still open without a rebuild.
-- A checkpoint holds the sequencer lock and the tree's exclusive lock. It records the last seq
-  applied to the index and the vLog position right after that entry (never the writer's tail).
+- A checkpoint holds the sequencer lock and the tree's exclusive lock only to capture: the last
+  seq applied to the index and the vLog position right after that entry (never the writer's
+  tail), the root and page count, and a copy of every dirty page; every existing page is then
+  frozen, so later changes copy it. With the locks released it writes the captured pages,
+  `F_FULLFSYNC`s and commits the superblock. Pages freed meanwhile are reused only after the
+  in-flight epoch + 2 commits.
 - Index pages are fsynced **before** the superblock that names them is written. A crash before the
   superblock write leaves the previous checkpoint fully usable.
 - Automatic checkpoints run every 4 MiB of vLog writes or 30 s, and on clean close.
@@ -148,7 +159,7 @@ Requires a C++17 compiler. Tested with Apple clang 21 on macOS; GitHub Actions r
 and `make asan` on Ubuntu with g++ and clang++ (`.github/workflows/ci.yml`).
 
 ```
-make test-quick  # optimized, smaller workloads, under 24 MiB written in total
+make test-quick  # optimized, smaller workloads, under 32 MiB written in total
 make test        # optimized, full workloads
 make asan        # AddressSanitizer + UndefinedBehaviorSanitizer
 make tsan        # ThreadSanitizer (fork + kill -9 tests are skipped)
@@ -160,7 +171,7 @@ make clean
 All builds use `-Wall -Wextra -Werror`. Each test prints one `[PASS] name (summary)` line; run with
 `TEST_VERBOSE=1` to also print the measurements behind each test. Every test binary uses its own
 temp directory, removes it on exit, aborts if free disk space is below 10 GB, and enforces a write
-budget as it writes (512 MiB in total for `test`/`asan`/`tsan`, 24 MiB for `test-quick`).
+budget as it writes (512 MiB in total for `test`/`asan`/`tsan`, 32 MiB for `test-quick`).
 
 | Binary | Covers |
 |---|---|
@@ -173,6 +184,7 @@ budget as it writes (512 MiB in total for `test`/`asan`/`tsan`, 24 MiB for `test
 | `test_doc` | JSON parsing and serialization edge cases, paths, `$set`/`$unset`/`$inc` semantics and errors (P4.A-C) |
 | `test_delta` | `update()` errors write nothing, chains and consolidation, mixed put/erase/update, concurrent updates, kill -9 during updates, replay rule, corrupt or missing chain entries (P4.C-G) |
 | `test_gc` | relocated entries in replay and rebuild, segment-id gaps, identity of older stores, counters, segment lifecycle and condemned list, reader pins, victim selection, relocation of Full entries / chains / tombstones, user writes and erases racing GC, kill -9 at 5 GC points, GC thread + 8 threads (P5) |
+| `test_perf` | segment rollover with 16 threads, segment descriptor cache (bounded, GC, deleted segments), adaptive group-commit window, checkpoints written outside the locks: snapshot fidelity and page reuse, 16-thread load, kill -9 at 3 new points (P6) |
 
 ## Measured results
 
@@ -276,6 +288,9 @@ These are single runs on one machine, not averaged benchmarks.
 
 ## High-Scale Stress Benchmark
 
+The numbers in this section are from one run before the performance work below (commit
+`bfea1bf`); see "Performance work" for medians of 3 runs before and after.
+
 `make bench-stress` (`bench/bench_stress.cpp`), one run on 2026-10-28, Apple M5, 17 GB RAM,
 macOS 27.0, Apple clang 21. Two fresh stores with the same seed, one with GC off (compacted with GC
 passes after the run) and one with the background GC thread on (32 MB/s limit):
@@ -368,6 +383,107 @@ superblock.db was deleted and the full cold rebuild was compared with the recove
 
 This run wrote 736 MB in total (cap 2 GiB).
 
+## Performance work
+
+Goal: make `make bench-stress` faster without changing what it measures: the same workload,
+seed, dataset (100,000 keys x 1 KB, 16 threads) and 4 MiB index cache, every acked write still
+`F_FULLFSYNC`ed. Numbers are the median of 3 runs on an Apple M5, 17 GB RAM, internal SSD, macOS
+27.0, Apple clang 21, on AC power with Low Power Mode off, the machine kept awake with
+`caffeinate`. Baseline: commit `d9cefa4`. After: commit `ff348c6` plus the benchmark's measurement
+additions.
+
+**Profile first** (`sample`, 10 s of the mixed phase, 16 workers, about 52,800 samples):
+
+| Where worker time went | Samples |
+|---|---:|
+| Waiting in `VLogWriter::commitLocked` for the group commit's `F_FULLFSYNC` | 48,867 (93%) |
+| Waiting in the sequencer (`applyInOrder`) | 3,232 (6%) |
+| Read path (`readVersion` -> `readEntry`, including `open`) | 180 |
+| JSON parse / apply / serialize | under 70 |
+
+One thread was inside `F_FULLFSYNC` almost all the time, and group-commit batches averaged 7.7 of
+16 threads.
+
+**Before and after** (GC off / GC on):
+
+| Metric | Baseline | After | Change |
+|---|---|---|---|
+| Mixed operations per second | 2,476 / 2,407 | 3,740 / 3,711 | +51% / +54% |
+| Load (100,000 puts) per second | 2,042 / 2,078 | 3,293 / 3,308 | +61% / +59% |
+| put p50 / p99 / p99.9 (ms), GC off | 6.94 / 13.6 / 34.9 | 4.77 / 9.83 / 16.0 | -31% / -28% / -54% |
+| put p50 / p99 / p99.9 (ms), GC on | 6.91 / 16.3 / 111.1 | 4.82 / 9.85 / 14.6 | -30% / -40% / -87% |
+| update p50 / p99 / p99.9 (ms), GC off | 7.05 / 13.9 / 25.3 | 4.83 / 9.94 / 13.5 | -32% / -29% / -47% |
+| update p50 / p99 / p99.9 (ms), GC on | 7.00 / 16.4 / 117.0 | 4.86 / 9.95 / 12.9 | -31% / -40% / -89% |
+| get p50 / p99 / p99.9 (µs), GC off | 100 / 457 / 3,547 | 36 / 262 / 350 | -64% / -43% / -90% |
+| get p50 / p99 / p99.9 (µs), GC on | 100 / 574 / 6,899 | 36 / 265 / 441 | -64% / -54% / -94% |
+| Index bytes written per run | 78.9 / 155.8 MB | 83.2 / 78.2 MB | +5% / -50% |
+| Space amplification after compaction | 1.47x / 1.47x | 1.47x / 1.47x | none |
+| Group-commit batch (average entries) | 7.7 / 7.7 | 15.1 / 15.2 | about 2x |
+| Checkpoint stall, median / max (ms) | 7.7 / 22.1 (off) | 0.83 / 3.4 (off) | -89% / -85% |
+| Chaos store: recovery open / full rebuild (ms) | 21.3 / 70.0 | 28.4 / 146.3 | +33% / +109% |
+
+Acked operations verified after the 50 kill -9 crashes: 112,296 of 112,296 before and 112,305 of
+112,305 after. Recovery of the main store after dropping it without `close()` (added to the
+benchmark in this work, so there is no baseline) takes 151-162 ms for about 26,300 replayed entries.
+
+**What each change did** (median of 3, previous commit -> this one; these intermediate runs were
+mostly on battery, so compare them with each other, not with the table above):
+
+1. **Segment rollover re-check** (`a12bc45`, a correctness fix). 16 threads made about 240
+   segments at peak churn, most almost empty; now 36. Fewer 0-live segments meant fewer GC
+   events: with GC on, checkpoints fell from 323 to 8 and put p99.9 from 111 to 20 ms.
+2. **Segment descriptor cache** (`b27f5ad`). get p50 97 -> 37 µs, chain get p50 186 -> 64 µs.
+3. **Adaptive group-commit window** (`5f8220a`, committed as "testing"). Batches 7.8 -> 14.1,
+   mixed ops/s +47%, put p50 7.0 -> 4.2 ms. Window sweep (GC off, chaos skipped):
+
+   | Window | ops/s | put p50 / p99 | Avg batch |
+   |---:|---:|---|---:|
+   | 0 µs | 2,502 | 6.97 / 12.9 ms | 7.8 |
+   | 100 µs | 2,356 | 7.90 / 12.8 ms | 7.9 |
+   | 200 µs | 2,649 | 6.98 / 12.5 ms | 8.8 |
+   | 500 µs (default) | 3,424 | 4.56 / 10.0 ms | 13.9 |
+   | 1000 µs | 3,679 | 4.88 / 9.0 ms | 15.6 |
+
+   1000 µs gives more throughput and a better p99 but a worse p50, and a writer under light
+   concurrency can wait twice as long, so the default is 500 µs. A single writer is unaffected
+   (put p50 3.96 ms with and without the window).
+4. **Checkpoints write outside the locks** (`ff348c6`). Stall while the locks are held: median
+   21-27 -> 0.9 ms, max about 35 -> 3.3 ms; put p99.9 -14% / -18%. Costs: writers now run during
+   the checkpoint's own fsyncs and change pages that must then be copied, so mixed ops/s fell
+   about 8% and index bytes rose; and because GC no longer forces checkpoints, the short-lived
+   chaos children reclaim less (vLog 9 -> 56 MB), which is why chaos recovery and rebuild got
+   slower.
+
+**Tried and not kept**: a 32 MB cache of materialized documents (filled by `get()` misses, keyed
+by key + seq). Only 2.6% of lookups hit on this workload (random keys over 100,000 documents), get
+latency did not change, and it was reverted. **Not changed**: stripe lock hold time; the JSON work
+inside it is about 0.1% of worker time, against the fsync wait the lock has to cover.
+
+**Tuning trade-offs** (bench-stress without chaos, median of 3, on battery; GC off / GC on):
+
+| checkpoint_bytes | Checkpoints | Index MB written | Recovery open | Entries replayed |
+|---:|---:|---|---|---:|
+| 4 MB | 34 | 136 / 140 | 202 / 191 ms | about 8,000 |
+| 16 MB (benchmark setting) | 8 | 103 / 106 | 331 / 327 ms | about 26,300 |
+| 64 MB | 2 | 73 / 78 | 347 / 310 ms | 26,700-30,900 |
+
+Larger checkpoints write fewer index bytes; recovery replays whatever was written since the last
+checkpoint, so its worst case grows with checkpoint_bytes (these runs happened to stop at a
+similar point after the last checkpoint for 16 and 64 MB). The engine default stays 4 MiB.
+
+| gc_threshold | Space amp after compaction | GC bytes written | Peak space amp, GC on |
+|---:|---|---|---:|
+| 0.5 (default) | 1.47x / 1.47x | 0 / 0 MB | 1.47x |
+| 0.7 | 1.05x / 1.06x | 80 / 81 MB | 1.69x |
+
+At 0.5 the churn leaves every segment above the threshold, so nothing is collected; 0.7
+reclaims about 30% of the vLog for about 80 MB of copies, and with GC on the vLog peaks higher
+while relocated segments wait for normal checkpoints. The default stays 0.5.
+
+**Measurement note**: in two runs during this work the laptop went to sleep mid-benchmark
+(`pmset -g log`), which `steady_clock` counted as a 710 s and a 1,023 s write latency. The
+affected tuning run was repeated; all final runs used `caffeinate`.
+
 ## Known limitations
 
 
@@ -387,11 +503,17 @@ This run wrote 736 MB in total (cap 2 GiB).
 - **Writes to one key are serialized** across the group commit (stripe lock), so one key takes at
   most about one write per `F_FULLFSYNC`.
 - **LZ4 is not used**, although the format has a flag for it.
-- **Checkpoints stall the store** for the duration of two `F_FULLFSYNC` calls (about 10 ms here).
+- **Checkpoints still stall writers and readers briefly** while they capture (median about 0.9 ms,
+  max 3.3 ms in `make bench-stress`); writing the pages and the two `F_FULLFSYNC` calls overlaps
+  with writes, which slows those writes' own fsyncs a little.
+- **GC never forces a checkpoint**: retired segments wait for the normal triggers (4 MiB of vLog
+  or 30 s), so a short-lived process that crashes often keeps dead segments longer (the chaos
+  store in `make bench-stress` ended with 56 MB of vLog instead of 9 MB).
 - **Open reads every page of the committed tree** to check CRCs, so open time grows with index size.
 - **Lost vLog data before the replay point is not detected** unless the replay segment itself is
   missing or too short.
-- **get() opens the segment file** for every read (no file handle cache, no value cache).
+- **No document cache**: one was tried and measured (2.6% hit rate on `make bench-stress`, no
+  change in get latency) and not kept.
 - **No page merges**: a tree with many deletes keeps empty leaves.
 - **One lock per tree**: writers are serialized.
 - **Crash tests use kill -9**, not power loss. The Linux `fdatasync` path is covered only by the
