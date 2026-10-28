@@ -75,6 +75,26 @@ public:
         return true;
     }
 
+    // Reads the entry at vptr from an open descriptor of its segment with a single pread of
+    // vptr.length bytes, then the same checks as readEntry (header bounds, length, CRC). A short
+    // read (the entry would end past the end of the file) fails.
+    static bool readEntryAt(int fd, const VPtr& vptr, EntryHeader& out_hdr, std::string& out_key,
+                            std::vector<uint8_t>& out_payload) {
+        if (vptr.length < sizeof(EntryHeader) || vptr.length > kMaxEntryLen) return false;
+        std::vector<uint8_t> buf(vptr.length);
+        if (pread(fd, buf.data(), vptr.length, vptr.offset) != static_cast<ssize_t>(vptr.length))
+            return false;
+        EntryHeader hdr;
+        std::memcpy(&hdr, buf.data(), sizeof(hdr));
+        if (!validateHeaderBounds(hdr, vptr.offset, uint64_t(vptr.offset) + vptr.length) ||
+            hdr.total_len != vptr.length ||
+            crc32c(buf.data() + 4, hdr.total_len - 4) != hdr.crc32c)
+            return false;
+        out_hdr = hdr;
+        extractKeyAndPayload(hdr, buf, &out_key, &out_payload);
+        return true;
+    }
+
     // Recovery scan of one segment from start_offset (an entry boundary).
     //  - A torn tail is allowed only in the LAST segment: it is truncated with ftruncate + fsync.
     //    The same damage in a non-last segment throws (acked data would be lost).

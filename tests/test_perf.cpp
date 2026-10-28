@@ -87,10 +87,84 @@ static void testS1Rollover(const std::string& dir) {
          " segments (expected " + std::to_string(expected) + ", limit +2), every entry intact");
 }
 
+// ------------------------------------------------------------------------------------------
+// P6.R1 Segment descriptor cache: bounded, closed before GC unlinks, deleted segment = missing
+// ------------------------------------------------------------------------------------------
+static IndexedStore::Options smallSegOpts(size_t fd_cache) {
+    IndexedStore::Options o;
+    o.cache_frames = 64;
+    o.vlog_opts = vlog::VLogWriter::Options(8 * 1024, std::min<uint64_t>(64ULL << 20, remainingBudget()));
+    o.on_index_write = [](uint64_t n) { accountBytes(n, "index writes"); };
+    o.auto_checkpoint = false;
+    o.gc_rate_mb_s = 0;
+    o.fd_cache_size = fd_cache;
+    return o;
+}
+static std::string bigDoc(int i) { return std::string("{\"i\":") + std::to_string(i) + ",\"p\":\"" + std::string(2900, 'a' + i % 26) + "\"}"; }
+
+static void testR1FdCache(const std::string& dir) {
+    banner("P6.R1 segment descriptor cache");
+    auto st = IndexedStore::open(dir, smallSegOpts(4));
+    const int kKeys = 12; // one ~3 KB document per 8 KiB segment: 12 segments, cache of 4
+    for (int i = 0; i < kKeys; ++i) st->put("k" + std::to_string(i), bigDoc(i));
+    // 8 readers over 12 segments with 4 descriptors: evictions while leases are held.
+    std::vector<std::thread> th;
+    std::atomic<int> bad{0};
+    for (int t = 0; t < 8; ++t)
+        th.emplace_back([&, t] {
+            for (int r = 0; r < (kQuick ? 30 : 200); ++r) {
+                const int i = (t * 7 + r) % kKeys;
+                if (st->get("k" + std::to_string(i)) != bigDoc(i)) bad++;
+            }
+        });
+    for (auto& x : th) x.join();
+    CHECK(bad == 0);
+    CHECK(st->fdCacheForTest().size() <= 4);
+    CHECK(st->fdCacheForTest().hits() > 0 && st->fdCacheForTest().misses() >= kKeys);
+    // A segment deleted from outside while its descriptor is cached reads as missing.
+    const vlog::VPtr p0 = st->tree().get("k11")->vptr;
+    CHECK(st->get("k11") == bigDoc(11) && st->fdCacheForTest().contains(p0.segment_id));
+    const std::string seg_path = st->vlogDir() + "/vlog_" + std::string(8 - std::to_string(p0.segment_id).size(), '0') + std::to_string(p0.segment_id) + ".log";
+    accountBytes(std::filesystem::file_size(seg_path), "segment removed by the test");
+    CHECK(::unlink(seg_path.c_str()) == 0);
+    bool threw = false;
+    try {
+        (void)st->get("k11");
+    } catch (const bpt::VLogReadError&) {
+        threw = true;
+    }
+    CHECK(threw && !st->fdCacheForTest().contains(p0.segment_id));
+    st->put("k11", bigDoc(11)); // live again in a new segment
+    // GC unlinks segments whose descriptors are cached: they are closed first.
+    std::vector<uint32_t> old;
+    for (int i = 0; i < 6; ++i) {
+        old.push_back(st->tree().get("k" + std::to_string(i))->vptr.segment_id);
+        CHECK(st->get("k" + std::to_string(i)) == bigDoc(i)); // cache the descriptor
+    }
+    for (int i = 0; i < 6; ++i) st->put("k" + std::to_string(i), bigDoc(i + 20));
+    st->put("z", bigDoc(40));
+    for (int r = 0; r < 200; ++r) {
+        bpt::GcReport g = st->runGcPass();
+        if (g.action == bpt::GcReport::Action::None && !st->gcPending()) break;
+        st->checkpoint();
+    }
+    for (uint32_t id : old) {
+        CHECK(!std::filesystem::exists(st->vlogDir() + "/vlog_" + std::string(8 - std::to_string(id).size(), '0') + std::to_string(id) + ".log"));
+        CHECK(!st->fdCacheForTest().contains(id));
+    }
+    for (int i = 0; i < kKeys; ++i)
+        CHECK(st->get("k" + std::to_string(i)) == bigDoc(i < 6 ? i + 20 : i));
+    accountBytes(st->vlogBytesWritten(), "vLog");
+    st->close();
+    pass("P6.R1 descriptor cache: 8 readers over 12 segments with 4 slots read correctly; a "
+         "deleted cached segment reads as missing; GC closes descriptors before unlinking");
+}
+
 int main() {
     std::string dir = setupRun("perf_test");
     Cleaner cleaner{dir};
     testS1Rollover(dir + "/s1");
+    testR1FdCache(dir + "/r1");
     printBudget();
     return 0;
 }

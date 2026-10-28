@@ -58,6 +58,7 @@
 #include "doc/Update.hpp"
 #include "index/BPTree.hpp"
 #include "index/DeltaCodec.hpp"
+#include "index/FdCache.hpp"
 #include "index/GcTypes.hpp"
 #include "index/IndexRecovery.hpp"
 #include "index/Pager.hpp"
@@ -173,6 +174,8 @@ public:
         uint64_t gc_batch_bytes = 1024 * 1024;  // relocations per appendRelocated (one fsync)
         uint32_t gc_batch_max_stripes = 32;     // max distinct stripes held by one batch
         uint32_t gc_rate_mb_s = 32;             // GC vLog writes per second (0: no limit)
+        // Read path: open vLog segment descriptors kept for get() / update() (LRU).
+        size_t fd_cache_size = 64;
         // Test-only hooks.
         std::function<void(uint32_t victim, size_t entries)> on_gc_after_append;
         std::function<void(uint32_t victim)> on_gc_after_apply;
@@ -197,6 +200,7 @@ public:
         if (!(opts.gc_threshold > 0.0 && opts.gc_threshold < 1.0))
             throw std::invalid_argument("gc_threshold must be in (0, 1)");
         if (opts.gc_batch_bytes == 0) throw std::invalid_argument("gc_batch_bytes must be > 0");
+        if (opts.fd_cache_size == 0) throw std::invalid_argument("fd_cache_size must be > 0");
         if (opts.gc_batch_max_stripes == 0)
             throw std::invalid_argument("gc_batch_max_stripes must be > 0");
         if (opts.gc_enabled && opts.gc_interval_ms == 0)
@@ -588,6 +592,7 @@ public:
         return condemned_;
     }
     uint64_t activeReadPinsForTest() const { return readers_.activePins(); }
+    const SegmentFdCache& fdCacheForTest() const { return fds_; }
 
     // Test-only: recomputes the counters from the index and the segment files and compares them
     // with the in-memory ones. "" if equal, else the first difference. Callers must have stopped
@@ -695,6 +700,7 @@ private:
         }
         for (uint32_t id : to_unlink) {
             if (opts_.on_gc_before_unlink) opts_.on_gc_before_unlink(id);
+            fds_.invalidate(id); // closes once no reader holds it
             const std::string path = segmentPath(id);
             if (::unlink(path.c_str()) != 0 && errno != ENOENT) fatal("unlink failed for " + path);
             if (opts_.on_gc_after_unlink_before_dirsync) opts_.on_gc_after_unlink_before_dirsync(id);
@@ -1084,7 +1090,6 @@ private:
     // expected seq (the index seq, then each Delta's base_seq), and the depth must fall by one per
     // hop until a Full entry. Throws VLogReadError otherwise.
     Version readVersion(std::string_view key, const vlog::IndexValueRef& ref) const {
-        vlog::VLogReader reader(vlog_dir_);
         Version v;
         uint64_t want_seq = ref.seq;
         vlog::VPtr at = ref.vptr;
@@ -1096,7 +1101,8 @@ private:
             const std::string where = "segment " + std::to_string(at.segment_id) + " offset " +
                                       std::to_string(at.offset) + " (expected seq " +
                                       std::to_string(want_seq) + ")";
-            if (!reader.readEntry(at, h, k, payload)) {
+            SegmentFdCache::Lease lease = fds_.acquire(at.segment_id);
+            if (!lease || !vlog::VLogReader::readEntryAt(lease.fd(), at, h, k, payload)) {
                 throw VLogReadError(
                     "vLog entry unreadable (missing segment, bad bounds, or CRC mismatch) at " +
                     where);
@@ -1452,6 +1458,7 @@ private:
     uint32_t cp_replay_older_ = 0;
     bool cp_has_older_ = false;
     mutable ReaderRegistry readers_;
+    mutable SegmentFdCache fds_{vlog_dir_, opts_.fd_cache_size};
     std::mutex gc_run_mu_; // one GC pass at a time
     std::mutex gc_thread_mu_; // guards gc_stop_
     std::condition_variable gc_cv_;
