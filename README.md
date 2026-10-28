@@ -1,11 +1,112 @@
-# LSM: a document store with key-value separation
+# Crash-safe Document Store Engine in C++
+
+C++17, no third-party runtime dependencies in the engine, built and tested on macOS (Apple Silicon)
+and Linux. The SQLite comparison benchmark links the system SQLite library.
+
+## At a glance
+
+An embedded database that stores JSON documents by key and is designed so that no acknowledged
+write is lost after a crash (verified by the kill -9 tests below).
+
+- Documents are appended to a log on disk and never overwritten.
+- A B+Tree index stores only where each document lives in that log.
+- Small changes (`$set` / `$inc` / `$unset`) append a small change record, not the whole document.
+- Checkpoints let recovery read only the end of the log after a crash.
+- A background garbage collector reclaims space from old versions.
+
+```
+put/update -> log (group commit + fsync) -> B+Tree -> ack
+get        -> B+Tree -> log -> document
+```
+
+## Results vs SQLite and MongoLite
+
+1 KB documents, 25,000 documents per dataset, 10,000 single-field updates (`profile.score + 1`).
+
+| Metric | This engine | SQLite | MongoLite (legacy) | Winner |
+|---|---:|---:|---:|---|
+| Bytes written per update, 1 thread (bytes, lower is better) | 16,818 | 33,256 | 21,060 | This engine |
+| Bytes written per update, 16 threads (bytes, lower is better) | 1,384 | 33,300 | 21,852 | This engine |
+| Updates per second, 1 thread (higher is better) | 257 | 340 | 274 | SQLite |
+| Updates per second, 16 threads (higher is better) | 3,363 | 313 | 287 | This engine |
+
+Same Mac (Apple M5), same durability (F_FULLFSYNC on every acked write for all engines), median of 3
+runs. Full details below.
+
+Where SQLite wins:
+- **Single-thread throughput:** 340 vs 257 updates per second, and 453 vs 273 inserts per second
+  in the 1-thread bulk load (1 KB, higher is better).
+- **Range scans of 100 keys:** 9,166 vs 1,423 scans per second (higher is better).
+- **File growth per update:** 0 vs 449 bytes (1 KB, 1 thread, lower is better).
+
+MongoLite (legacy) has the fastest point gets: 283,476 vs 123,646 gets per second for this engine
+(higher is better).
+
+## Proof it is correct
+
+kill -9 crash tests (latest full-mode run, macOS, AddressSanitizer build):
+
+| Suite | What is killed | Runs | Result |
+|---|---|---:|---|
+| V9 | vLog writer during group commit | 50 | 21,926 entries recovered, including all 21,750 acked; bytes verified |
+| B5.2 | store during writes, recovery and clean close | 50 | 17,073 acked ops; newest acked op reflected for 3,160 keys |
+| CP11 | writes, checkpoint flush, between index fsync and superblock, recovery | 50 | 12,507 acked ops; newest acked op reflected for 8,599 keys |
+| P4.G1 | stream of `$inc` updates on one key | 20 | 1,994 acked; acked <= value <= acked + 1 |
+| P4.G2 | random updates on many keys | 20 | 2,240 acked updates, all visible; index == full log replay |
+| P5.H1-H5 | 5 points inside garbage collection | 5 | acked writes intact, no erased key returned, rebuild matches |
+| P6.C3 | 3 points inside a checkpoint, 16 writer threads | 9 | every acked op present; index == full rebuild |
+| bench-stress chaos | 16-thread load with background GC | 50 per run, 3 runs | 112,305 of 112,305 acked operations verified (median run) |
+
+The engine comparison's crash test (kill -9 during 16-thread 1 KB updates, 3 runs) lost 0 acked
+updates for this engine and SQLite. MongoLite (legacy) lost 863, 852 and 859 of 2,500 acked updates.
+
+- **Sanitizers:** ASan + UBSan and TSan pass with no reports on macOS and on Linux (g++ 14,
+  aarch64 container). TSan builds skip the fork-based kill -9 tests.
+- **CI:** GitHub Actions on Ubuntu runs `make test-quick` and `make asan` with g++ and clang++, and
+  a separate `make tsan` job.
+
+## Build and test
+
+```
+make test-quick     # 10 test binaries, smaller workloads; write limit 32 MiB (recent totals 26.6-26.9 MB)
+make test           # the same binaries, full workloads; write limit 512 MiB
+make asan           # AddressSanitizer + UndefinedBehaviorSanitizer, full workloads
+make tsan           # ThreadSanitizer (fork + kill -9 tests skipped)
+make bench          # delta-update and GC benchmarks
+make bench-stress   # 100,000 keys, 16 threads, GC on/off, 50 x kill -9
+make bench-compare  # this engine vs SQLite vs MongoLite (links -lsqlite3), about 20 GB written
+make clean
+```
+
+## Project layout
+
+- `include/vlog/`: the append-only log: on-disk format, CRC32C, writer with group commit, reader.
+- `include/index/`: B+Tree, pager, superblock and checkpoints, recovery, garbage collection, `IndexedStore`.
+- `include/doc/`: JSON parser and serializer, `$set` / `$unset` / `$inc` update operators.
+- `tests/`: test binaries, built and run by the Makefile.
+- `bench/`: benchmarks (`make bench`, `bench-stress`, `bench-compare`).
+- `legacy/`: the earlier MongoLite engine, used only by the comparison benchmark.
+
+## Known limitations
+
+- Measurements come from one machine (Apple M5, macOS); the Linux runs are correctness tests only.
+- Crash tests use kill -9, not power loss.
+- No query language and no secondary indexes; only point lookups by key and key-range scans.
+- Range scans are slower than SQLite (1,423 vs 9,166 scans of 100 keys per second).
+- Single-threaded writes are slower than SQLite (257 vs 340 updates per second, 1 KB).
+- Writes to one key are serialized, so one key takes at most about one write per F_FULLFSYNC.
+- `index.db` never shrinks; freed pages are reused.
+
+---
+
+# Design details
 
 A C++17 storage engine: documents go to an append-only value log (vLog), a disk-based B+Tree maps
 each key to the location of its newest document, and checkpoints plus a two-slot superblock make
 crash recovery replay only the tail of the log. `update()` appends a small Delta entry (the changed
 fields) instead of rewriting the whole document.
 
-## The problem
+### The problem
 
 The earlier engine in `legacy/` (MongoLite) stored documents in 4 KiB slotted pages and updated
 them in place behind a write-ahead log. A small update to one document rewrites a whole page plus
@@ -23,7 +124,7 @@ ops)` writes only the changed paths as a Delta entry that points at the previous
 follow the chain back to a full copy. Measured on one machine, this cuts bytes written per update
 by 3.7x (1 KB documents) to 4.8x (8 KB documents); see Measured results.
 
-## Design
+### Design
 
 ```
 put(key, doc) --> vLog append (group commit, F_FULLFSYNC) --> apply to B+Tree in seq order --> ack
@@ -140,7 +241,7 @@ every winning Delta chain is then walked back to its Full base; a broken chain f
 `VLogCorruptError` and changes no file. Segment ids may have gaps after GC. If the replay point is missing from the vLog
 (acked entries are gone), open fails with an error and changes nothing.
 
-## Layout
+### Layout
 
 ```
 include/vlog/    value log: on-disk format, CRC32C, writer, reader
@@ -153,7 +254,7 @@ legacy/          earlier MongoLite engine (not built)
 
 `include/vlog/` and `include/doc/` include nothing from the layers above them; `make` checks this.
 
-## Build and test
+### Build and test
 
 Requires a C++17 compiler. Tested with Apple clang 21 on macOS; GitHub Actions runs `make test-quick`
 and `make asan` on Ubuntu with g++ and clang++ (`.github/workflows/ci.yml`).
@@ -187,7 +288,7 @@ budget as it writes (512 MiB in total for `test`/`asan`/`tsan`, 32 MiB for `test
 | `test_gc` | relocated entries in replay and rebuild, segment-id gaps, identity of older stores, counters, segment lifecycle and condemned list, reader pins, victim selection, relocation of Full entries / chains / tombstones, user writes and erases racing GC, kill -9 at 5 GC points, GC thread + 8 threads (P5) |
 | `test_perf` | segment rollover with 16 threads, segment descriptor cache (bounded, GC, deleted segments), adaptive group-commit window, checkpoints written outside the locks: snapshot fidelity and page reuse, 16-thread load, kill -9 at 3 new points (P6) |
 
-## Measured results
+### Measured results
 
 One run of `TEST_VERBOSE=1 make test` (optimized build) on 2026-10-24:
 Apple M5 (10 cores), 16 GB RAM, internal SSD (APFS), macOS 27.0, Apple clang 21.0.0.
@@ -287,7 +388,7 @@ put and update are dominated by `F_FULLFSYNC` (about 3 ms here). With GC on, put
 
 These are single runs on one machine, not averaged benchmarks.
 
-## High-Scale Stress Benchmark
+### High-Scale Stress Benchmark
 
 The numbers in this section are from one run before the performance work below (commit
 `bfea1bf`); see "Performance work" for medians of 3 runs before and after.
@@ -384,7 +485,7 @@ superblock.db was deleted and the full cold rebuild was compared with the recove
 
 This run wrote 736 MB in total (cap 2 GiB).
 
-## Performance work
+### Performance work
 
 Goal: make `make bench-stress` faster without changing what it measures: the same workload,
 seed, dataset (100,000 keys x 1 KB, 16 threads) and 4 MiB index cache, every acked write still
@@ -485,7 +586,7 @@ while relocated segments wait for normal checkpoints. The default stays 0.5.
 (`pmset -g log`), which `steady_clock` counted as a 710 s and a 1,023 s write latency. The
 affected tuning run was repeated; all final runs used `caffeinate`.
 
-## Storage Engine Comparison
+### Storage Engine Comparison
 
 `make bench-compare` (`bench/bench_compare.cpp`) compares this engine with SQLite 3 and the
 legacy MongoLite engine (`legacy/`, unmodified) under the same durability rule: every acked write
@@ -536,7 +637,7 @@ On APFS a single-threaded durable write costs about 17 KB or more of physical I/
 (each fsync writes whole 4 KB blocks plus file-system metadata). Group commit spreads that cost
 over many writes when 16 threads write together.
 
-### Headline: bytes written per update (OS counter, median of 3)
+#### Headline: bytes written per update (OS counter, median of 3)
 
 | Update workload | IndexedStore | SQLite | MongoLite | Winner |
 |---|---:|---:|---:|---|
@@ -569,11 +670,11 @@ over many writes when 16 threads write together.
 - **File growth per update:** SQLite updates in place (0 bytes of growth), while this engine
   appends.
 
-### Full results (median of 3 runs)
+#### Full results (median of 3 runs)
 
-### A. Bulk load (25000 documents of 1 KB)
+#### A. Bulk load (25000 documents of 1 KB)
 
-#### A load 1 KB, 1 thread
+##### A load 1 KB, 1 thread
 
 | Metric | IndexedStore | SQLite | MongoLite | Winner |
 |---|---:|---:|---:|---|
@@ -588,7 +689,7 @@ over many writes when 16 threads write together.
 | full syncs per op (F_FULLFSYNC) | 1.000 | 1.008 | 1.000 **(best)** | MongoLite |
 | SQLITE_BUSY retries (SQLite only) | - | 0 | - | n/a |
 
-#### A load 1 KB, 16 threads
+##### A load 1 KB, 16 threads
 
 | Metric | IndexedStore | SQLite | MongoLite | Winner |
 |---|---:|---:|---:|---|
@@ -603,9 +704,9 @@ over many writes when 16 threads write together.
 | full syncs per op (F_FULLFSYNC) | 0.064 **(best)** | 1.020 | 1.000 | IndexedStore |
 | SQLITE_BUSY retries (SQLite only) | - | 60 | - | n/a |
 
-### B. Small updates (10000 updates of profile.score + 1 on 25000 documents)
+#### B. Small updates (10000 updates of profile.score + 1 on 25000 documents)
 
-#### B update 1 KB, 1 thread
+##### B update 1 KB, 1 thread
 
 | Metric | IndexedStore | SQLite | MongoLite | Winner |
 |---|---:|---:|---:|---|
@@ -622,7 +723,7 @@ over many writes when 16 threads write together.
 | SQLITE_BUSY retries (SQLite only) | - | 0 | - | n/a |
 | GC bytes per op (IndexedStore only) | 0 | - | - | n/a |
 
-#### B update 1 KB, 16 threads
+##### B update 1 KB, 16 threads
 
 | Metric | IndexedStore | SQLite | MongoLite | Winner |
 |---|---:|---:|---:|---|
@@ -639,7 +740,7 @@ over many writes when 16 threads write together.
 | SQLITE_BUSY retries (SQLite only) | - | 17 | - | n/a |
 | GC bytes per op (IndexedStore only) | 0 | - | - | n/a |
 
-#### B update 2 KB, 1 thread
+##### B update 2 KB, 1 thread
 
 | Metric | IndexedStore | SQLite | MongoLite | Winner |
 |---|---:|---:|---:|---|
@@ -656,7 +757,7 @@ over many writes when 16 threads write together.
 | SQLITE_BUSY retries (SQLite only) | - | 0 | - | n/a |
 | GC bytes per op (IndexedStore only) | 0 | - | - | n/a |
 
-#### B update 2 KB, 16 threads
+##### B update 2 KB, 16 threads
 
 | Metric | IndexedStore | SQLite | MongoLite | Winner |
 |---|---:|---:|---:|---|
@@ -673,7 +774,7 @@ over many writes when 16 threads write together.
 | SQLITE_BUSY retries (SQLite only) | - | 17 | - | n/a |
 | GC bytes per op (IndexedStore only) | 0 | - | - | n/a |
 
-#### B update 8 KB, 1 thread
+##### B update 8 KB, 1 thread
 
 | Metric | IndexedStore | SQLite | MongoLite | Winner |
 |---|---:|---:|---:|---|
@@ -690,7 +791,7 @@ over many writes when 16 threads write together.
 | SQLITE_BUSY retries (SQLite only) | - | 0 | - | n/a |
 | GC bytes per op (IndexedStore only) | 0 | - | - | n/a |
 
-#### B update 8 KB, 16 threads
+##### B update 8 KB, 16 threads
 
 | Metric | IndexedStore | SQLite | MongoLite | Winner |
 |---|---:|---:|---:|---|
@@ -707,9 +808,9 @@ over many writes when 16 threads write together.
 | SQLITE_BUSY retries (SQLite only) | - | 14 | - | n/a |
 | GC bytes per op (IndexedStore only) | 0 | - | - | n/a |
 
-### C. Reads after reopening (1 KB dataset)
+#### C. Reads after reopening (1 KB dataset)
 
-#### C point get (1 KB, 1 thread)
+##### C point get (1 KB, 1 thread)
 
 | Metric | IndexedStore | SQLite | MongoLite | Winner |
 |---|---:|---:|---:|---|
@@ -719,7 +820,7 @@ over many writes when 16 threads write together.
 | p99.9 latency (µs) | 48 | 43 | 11 **(best)** | MongoLite |
 | max latency (µs) | 104 | 413 | 24 **(best)** | MongoLite |
 
-#### C range scan 100 (1 KB, 1 thread)
+##### C range scan 100 (1 KB, 1 thread)
 
 | Metric | IndexedStore | SQLite | MongoLite | Winner |
 |---|---:|---:|---:|---|
@@ -729,7 +830,7 @@ over many writes when 16 threads write together.
 | p99.9 latency (µs) | 1,166 | 264 **(best)** | 438 | SQLite |
 | max latency (µs) | 1,166 | 264 **(best)** | 438 | SQLite |
 
-### D. Disk footprint after B (live data = documents x document size)
+#### D. Disk footprint after B (live data = documents x document size)
 
 | Dataset | Metric | IndexedStore | SQLite | MongoLite | Winner |
 |---|---|---:|---:|---:|---|
@@ -749,7 +850,7 @@ over many writes when 16 threads write together.
 | 8 KB | space amplification after GC settles | 1.04 | - | - | n/a |
 | 8 KB | GC MB written while settling | 0.0 | - | - | n/a |
 
-### E. kill -9 during 16-thread 1 KB updates (killed after 2500 acks)
+#### E. kill -9 during 16-thread 1 KB updates (killed after 2500 acks)
 
 | Engine | Run | Acked updates | Acked updates lost | In flight at the kill | Reopened |
 |---|---:|---:|---:|---:|---|
@@ -764,7 +865,7 @@ over many writes when 16 threads write together.
 | MongoLite | 3 | 2,500 | 859 of 2,500 | 16 | yes |
 
 
-## Known limitations
+### Known limitations
 
 
 - **GC limits**: one GC thread and one victim per pass; `index.db` never shrinks (freed pages are
@@ -802,13 +903,13 @@ over many writes when 16 threads write together.
 
 ---
 
-## Production Verification & Invariant Mapping
+### Production Verification & Invariant Mapping
 
 > For complete, untruncated terminal logs of all test suites and benchmarks, see [docs/VERIFICATION_LOGS.md](docs/VERIFICATION_LOGS.md).
 
 This section maps the core storage engine invariants to their empirical test suites and documents the underlying architectural design principles.
 
-### 1. Test Suite & Verification Matrix
+#### 1. Test Suite & Verification Matrix
 
 The engine enforces strict hardware-level correctness through three complementary build configurations:
 - `make tsan` (Clang ThreadSanitizer): Proves data-race freedom across 1024 stripe locks, sequencers, and concurrent reads/writes.
@@ -826,7 +927,7 @@ The engine enforces strict hardware-level correctness through three complementar
 | **Delta Logging & Write Savings** | `P4.D1`–`P4.D7`, `make bench` | Validates in-place delta updates. Reduces write volume by $3.65\times$ (1 KB) to $4.78\times$ (8 KB) while guaranteeing byte-for-byte fidelity (`P4.D7`) and identical document states across caps 0..4 (`P4.D6`). |
 | **Strict JSON & Path Safety** | `P4.A1`–`P4.C10` | RFC 8259 compliance: depth limits (64 max), int64 overflow detection, surrogate pair escapes, path conflict resolution (`"a"` vs `"a.b"`), and zero-write guarantees on error. |
 
-### 2. Core Architectural Design Principles
+#### 2. Core Architectural Design Principles
 
 1. **Key-Value Separation (WiscKey Model)**
    - Traditional slotted page architectures (e.g., PostgreSQL heap, WiredTiger) rewrite full 4–8 KiB pages for small mutations, resulting in severe write amplification. By appending payloads sequentially to an append-only Value Log (vLog) and indexing them with slim 24-byte references (`IndexValueRef`), payload write amplification is eliminated.
