@@ -193,6 +193,9 @@ struct RunResult {
     uint64_t index_bytes_written = 0, vlog_bytes_written = 0;
     uint64_t index_load = 0, index_mixed = 0, vlog_load = 0, vlog_mixed = 0;
     uint64_t keys_end = 0;
+    double avg_batch = 0;      // entries per group-commit write + F_FULLFSYNC (whole run)
+    uint64_t cp_count = 0;     // checkpoints written (not skipped)
+    double cp_stall_p50 = 0, cp_stall_max = 0, cp_stall_sum = 0; // ms the locks were held
 };
 
 RunResult run(const std::string& dir, bool gc_on) {
@@ -221,6 +224,8 @@ RunResult run(const std::string& dir, bool gc_on) {
     r.base = space(*st);
 
     // Mixed phase.
+    std::printf("phase: mixed start (GC %s)\n", gc_on ? "on" : "off");
+    std::fflush(stdout);
     const bpt::Pager::Stats ps0 = st->pager().stats();
     std::vector<std::array<Lat, kNumCls>> lat(kThreads);
     std::atomic<uint64_t> checked{0};
@@ -340,6 +345,18 @@ RunResult run(const std::string& dir, bool gc_on) {
         CHECK(model[k].present ? got == model[k].doc(k) : !got);
     }
     r.vlog_bytes_written = st->vlogBytesWritten();
+    r.avg_batch = st->vlogAverageBatch();
+    {
+        std::vector<double> stalls;
+        for (const bpt::CheckpointReport& c : st->checkpointReports()) stalls.push_back(c.stall_ms);
+        std::sort(stalls.begin(), stalls.end());
+        r.cp_count = stalls.size();
+        if (!stalls.empty()) {
+            r.cp_stall_p50 = stalls[stalls.size() / 2];
+            r.cp_stall_max = stalls.back();
+            for (double x : stalls) r.cp_stall_sum += x;
+        }
+    }
     st->close();
     st.reset();
     r.index_bytes_written = g_index_bytes.load() - index0;
@@ -675,6 +692,42 @@ int main() {
                 "1 MiB of vLog; each child runs 16 threads and is killed after a random number of "
                 "acks (400-4,399).\n\n",
                 kChaosKeys);
+    std::printf("### Group commit and checkpoints\n\n");
+    std::printf("| Measure | GC off | GC on |\n|---|---:|---:|\n");
+    std::printf("| Entries per write + F_FULLFSYNC (whole run) | %.2f | %.2f |\n", off.avg_batch,
+                on.avg_batch);
+    std::printf("| Checkpoints written | %llu | %llu |\n", (unsigned long long)off.cp_count,
+                (unsigned long long)on.cp_count);
+    std::printf("| Checkpoint stall (locks held), median / max / total | %.1f / %.1f / %.0f ms | "
+                "%.1f / %.1f / %.0f ms |\n\n",
+                off.cp_stall_p50, off.cp_stall_max, off.cp_stall_sum, on.cp_stall_p50,
+                on.cp_stall_max, on.cp_stall_sum);
+    // Machine-readable summary (medians over runs are taken from these lines).
+    for (const RunResult* r : {&off, &on}) {
+        const char* g = r->gc ? "on" : "off";
+        std::printf("METRIC %s load_ops_s %.1f\n", g, kKeys / r->load_s);
+        std::printf("METRIC %s mixed_ops_s %.1f\n", g, kMixedOps / r->mixed_s);
+        const std::pair<const char*, const Lat*> lats[] = {
+            {"put", &r->put_all}, {"update", &r->upd_all}, {"get", &r->get_all},
+            {"get0", &r->cls[kGet0]}, {"getchain", &r->cls[kGetChain]}, {"erase", &r->cls[kErase]}};
+        for (const auto& [name, l] : lats)
+            std::printf("METRIC %s %s_us p50 %.1f p90 %.1f p99 %.1f p999 %.1f max %.1f\n", g, name,
+                        l->pct(0.5), l->pct(0.9), l->pct(0.99), l->pct(0.999), l->max());
+        std::printf("METRIC %s index_mb %.2f\n", g, r->index_bytes_written / 1e6);
+        std::printf("METRIC %s index_mixed_mb %.2f\n", g, r->index_mixed / 1e6);
+        std::printf("METRIC %s amp_peak %.3f\n", g, r->peak.amp);
+        std::printf("METRIC %s amp_post %.3f\n", g, r->post.amp);
+        std::printf("METRIC %s gc_mb %.2f\n", g, r->gc_bytes / 1e6);
+        std::printf("METRIC %s avg_batch %.2f\n", g, r->avg_batch);
+        std::printf("METRIC %s cp_count %llu\n", g, (unsigned long long)r->cp_count);
+        std::printf("METRIC %s cp_stall_p50_ms %.2f\n", g, r->cp_stall_p50);
+        std::printf("METRIC %s cp_stall_max_ms %.2f\n", g, r->cp_stall_max);
+        std::printf("METRIC %s page_reads_per_op %.4f\n", g, double(r->mixed_page_reads) / kMixedOps);
+    }
+    std::printf("METRIC chaos recover_ms %.2f\n", cr.recover_ms_sum / std::max(1, cr.crashes));
+    std::printf("METRIC chaos rebuild_ms %.2f\n", cr.rebuild_ms_sum / std::max(1, cr.crashes));
+    std::printf("METRIC chaos acked %llu verified %llu\n", (unsigned long long)cr.acked,
+                (unsigned long long)cr.verified);
     std::printf("[Budget] bytes written: %llu of %llu\n", (unsigned long long)bytesWritten(),
                 (unsigned long long)kBenchBudget);
     return 0;

@@ -625,6 +625,9 @@ public:
     BPTree& tree() { return *tree_; }
     Pager& pager() { return *pager_; }
     uint64_t vlogBytesWritten() const { return writer_ ? writer_->getTotalBytesWritten() : 0; }
+    // Group commit: entries per write + F_FULLFSYNC batch, and the number of those fsyncs.
+    double vlogAverageBatch() const { return writer_ ? writer_->getAverageBatchSize() : 0.0; }
+    uint64_t vlogFsyncs() const { return writer_ ? writer_->getTotalFsyncs() : 0; }
     uint64_t vlogLastSeq() const {
         return writer_->getCurrentSeq();
     } // last seq assigned by the vLog writer
