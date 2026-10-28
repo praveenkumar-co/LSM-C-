@@ -121,12 +121,7 @@ public:
                                      std::to_string(total_bytes_written_ + total_len) + " > " +
                                      std::to_string(options_.max_bytes) + ")");
         }
-        // Rollover: the in-flight batch must land in the old segment before it is closed.
-        if (current_offset_ + total_len > options_.segment_size_limit) {
-            while (flush_in_progress_) cv_.wait(lock);
-            flushStagingBufferLocked();
-            openNewSegmentLocked();
-        }
+        rollOverIfNeededLocked(lock, total_len);
         // seq and offset are assigned under the same lock, so file order == seq order for every
         // entry without kFlagRelocated (appendRelocated keeps a GC copy's original seq).
         current_seq_++;
@@ -218,11 +213,7 @@ public:
         }
         for (const std::vector<uint8_t>& buf : bufs) {
             const uint32_t total_len = static_cast<uint32_t>(buf.size());
-            if (current_offset_ + total_len > options_.segment_size_limit) {
-                while (flush_in_progress_) cv_.wait(lock);
-                flushStagingBufferLocked();
-                openNewSegmentLocked();
-            }
+            rollOverIfNeededLocked(lock, total_len);
             out.push_back(VPtr{current_segment_id_, current_offset_, total_len});
             staging_buffer_.insert(staging_buffer_.end(), buf.begin(), buf.end());
             current_offset_ += total_len;
@@ -277,6 +268,19 @@ private:
         bool failed{false};
         std::condition_variable cv;
     };
+
+    // Rolls over to a new segment if an entry of total_len bytes does not fit in the current one.
+    // An in-flight flush must land in the old segment before it is closed, so this waits for it
+    // first, then checks again: another thread may have rolled over while this one waited, and
+    // then the entry fits in that new segment (without the re-check, every waiting thread would
+    // open one more, almost empty segment).
+    void rollOverIfNeededLocked(std::unique_lock<std::mutex>& lock, uint32_t total_len) {
+        if (current_offset_ + total_len <= options_.segment_size_limit) return;
+        while (flush_in_progress_) cv_.wait(lock);
+        if (current_offset_ + total_len <= options_.segment_size_limit) return;
+        flushStagingBufferLocked();
+        openNewSegmentLocked();
+    }
 
     // Waits until req is durable: as a follower while another thread leads, or as the leader,
     // which flushes batches until no request is waiting. Called with req already queued.

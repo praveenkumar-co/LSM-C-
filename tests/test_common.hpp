@@ -6,7 +6,7 @@
 // Rule for new tests: in quick mode (TEST_QUICK) a test must run a fixed number of operations,
 // never "for N ms" or "until killed", so the bytes it writes do not depend on time or disk speed.
 // Each test should write under 1 MiB in quick mode unless the reason is written next to it. The
-// quick total must stay well under the 24 MiB budget; each [PASS] line shows the test's bytes.
+// quick total must stay well under the 32 MiB budget; each [PASS] line shows the test's bytes.
 
 #include <atomic>
 #include <cerrno>

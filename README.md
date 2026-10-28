@@ -370,10 +370,6 @@ This run wrote 736 MB in total (cap 2 GiB).
 
 ## Known limitations
 
-- **Concurrent writers create extra small segments**: when several threads hit a segment rollover
-  together, each opens a new segment after waiting, without checking again (16 threads writing
-  20 MB with a 1 MiB limit made 79 segments, 60 of them under 512 KiB; one thread made 20). The
-  segments are valid; there are just more of them.
 
 - **GC limits**: one GC thread and one victim per pass; `index.db` never shrinks (freed pages are
   reused); open reads one small header per key to rebuild the GC counters; tombstones of erased

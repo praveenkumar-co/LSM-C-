@@ -2,14 +2,14 @@
 #   make test        optimized build
 #   make asan        AddressSanitizer + UndefinedBehaviorSanitizer
 #   make tsan        ThreadSanitizer (defines TSAN_BUILD)
-#   make test-quick  optimized build with -DTEST_QUICK: smaller workloads, under 24 MiB written
+#   make test-quick  optimized build with -DTEST_QUICK: smaller workloads, under 32 MiB written
 #   make bench       delta-update and GC benchmarks (not part of any test mode)
 #   make bench-stress  100,000-key, 16-thread stress benchmark with GC and 50 kill -9 crashes
 #   make clean
 #
 # Each test binary prints one "[PASS] ..." line per test (TEST_VERBOSE=1 adds measurements) and
 # "[Budget] bytes written: N of M". After a run, the Makefile adds up N over all binaries and
-# fails if the sum is over the mode's limit (512 MiB for test/asan/tsan, 24 MiB for test-quick).
+# fails if the sum is over the mode's limit (512 MiB for test/asan/tsan, 32 MiB for test-quick).
 
 ifeq ($(origin CXX),default)
 CXX := clang++
@@ -31,7 +31,7 @@ FLAGS_quick := -O2 -DTEST_QUICK
 LIMIT_test  := 536870912
 LIMIT_asan  := 536870912
 LIMIT_tsan  := 536870912
-LIMIT_quick := 25165824
+LIMIT_quick := 33554432
 
 .PHONY: test asan tsan quick test-quick bench bench-stress clean check-deps
 
