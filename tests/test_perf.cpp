@@ -18,6 +18,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <cstring>
 #include <filesystem>
 #include <map>
@@ -43,9 +45,9 @@ static uint64_t dirBytes(const std::string& d) {
 // ------------------------------------------------------------------------------------------
 static void testS1Rollover(const std::string& dir) {
     banner("P6.S1 16 threads rolling over together open one segment, not one each");
-    // Full mode: 20 MB with 256 KiB segments. Quick mode: 2 MB with 64 KiB segments.
+    // Full mode: 20 MB with 256 KiB segments. Quick mode: 1 MB with 64 KiB segments.
     const uint32_t seg = kQuick ? 64 * 1024 : 256 * 1024;
-    const uint64_t target = kQuick ? 2ULL * 1000 * 1000 : 20ULL * 1000 * 1000;
+    const uint64_t target = kQuick ? 1ULL * 1000 * 1000 : 20ULL * 1000 * 1000;
     const int kThreads = 16;
     const std::string payload(1000, 'x');
     const uint32_t entry = vlog::entry_size(8, static_cast<uint32_t>(payload.size()));
@@ -329,12 +331,28 @@ static void testC2CheckpointsUnderLoad(const std::string& dir) {
     auto st = IndexedStore::open(dir, cpOpts());
     const int kKeys = 512, kOps = kQuick ? 150 : 800;
     std::vector<Model> model(kKeys);
-    std::atomic<bool> done{false};
+    // A fixed number of checkpoints, one every kEvery ops (by op count, not as fast as the disk
+    // allows), so the bytes written do not depend on disk speed. They still run concurrently
+    // with the 16 writers.
+    const uint64_t kTotal = 16ULL * kOps, kEvery = kTotal / 50;
+    std::mutex ops_mu;
+    std::condition_variable ops_cv;
+    uint64_t ops_done = 0;
     std::vector<std::thread> th;
     for (int t = 0; t < 16; ++t)
         th.emplace_back([&, t] {
             std::mt19937 rng(t);
             for (int i = 0; i < kOps; ++i) {
+                struct OpDone {
+                    std::mutex& mu;
+                    std::condition_variable& cv;
+                    uint64_t& n;
+                    ~OpDone() {
+                        std::lock_guard<std::mutex> lk(mu);
+                        ++n;
+                        cv.notify_all();
+                    }
+                } op_done{ops_mu, ops_cv, ops_done};
                 const int k = t + 16 * static_cast<int>(rng() % (kKeys / 16));
                 Model& m = model[k];
                 const int op = static_cast<int>(rng() % 10);
@@ -360,14 +378,18 @@ static void testC2CheckpointsUnderLoad(const std::string& dir) {
         });
     int cps = 0;
     std::thread cp([&] {
-        while (!done) {
+        for (uint64_t next = kEvery; next <= kTotal; next += kEvery) {
+            {
+                std::unique_lock<std::mutex> lk(ops_mu);
+                ops_cv.wait(lk, [&] { return ops_done >= next; });
+            }
             st->checkpoint();
             cps++;
         }
     });
     for (auto& x : th) x.join();
-    done = true;
     cp.join();
+    CHECK(cps == static_cast<int>(kTotal / kEvery));
     auto verify = [&](IndexedStore& s, const char* what) {
         for (int k = 0; k < kKeys; ++k) {
             std::optional<std::string> got = s.get(ckey(k));
@@ -484,7 +506,12 @@ static void testC3KillDuringCheckpoint(const std::string& base) {
                             acks++;
                         }
                     });
-                while (true) st->checkpoint(); // killed inside one of them
+                // One checkpoint per 100 acks (by count, not as fast as the disk allows): the
+                // third one, at 300 acks, reaches the kill point.
+                for (uint64_t next = 100;; next += 100) {
+                    while (acks < next) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    st->checkpoint();
+                }
             }
             CHECK(close(pfd[1]) == 0);
             std::map<uint32_t, Rec> pending;

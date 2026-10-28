@@ -193,8 +193,12 @@ public:
             hdr.key_len = k_len;
             hdr.payload_len = p_len;
             hdr.raw_len = r.raw_len > 0 ? r.raw_len : p_len;
-            std::memcpy(buf.data() + sizeof(EntryHeader), r.key.data(), k_len);
-            if (p_len > 0) std::memcpy(buf.data() + payload_offset(k_len), r.payload.data(), p_len);
+            // entry_size() covers header + key + payload; checked here so the compiler sees the
+            // bound too (g++ 14 -Warray-bounds otherwise assumes buf may be empty).
+            if (buf.size() < payload_offset(k_len) + static_cast<size_t>(p_len))
+                throw std::invalid_argument("appendRelocated: entry size mismatch");
+            std::copy(r.key.begin(), r.key.end(), buf.begin() + sizeof(EntryHeader));
+            std::copy(r.payload.begin(), r.payload.end(), buf.begin() + payload_offset(k_len));
             std::memcpy(buf.data(), &hdr, sizeof(hdr));
             const uint32_t crc = crc32c(buf.data() + 4, buf.size() - 4);
             std::memcpy(buf.data(), &crc, sizeof(crc));
