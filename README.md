@@ -165,6 +165,7 @@ make asan        # AddressSanitizer + UndefinedBehaviorSanitizer
 make tsan        # ThreadSanitizer (fork + kill -9 tests are skipped)
 make bench       # delta-update and GC benchmarks; not part of the test modes, about 390 MB written
 make bench-stress  # 100,000 keys, 16 threads, GC on/off, 50 x kill -9; about 740 MB written
+make bench-compare # IndexedStore vs SQLite vs legacy MongoLite (-lsqlite3); about 20 GB written, about 2 h
 make clean
 ```
 
@@ -483,6 +484,285 @@ while relocated segments wait for normal checkpoints. The default stays 0.5.
 **Measurement note**: in two runs during this work the laptop went to sleep mid-benchmark
 (`pmset -g log`), which `steady_clock` counted as a 710 s and a 1,023 s write latency. The
 affected tuning run was repeated; all final runs used `caffeinate`.
+
+## Storage Engine Comparison
+
+`make bench-compare` (`bench/bench_compare.cpp`) compares this engine with SQLite 3 and the
+legacy MongoLite engine (`legacy/`, unmodified) under the same durability rule: every acked write
+is flushed with `F_FULLFSYNC` before it is acked. Median of 3 runs on an Apple M5, 17 GB RAM,
+APPLE SSD AP0512Z (APFS), macOS 27.0, Apple clang 21, SQLite 3.54.0 (system `libsqlite3`), on
+2026-10-28/29, with the machine kept awake (`caffeinate`; a workload during which the machine
+slept would have been rerun: none was).
+
+**Sizes.** Each dataset has 25,000 documents and each update workload 10,000 updates, half of the
+50,000 / 20,000 first planned: a pilot measured about 12 GB written per run at the full sizes.
+Reads use 10,000 point gets and 1,000 range scans of 100 keys. Documents are JSON with a nested
+`profile.score` integer, padded to 1 KB, 2 KB or 8 KB. Same keys, documents, seed and op counts
+for every engine, a fresh directory per engine and run. The whole run wrote 19.9 GB (OS counter).
+
+**Durability settings**
+- **IndexedStore**: default options, index cache 1,024 frames (4 MiB), background GC on (default
+  threshold 0.5). Every acked write is fsynced by the group commit.
+- **SQLite**: table `docs(key TEXT PRIMARY KEY, doc TEXT)`; `journal_mode = WAL`,
+  `synchronous = FULL`, `fullfsync = ON`, `checkpoint_fullfsync = ON`, `cache_size = -4096`
+  (4 MiB). Update in one statement:
+  `UPDATE docs SET doc = json_set(doc, '$.profile.score', json_extract(doc, '$.profile.score') + 1) WHERE key = ?`.
+  One connection per thread, `busy_timeout = 10000`. SQLite allows one writer at a time.
+  - **Adapter note:** macOS's system `libsqlite3` turns `fullfsync = ON` into
+    `F_BARRIERFSYNC` (measured 0.34 ms per commit, against 3.8 ms for `F_FULLFSYNC`), which
+    does not flush the drive cache. The benchmark registers a VFS shim that delegates every
+    call to the default VFS and also issues `F_FULLFSYNC` in `xSync`. The tables show 1.00-1.02
+    full syncs per SQLite write.
+  - **Adapter note:** with 16 writers a statement could wait longer than the 10 s busy timeout
+    (SQLite's busy handler is not fair), so the adapter retries a statement that returns
+    `SQLITE_BUSY`. The waiting counts in its latency, and the retries are listed in the tables.
+- **MongoLite** (`legacy/`, not modified): 1,024-frame buffer pool (4 MiB). Update = read ->
+  delete -> insert.
+  - **Adapter note:** its WAL never syncs, so the adapter `F_FULLFSYNC`s the WAL file after
+    every operation and the data file at checkpoint.
+  - **Adapter note:** every call goes through one mutex, because the legacy code has data races.
+  - **Limits:** its 4 KB pages cannot hold an 8 KB document ("not supported" below). It
+    printed 63 "[PrimaryIndex] Duplicate key error" messages while rebuilding its index on
+    reopen over the 3 runs.
+
+**How bytes are measured.** Disk bytes written by the process, from the OS (`proc_pid_rusage`
+`ri_diskio_byteswritten` on macOS), after each engine flushed its background work (SQLite
+`wal_checkpoint(TRUNCATE)`, IndexedStore and MongoLite `checkpoint()`). The tables also show the
+engine's file growth per op as a cross-check. Write amplification:
+- **WAF vs changed field:** bytes written / 11 bytes (the text `"score":N`).
+- **WAF vs document size:** bytes written / the document size.
+
+On APFS a single-threaded durable write costs about 17 KB or more of physical I/O in every engine
+(each fsync writes whole 4 KB blocks plus file-system metadata). Group commit spreads that cost
+over many writes when 16 threads write together.
+
+### Headline: bytes written per update (OS counter, median of 3)
+
+| Update workload | IndexedStore | SQLite | MongoLite | Winner |
+|---|---:|---:|---:|---|
+| 1 KB documents, 1 thread | 16,818 | 33,256 | 21,060 | IndexedStore |
+| 1 KB documents, 16 threads | 1,384 | 33,300 | 21,852 | IndexedStore |
+| 2 KB documents, 1 thread | 16,762 | 35,352 | 24,204 | IndexedStore |
+| 2 KB documents, 16 threads | 1,382 | 35,405 | 26,003 | IndexedStore |
+| 8 KB documents, 1 thread | 16,669 | 34,256 | not supported | IndexedStore |
+| 8 KB documents, 16 threads | 2,044 | 34,287 | not supported | IndexedStore |
+
+| Update throughput (ops/s) | IndexedStore | SQLite | MongoLite | Winner |
+|---|---:|---:|---:|---|
+| 1 KB, 1 thread | 257 | 340 | 274 | SQLite |
+| 1 KB, 16 threads | 3,363 | 313 | 287 | IndexedStore |
+| 2 KB, 1 thread | 255 | 340 | 241 | SQLite |
+| 2 KB, 16 threads | 3,402 | 309 | 240 | IndexedStore |
+| 8 KB, 1 thread | 255 | 259 | not supported | SQLite |
+| 8 KB, 16 threads | 2,216 | 284 | not supported | IndexedStore |
+
+**Where this engine loses**
+- **Single-threaded throughput and median latency:** SQLite wins every bulk-load and update
+  row. A SQLite commit (its barrier plus the shim's `F_FULLFSYNC`) measured 2.0-4.0 ms at the
+  median, against 3.9-4.0 ms for this engine.
+- **16 threads, median latency:** SQLite has the lowest p50, because one writer at a time
+  commits quickly while the others wait. Its p99.9 and maximum are 10-45 s.
+- **Point gets:** MongoLite wins (its index and buffer pool are in memory): 283,476 gets/s
+  against 123,646 for this engine.
+- **Range scans of 100 keys:** SQLite wins (9,166 scans/s against 1,423); this engine reads each
+  of the 100 documents from the vLog separately.
+- **File growth per update:** SQLite updates in place (0 bytes of growth), while this engine
+  appends.
+
+### Full results (median of 3 runs)
+
+### A. Bulk load (25000 documents of 1 KB)
+
+#### A load 1 KB, 1 thread
+
+| Metric | IndexedStore | SQLite | MongoLite | Winner |
+|---|---:|---:|---:|---|
+| ops/s | 273 | 453 **(best)** | 283 | SQLite |
+| p50 latency (µs) | 3,858 | 2,036 **(best)** | 3,882 | SQLite |
+| p99 latency (µs) | 5,911 | 5,217 **(best)** | 5,260 | SQLite |
+| p99.9 latency (µs) | 8,944 | 7,930 **(best)** | 10,792 | SQLite |
+| max latency (µs) | 189,473 | 188,794 | 153,840 **(best)** | MongoLite |
+| bytes written per op (OS) | 17,394 **(best)** | 29,127 | 18,275 | IndexedStore |
+| file growth per op | 1,137 **(best)** | 1,387 | 1,365 | IndexedStore |
+| WAF vs document size | 16.99 **(best)** | 28.44 | 17.85 | IndexedStore |
+| full syncs per op (F_FULLFSYNC) | 1.000 | 1.008 | 1.000 **(best)** | MongoLite |
+| SQLITE_BUSY retries (SQLite only) | - | 0 | - | n/a |
+
+#### A load 1 KB, 16 threads
+
+| Metric | IndexedStore | SQLite | MongoLite | Winner |
+|---|---:|---:|---:|---|
+| ops/s | 3,789 **(best)** | 308 | 268 | IndexedStore |
+| p50 latency (µs) | 4,019 | 3,050 **(best)** | 52,133 | SQLite |
+| p99 latency (µs) | 7,977 **(best)** | 11,001 | 127,966 | IndexedStore |
+| p99.9 latency (µs) | 11,869 **(best)** | 12,113,968 | 240,941 | IndexedStore |
+| max latency (µs) | 15,797 **(best)** | 45,439,544 | 2,235,110 | IndexedStore |
+| bytes written per op (OS) | 2,138 **(best)** | 30,158 | 18,267 | IndexedStore |
+| file growth per op | 1,137 **(best)** | 1,386 | 1,365 | IndexedStore |
+| WAF vs document size | 2.09 **(best)** | 29.45 | 17.84 | IndexedStore |
+| full syncs per op (F_FULLFSYNC) | 0.064 **(best)** | 1.020 | 1.000 | IndexedStore |
+| SQLITE_BUSY retries (SQLite only) | - | 60 | - | n/a |
+
+### B. Small updates (10000 updates of profile.score + 1 on 25000 documents)
+
+#### B update 1 KB, 1 thread
+
+| Metric | IndexedStore | SQLite | MongoLite | Winner |
+|---|---:|---:|---:|---|
+| ops/s | 257 | 340 **(best)** | 274 | SQLite |
+| p50 latency (µs) | 3,977 | 2,139 **(best)** | 3,912 | SQLite |
+| p99 latency (µs) | 5,173 | 5,674 | 5,080 **(best)** | MongoLite |
+| p99.9 latency (µs) | 9,284 **(best)** | 30,022 | 11,896 | IndexedStore |
+| max latency (µs) | 187,546 | 181,742 | 123,064 **(best)** | MongoLite |
+| bytes written per op (OS) | 16,818 **(best)** | 33,256 | 21,060 | IndexedStore |
+| file growth per op | 449 | 0 **(best)** | 1,365 | SQLite |
+| WAF vs changed field (11 B) | 1528.9 **(best)** | 3023.3 | 1914.6 | IndexedStore |
+| WAF vs document size | 16.42 **(best)** | 32.48 | 20.57 | IndexedStore |
+| full syncs per op (F_FULLFSYNC) | 1.000 **(best)** | 1.003 | 1.000 | IndexedStore |
+| SQLITE_BUSY retries (SQLite only) | - | 0 | - | n/a |
+| GC bytes per op (IndexedStore only) | 0 | - | - | n/a |
+
+#### B update 1 KB, 16 threads
+
+| Metric | IndexedStore | SQLite | MongoLite | Winner |
+|---|---:|---:|---:|---|
+| ops/s | 3,363 **(best)** | 313 | 287 | IndexedStore |
+| p50 latency (µs) | 4,099 | 2,074 **(best)** | 3,883 | SQLite |
+| p99 latency (µs) | 9,944 | 8,189 **(best)** | 905,332 | SQLite |
+| p99.9 latency (µs) | 10,934 **(best)** | 10,547,864 | 7,724,429 | IndexedStore |
+| max latency (µs) | 14,809 **(best)** | 22,275,816 | 17,323,660 | IndexedStore |
+| bytes written per op (OS) | 1,384 **(best)** | 33,300 | 21,852 | IndexedStore |
+| file growth per op | 100 | 0 **(best)** | 1,365 | SQLite |
+| WAF vs changed field (11 B) | 125.8 **(best)** | 3027.3 | 1986.5 | IndexedStore |
+| WAF vs document size | 1.35 **(best)** | 32.52 | 21.34 | IndexedStore |
+| full syncs per op (F_FULLFSYNC) | 0.067 **(best)** | 1.013 | 1.000 | IndexedStore |
+| SQLITE_BUSY retries (SQLite only) | - | 17 | - | n/a |
+| GC bytes per op (IndexedStore only) | 0 | - | - | n/a |
+
+#### B update 2 KB, 1 thread
+
+| Metric | IndexedStore | SQLite | MongoLite | Winner |
+|---|---:|---:|---:|---|
+| ops/s | 255 | 340 **(best)** | 241 | SQLite |
+| p50 latency (µs) | 3,953 | 2,970 **(best)** | 3,966 | SQLite |
+| p99 latency (µs) | 4,970 **(best)** | 5,173 | 6,821 | IndexedStore |
+| p99.9 latency (µs) | 8,053 **(best)** | 35,944 | 13,738 | IndexedStore |
+| max latency (µs) | 189,913 | 155,534 **(best)** | 2,590,704 | SQLite |
+| bytes written per op (OS) | 16,762 **(best)** | 35,352 | 24,204 | IndexedStore |
+| file growth per op | 447 | 0 **(best)** | 4,096 | SQLite |
+| WAF vs changed field (11 B) | 1523.9 **(best)** | 3213.8 | 2200.4 | IndexedStore |
+| WAF vs document size | 8.18 **(best)** | 17.26 | 11.82 | IndexedStore |
+| full syncs per op (F_FULLFSYNC) | 1.000 **(best)** | 1.003 | 1.000 | IndexedStore |
+| SQLITE_BUSY retries (SQLite only) | - | 0 | - | n/a |
+| GC bytes per op (IndexedStore only) | 0 | - | - | n/a |
+
+#### B update 2 KB, 16 threads
+
+| Metric | IndexedStore | SQLite | MongoLite | Winner |
+|---|---:|---:|---:|---|
+| ops/s | 3,402 **(best)** | 309 | 240 | IndexedStore |
+| p50 latency (µs) | 4,072 | 2,108 **(best)** | 3,949 | SQLite |
+| p99 latency (µs) | 8,942 | 7,356 **(best)** | 602,857 | SQLite |
+| p99.9 latency (µs) | 12,472 **(best)** | 10,957,702 | 11,013,579 | IndexedStore |
+| max latency (µs) | 16,029 **(best)** | 29,889,516 | 19,006,030 | IndexedStore |
+| bytes written per op (OS) | 1,382 **(best)** | 35,405 | 26,003 | IndexedStore |
+| file growth per op | 104 | 0 **(best)** | 4,096 | SQLite |
+| WAF vs changed field (11 B) | 125.6 **(best)** | 3218.6 | 2364.0 | IndexedStore |
+| WAF vs document size | 0.67 **(best)** | 17.29 | 12.70 | IndexedStore |
+| full syncs per op (F_FULLFSYNC) | 0.067 **(best)** | 1.011 | 1.000 | IndexedStore |
+| SQLITE_BUSY retries (SQLite only) | - | 17 | - | n/a |
+| GC bytes per op (IndexedStore only) | 0 | - | - | n/a |
+
+#### B update 8 KB, 1 thread
+
+| Metric | IndexedStore | SQLite | MongoLite | Winner |
+|---|---:|---:|---:|---|
+| ops/s | 255 | 259 **(best)** | not supported | SQLite |
+| p50 latency (µs) | 3,990 | 3,973 **(best)** | not supported | SQLite |
+| p99 latency (µs) | 5,980 | 5,202 **(best)** | not supported | SQLite |
+| p99.9 latency (µs) | 8,278 **(best)** | 44,087 | not supported | IndexedStore |
+| max latency (µs) | 117,551 **(best)** | 119,839 | not supported | IndexedStore |
+| bytes written per op (OS) | 16,669 **(best)** | 34,256 | not supported | IndexedStore |
+| file growth per op | 409 | 0 **(best)** | not supported | SQLite |
+| WAF vs changed field (11 B) | 1515.3 **(best)** | 3114.2 | not supported | IndexedStore |
+| WAF vs document size | 2.03 **(best)** | 4.18 | not supported | IndexedStore |
+| full syncs per op (F_FULLFSYNC) | 1.000 **(best)** | 1.003 | not supported | IndexedStore |
+| SQLITE_BUSY retries (SQLite only) | - | 0 | - | n/a |
+| GC bytes per op (IndexedStore only) | 0 | - | - | n/a |
+
+#### B update 8 KB, 16 threads
+
+| Metric | IndexedStore | SQLite | MongoLite | Winner |
+|---|---:|---:|---:|---|
+| ops/s | 2,216 **(best)** | 284 | not supported | IndexedStore |
+| p50 latency (µs) | 7,964 | 3,001 **(best)** | not supported | SQLite |
+| p99 latency (µs) | 11,256 | 5,303 **(best)** | not supported | SQLite |
+| p99.9 latency (µs) | 17,716 **(best)** | 11,157,116 | not supported | IndexedStore |
+| max latency (µs) | 21,802 **(best)** | 26,391,561 | not supported | IndexedStore |
+| bytes written per op (OS) | 2,044 **(best)** | 34,287 | not supported | IndexedStore |
+| file growth per op | 128 | 0 **(best)** | not supported | SQLite |
+| WAF vs changed field (11 B) | 185.8 **(best)** | 3117.0 | not supported | IndexedStore |
+| WAF vs document size | 0.25 **(best)** | 4.19 | not supported | IndexedStore |
+| full syncs per op (F_FULLFSYNC) | 0.108 **(best)** | 1.008 | not supported | IndexedStore |
+| SQLITE_BUSY retries (SQLite only) | - | 14 | - | n/a |
+| GC bytes per op (IndexedStore only) | 0 | - | - | n/a |
+
+### C. Reads after reopening (1 KB dataset)
+
+#### C point get (1 KB, 1 thread)
+
+| Metric | IndexedStore | SQLite | MongoLite | Winner |
+|---|---:|---:|---:|---|
+| ops/s | 123,646 | 114,737 | 283,476 **(best)** | MongoLite |
+| p50 latency (µs) | 10 | 8 | 4 **(best)** | MongoLite |
+| p99 latency (µs) | 18 | 16 | 5 **(best)** | MongoLite |
+| p99.9 latency (µs) | 48 | 43 | 11 **(best)** | MongoLite |
+| max latency (µs) | 104 | 413 | 24 **(best)** | MongoLite |
+
+#### C range scan 100 (1 KB, 1 thread)
+
+| Metric | IndexedStore | SQLite | MongoLite | Winner |
+|---|---:|---:|---:|---|
+| ops/s | 1,423 | 9,166 **(best)** | 3,699 | SQLite |
+| p50 latency (µs) | 694 | 111 **(best)** | 273 | SQLite |
+| p99 latency (µs) | 942 | 135 **(best)** | 339 | SQLite |
+| p99.9 latency (µs) | 1,166 | 264 **(best)** | 438 | SQLite |
+| max latency (µs) | 1,166 | 264 **(best)** | 438 | SQLite |
+
+### D. Disk footprint after B (live data = documents x document size)
+
+| Dataset | Metric | IndexedStore | SQLite | MongoLite | Winner |
+|---|---|---:|---:|---:|---|
+| 1 KB | disk MB | 33.9 **(best)** | 34.7 | 61.4 | IndexedStore |
+| 1 KB | space amplification | 1.32 **(best)** | 1.36 | 2.40 | IndexedStore |
+| 1 KB | disk MB after GC settles (IndexedStore) | 33.9 | - | - | n/a |
+| 1 KB | space amplification after GC settles | 1.32 | - | - | n/a |
+| 1 KB | GC MB written while settling | 0.0 | - | - | n/a |
+| 2 KB | disk MB | 59.5 **(best)** | 103.1 | 184.3 | IndexedStore |
+| 2 KB | space amplification | 1.16 **(best)** | 2.01 | 3.60 | IndexedStore |
+| 2 KB | disk MB after GC settles (IndexedStore) | 59.5 | - | - | n/a |
+| 2 KB | space amplification after GC settles | 1.16 | - | - | n/a |
+| 2 KB | GC MB written while settling | 0.0 | - | - | n/a |
+| 8 KB | disk MB | 212.8 **(best)** | 218.1 | not supported | IndexedStore |
+| 8 KB | space amplification | 1.04 **(best)** | 1.06 | not supported | IndexedStore |
+| 8 KB | disk MB after GC settles (IndexedStore) | 212.8 | - | - | n/a |
+| 8 KB | space amplification after GC settles | 1.04 | - | - | n/a |
+| 8 KB | GC MB written while settling | 0.0 | - | - | n/a |
+
+### E. kill -9 during 16-thread 1 KB updates (killed after 2500 acks)
+
+| Engine | Run | Acked updates | Acked updates lost | In flight at the kill | Reopened |
+|---|---:|---:|---:|---:|---|
+| IndexedStore | 1 | 2,503 | 0 of 2,503 | 16 | yes |
+| IndexedStore | 2 | 2,502 | 0 of 2,502 | 16 | yes |
+| IndexedStore | 3 | 2,502 | 0 of 2,502 | 16 | yes |
+| SQLite | 1 | 2,500 | 0 of 2,500 | 16 | yes |
+| SQLite | 2 | 2,500 | 0 of 2,500 | 16 | yes |
+| SQLite | 3 | 2,500 | 0 of 2,500 | 16 | yes |
+| MongoLite | 1 | 2,500 | 863 of 2,500 | 16 | yes |
+| MongoLite | 2 | 2,500 | 852 of 2,500 | 16 | yes |
+| MongoLite | 3 | 2,500 | 859 of 2,500 | 16 | yes |
+
 
 ## Known limitations
 
