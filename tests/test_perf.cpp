@@ -160,11 +160,65 @@ static void testR1FdCache(const std::string& dir) {
          "deleted cached segment reads as missing; GC closes descriptors before unlinking");
 }
 
+// ------------------------------------------------------------------------------------------
+// P6.W1 Adaptive group-commit window: a single writer never waits; a full batch stops the wait
+// ------------------------------------------------------------------------------------------
+static void testW1CommitWindow(const std::string& base) {
+    banner("P6.W1 adaptive group-commit window");
+    CHECK(::mkdir(base.c_str(), 0755) == 0);
+    const std::string payload(500, 'w');
+    // A 200 ms window: if a single writer waited, 20 appends would take 4 s.
+    {
+        vlog::VLogWriter::Options o(1 << 20, 64ULL << 20);
+        o.group_commit_window_us = 200000;
+        vlog::VLogWriter w(base + "/single", o);
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 20; ++i) w.append(vlog::EntryType::Full, "k", payload.data(), payload.size());
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        CHECK(s < 2.0);
+        CHECK(w.getAverageBatchSize() <= 1.0); // segment-creation fsyncs count too
+    }
+    // 16 writers, max batch 16, a 200 ms window: batches fill and stop waiting at 16.
+    uint64_t n = 0;
+    double avg = 0, secs = 0;
+    {
+        vlog::VLogWriter::Options o(1 << 20, 64ULL << 20);
+        o.group_commit_window_us = 200000;
+        o.group_commit_max_batch = 16;
+        vlog::VLogWriter w(base + "/many", o);
+        const int per = kQuick ? 20 : 100;
+        auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::thread> th;
+        for (int t = 0; t < 16; ++t)
+            th.emplace_back([&] {
+                for (int i = 0; i < per; ++i)
+                    w.append(vlog::EntryType::Full, "key", payload.data(), payload.size());
+            });
+        for (auto& x : th) x.join();
+        secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        avg = w.getAverageBatchSize();
+        n = 16ULL * per;
+        CHECK(avg >= 8.0);
+        // Waiting out the window on every batch would take n / 16 * 0.2 s.
+        CHECK(secs < double(n) / 16 * 0.2 / 2);
+    }
+    std::vector<uint32_t> segs = bpt::listVLogSegments(base + "/many");
+    vlog::VLogReader reader(base + "/many");
+    uint64_t entries = 0;
+    for (size_t i = 0; i < segs.size(); ++i) entries += reader.scanSegment(segs[i], i + 1 == segs.size()).entries.size();
+    CHECK(entries == n);
+    accountBytes(dirBytes(base), "P6.W1 vLog");
+    pass("P6.W1 window 200 ms: 1 writer never waits (20 appends, batch <= 1.0); 16 writers fill "
+         "batches of 16 and stop waiting (avg batch " + std::to_string(avg).substr(0, 4) + ", " +
+         std::to_string(secs).substr(0, 4) + " s); all " + std::to_string(n) + " entries intact");
+}
+
 int main() {
     std::string dir = setupRun("perf_test");
     Cleaner cleaner{dir};
     testS1Rollover(dir + "/s1");
     testR1FdCache(dir + "/r1");
+    testW1CommitWindow(dir + "/w1");
     printBudget();
     return 0;
 }

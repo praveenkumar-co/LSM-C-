@@ -27,6 +27,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <optional>
@@ -145,15 +146,33 @@ uint64_t vlogDiskBytes(const std::string& vdir) {
 
 std::atomic<uint64_t> g_index_bytes{0};
 
+// Tuning knobs for the experiments in the README (defaults = the engine's defaults, except
+// checkpoint_bytes, which this benchmark has always set to 16 MiB). The values used are printed.
+double envNum(const char* name, double def) {
+    const char* v = std::getenv(name);
+    return v ? std::strtod(v, nullptr) : def;
+}
+uint32_t knobWindowUs() {
+    return static_cast<uint32_t>(
+        envNum("STRESS_COMMIT_WINDOW_US", vlog::VLogWriter::Options().group_commit_window_us));
+}
+uint64_t knobCheckpointBytes() {
+    return static_cast<uint64_t>(envNum("STRESS_CHECKPOINT_MB", 16) * 1024 * 1024);
+}
+double knobGcThreshold() { return envNum("STRESS_GC_THRESHOLD", IndexedStore::Options().gc_threshold); }
+bool knobSkipChaos() { return envNum("STRESS_SKIP_CHAOS", 0) != 0; }
+
 IndexedStore::Options storeOpts(bool gc) {
     IndexedStore::Options o;
     o.cache_frames = kCacheFrames;
     o.vlog_opts = vlog::VLogWriter::Options(kSegment, kBenchBudget);
+    o.vlog_opts.group_commit_window_us = knobWindowUs();
     o.on_index_write = [](uint64_t n) {
         g_index_bytes += n;
         accountBytes(n, "index.db / superblock.db writes");
     };
-    o.checkpoint_bytes = 16ULL * 1024 * 1024;
+    o.checkpoint_bytes = knobCheckpointBytes();
+    o.gc_threshold = knobGcThreshold();
     o.gc_enabled = gc;
     o.gc_interval_ms = 10;
     o.gc_rate_mb_s = 32;
@@ -585,6 +604,12 @@ int main() {
                 "90 MB in a trial GC-off run), plus about 50 x 10 MB for the crash runs; budget "
                 "%.0f MiB; files are deleted after each run.\n",
                 (load + mixed) / 1e6, kBenchBudget / 1048576.0);
+    std::printf("Settings: group_commit_window_us %u, checkpoint_bytes %.0f MiB, gc_threshold "
+                "%.2f%s\n",
+                knobWindowUs(), knobCheckpointBytes() / 1048576.0, knobGcThreshold(),
+                knobSkipChaos() ? ", chaos skipped" : "");
+    std::printf("METRIC cfg window_us %u\nMETRIC cfg checkpoint_mb %.0f\nMETRIC cfg gc_threshold %.2f\n",
+                knobWindowUs(), knobCheckpointBytes() / 1048576.0, knobGcThreshold());
     std::fflush(stdout);
 
     RunResult off = run(dir + "/off", false);
@@ -593,7 +618,7 @@ int main() {
     RunResult on = run(dir + "/on", true);
     std::printf("GC-on run done (%.0f s)\n", on.load_s + on.mixed_s + on.compact_s);
     std::fflush(stdout);
-    ChaosResult cr = chaos(dir + "/chaos");
+    ChaosResult cr = knobSkipChaos() ? ChaosResult{} : chaos(dir + "/chaos");
 
     std::printf("\n## High-Scale Stress Benchmark\n\n");
     std::printf("%d keys x %.0f-byte documents, %d threads, B+Tree cache %zu frames (%.0f MiB), "

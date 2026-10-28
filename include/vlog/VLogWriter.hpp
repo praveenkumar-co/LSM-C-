@@ -56,6 +56,13 @@ public:
         uint32_t scan_from_segment = 0;
         uint32_t scan_from_offset = kBlockSize;
         uint64_t min_seq = 0; // seqs up to this were used before the scan start (checkpoint seq)
+        // Group commit window: before a write + F_FULLFSYNC, the leader waits up to this many
+        // microseconds for more requests to join the batch, or until group_commit_max_batch
+        // requests are staged. Adaptive: it waits only if the previous batch had more than one
+        // request (other writers are active), so a single writer never waits. Acks still come
+        // only after the fsync. 0 = write at once.
+        uint32_t group_commit_window_us = 500;
+        uint32_t group_commit_max_batch = 64;
 
         Options(uint32_t seg_limit = 64 * 1024 * 1024, uint64_t max_b = 0)
             : segment_size_limit(seg_limit), max_bytes(max_b) {}
@@ -139,6 +146,7 @@ public:
         req.vptr = assigned_vptr;
         req.assigned_seq = hdr.seq;
         pending_requests_.push_back(&req);
+        noteStagedLocked();
         commitLocked(lock, req);
         return AppendResult{req.vptr, req.assigned_seq};
     }
@@ -220,6 +228,7 @@ public:
             total_bytes_written_ += total_len;
         }
         pending_requests_.push_back(&req);
+        noteStagedLocked();
         commitLocked(lock, req);
         return out;
     }
@@ -269,6 +278,12 @@ private:
         std::condition_variable cv;
     };
 
+    // A request was queued: wake a leader waiting in its window once the batch is full.
+    void noteStagedLocked() {
+        if (leader_waiting_ && pending_requests_.size() >= options_.group_commit_max_batch)
+            staged_cv_.notify_one();
+    }
+
     // Rolls over to a new segment if an entry of total_len bytes does not fit in the current one.
     // An in-flight flush must land in the old segment before it is closed, so this waits for it
     // first, then checks again: another thread may have rolled over while this one waited, and
@@ -296,6 +311,18 @@ private:
         // This thread is the leader: flush batches until no request is waiting.
         while (!pending_requests_.empty()) {
             flush_in_progress_ = true;
+            if (options_.group_commit_window_us > 0 && last_batch_requests_ > 1 &&
+                pending_requests_.size() < options_.group_commit_max_batch) {
+                // Writers that are about to append get a short window to join this batch.
+                leader_waiting_ = true;
+                staged_cv_.wait_for(lock,
+                                    std::chrono::microseconds(options_.group_commit_window_us),
+                                    [&] {
+                                        return fatal_error_ || pending_requests_.size() >=
+                                                                   options_.group_commit_max_batch;
+                                    });
+                leader_waiting_ = false;
+            }
             std::vector<uint8_t> batch_bytes;
             batch_bytes.swap(staging_buffer_);
             std::vector<Request*> batch(pending_requests_.begin(), pending_requests_.end());
@@ -316,6 +343,7 @@ private:
             }
             total_fsyncs_++;
             total_ops_ += batch.size();
+            last_batch_requests_ = batch.size();
             for (Request* r : batch) {
                 r->done = true;
                 r->failed = false;
@@ -490,6 +518,9 @@ private:
 
     mutable std::mutex mutex_;
     std::condition_variable cv_; // signalled when a leader finishes (rollover waits on it)
+    std::condition_variable staged_cv_; // a leader waiting in its window: the batch is full
+    bool leader_waiting_{false};
+    size_t last_batch_requests_{0}; // requests in the last write + fsync (window is adaptive)
 
     uint32_t current_segment_id_{0};
     uint64_t current_seq_{0};
