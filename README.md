@@ -23,12 +23,12 @@ get        -> B+Tree -> log -> document
 
 1 KB documents, 25,000 documents per dataset, 10,000 single-field updates (`profile.score + 1`).
 
-| Metric | This engine | SQLite | MongoLite (legacy) | Winner |
-|---|---:|---:|---:|---|
-| Bytes written per update, 1 thread (bytes, lower is better) | 16,818 | 33,256 | 21,060 | This engine |
-| Bytes written per update, 16 threads (bytes, lower is better) | 1,384 | 33,300 | 21,852 | This engine |
-| Updates per second, 1 thread (higher is better) | 257 | 340 | 274 | SQLite |
-| Updates per second, 16 threads (higher is better) | 3,363 | 313 | 287 | This engine |
+| | **DocStore (this project)** | SQLite | MongoLite (my earlier engine) |
+|---|---:|---:|---:|
+| Bytes written per update, 1 thread (lower is better) | **16,818** ✅ | 33,256 | 21,060 |
+| Bytes written per update, 16 threads (lower is better) | **1,384** ✅ | 33,300 | 21,852 |
+| Updates per second, 16 threads (higher is better) | **3,363** ✅ | 313 | 287 |
+| Updates per second, 1 thread (higher is better) | 257 | **340** ✅ | 274 |
 
 Same Mac (Apple M5), same durability (F_FULLFSYNC on every acked write for all engines), median of 3
 runs. Full details below.
