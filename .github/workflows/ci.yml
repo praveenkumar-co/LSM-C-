@@ -8,6 +8,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -25,6 +26,7 @@ jobs:
 
   tsan:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       CXX: g++
     steps:

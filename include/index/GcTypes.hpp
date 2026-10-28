@@ -103,13 +103,19 @@ struct GcReport {
 };
 
 // Keeps segments on disk while a reader may still use them (plan section 4). Built from
-// mutexes (no lock-free code): 64 shards, each a mutex and a count of readers per epoch.
+// mutexes (no lock-free code): 64 shards, each a mutex and a count of readers per epoch, and one
+// mutex for the epoch counter.
 //   pin():    a reader records the current epoch BEFORE it reads the index.
 //   retire(): GC, after the last relocation of a segment is applied, moves the epoch on and
 //             keeps the new value; a reader that pins from then on sees only the new index.
 //   pinnedBefore(e): some reader that pinned before retire() returned e is still reading, so it
 //             may hold a VPtr into the retired segment; the segment must stay.
-// epoch_ changes only with every shard lock held, so reading it under one shard lock is safe.
+// pin() reads the epoch and records the pin while holding its shard lock, and pinnedBefore()
+// takes every shard lock in turn. So a reader that read an epoch below e is either visible to
+// pinnedBefore(e), or still holds its shard lock and pinnedBefore() waits for it. No thread holds
+// more than two of these locks at once (shard, then epoch); retire() takes only the epoch lock.
+// (It used to take all 64 shard locks, which exceeds ThreadSanitizer's limit of 64 locks held
+// by one thread on Linux.)
 class ReaderRegistry {
 public:
     static constexpr size_t kShards = 64;
@@ -121,8 +127,12 @@ public:
     Pin pin() {
         const size_t sh = std::hash<std::thread::id>{}(std::this_thread::get_id()) % kShards;
         std::lock_guard<std::mutex> lk(shards_[sh].mu);
-        const uint64_t e = epoch_;
-        shards_[sh].pins[e]++;
+        uint64_t e;
+        {
+            std::lock_guard<std::mutex> el(epoch_mu_);
+            e = epoch_;
+        }
+        shards_[sh].pins[e]++; // recorded before the shard lock is released
         return Pin{sh, e};
     }
 
@@ -137,9 +147,7 @@ public:
     }
 
     uint64_t retire() {
-        std::array<std::unique_lock<std::mutex>, kShards> locks;
-        for (size_t i = 0; i < kShards; ++i)
-            locks[i] = std::unique_lock<std::mutex>(shards_[i].mu); // ascending shard order
+        std::lock_guard<std::mutex> el(epoch_mu_);
         return ++epoch_;
     }
 
@@ -166,6 +174,7 @@ private:
         std::map<uint64_t, uint32_t> pins; // epoch -> readers
     };
     std::array<Shard, kShards> shards_;
+    std::mutex epoch_mu_; // guards epoch_; taken after a shard lock, never before
     uint64_t epoch_ = 1;
 };
 

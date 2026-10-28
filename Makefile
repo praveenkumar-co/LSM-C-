@@ -52,7 +52,8 @@ build/$(1)/%: tests/%.cpp $(HEADERS) Makefile
 $(1): check-deps $(addprefix build/$(1)/,$(TEST_NAMES))
 	@total=0; for t in $(TEST_NAMES); do \
 	  echo "=== [$(1)] $$$$t ==="; \
-	  ./build/$(1)/$$$$t > build/$(1)/$$$$t.log 2>&1; rc=$$$$?; cat build/$(1)/$$$$t.log; \
+	  { ./build/$(1)/$$$$t 2>&1; echo $$$$? > build/$(1)/$$$$t.rc; } | tee build/$(1)/$$$$t.log; \
+	  rc=$$$$(cat build/$(1)/$$$$t.rc); \
 	  if [ $$$$rc -ne 0 ]; then echo "=== [$(1)] $$$$t: FAILED (exit $$$$rc) ==="; exit $$$$rc; fi; \
 	  echo "=== [$(1)] $$$$t: exit 0 ==="; \
 	  b=$$$$(sed -n 's/^\[Budget\] bytes written: \([0-9]*\).*/\1/p' build/$(1)/$$$$t.log | tail -1); \

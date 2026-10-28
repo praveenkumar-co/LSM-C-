@@ -7,7 +7,9 @@
 #include <cstdint>
 #include <cstring>
 
-#if defined(__aarch64__) || defined(_M_ARM64)
+// ARM: only when the compiler targets the CRC extension (__ARM_FEATURE_CRC32: Apple clang does
+// by default; GCC for generic aarch64 does not without -march=...+crc), like __SSE4_2__ on x86.
+#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(__ARM_FEATURE_CRC32)
 #if defined(__has_include)
 #if __has_include(<arm_acle.h>)
 #include <arm_acle.h>
