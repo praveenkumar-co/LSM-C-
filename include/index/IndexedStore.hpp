@@ -25,11 +25,13 @@
 // that reason any exception from append() aborts the process.
 //
 // Checkpoint (checkpoint()): with the sequencer lock held (no index update can start) and the
-// tree's exclusive lock held (no reader or writer is in the tree):
+// tree's exclusive lock held (no reader or writer is in the tree), capture only:
 //   checkpoint_seq = seq of the last entry applied to the index
 //   replay point   = vLog position right after that entry (never the writer's tail: entries
 //                    appended but not yet applied have higher seqs and are replayed after a crash)
-//   write back dirty pages -> F_FULLFSYNC index.db -> superblock epoch+1 -> F_FULLFSYNC
+//   copy of every dirty page; every existing page frozen (later changes copy the page)
+// then, with both locks released (writers and readers continue):
+//   write the captured pages -> F_FULLFSYNC index.db -> superblock epoch+1 -> F_FULLFSYNC
 // Triggers: a background thread checkpoints after checkpoint_bytes of vLog writes (default
 // 4 MiB) or checkpoint_interval_ms (default 30 s), and close() checkpoints.
 //
@@ -122,6 +124,7 @@ struct CheckpointReport {
     uint32_t page_count = 0;
     double lock_wait_ms = 0; // time to get the sequencer + tree locks
     double stall_ms = 0;     // time the locks were held: index updates and readers wait this long
+    double write_ms = 0;     // page writes + fsyncs + superblock, after the locks were released
 };
 
 static_assert(doc::kMaxDocBytes ==
@@ -157,6 +160,8 @@ public:
             on_checkpoint_start; // test-only: locks held, before the flush
         std::function<void(CheckpointTrigger)>
             on_checkpoint_after_index_fsync; // test-only, every checkpoint
+        std::function<void(CheckpointTrigger)>
+            on_checkpoint_after_capture; // test-only: locks released, before the page writes
         bool auto_checkpoint = true;
         uint64_t checkpoint_bytes = 4ULL * 1024 * 1024; // vLog bytes between automatic checkpoints
         uint32_t checkpoint_interval_ms = 30000; // longest time between automatic checkpoints
@@ -167,7 +172,7 @@ public:
         uint32_t max_document_bytes = 0;
         // GC (plan sections 2, 3, 6). runGcPass() runs one pass on the caller's thread; with
         // gc_enabled a background thread runs passes every gc_interval_ms until nothing is
-        // left to do, and requests the checkpoints that move retired segments on.
+        // left to do; retired segments wait for the normal checkpoint triggers.
         bool gc_enabled = false;
         uint32_t gc_interval_ms = 1000;
         double gc_threshold = 0.5;              // victims: live/total below this, in (0, 1)
@@ -398,6 +403,7 @@ public:
         if (closed_) fatal("IndexedStore::checkpoint after close");
         std::lock_guard<std::mutex> run_lk(cp_run_mu_); // one checkpoint at a time
         const auto t0 = std::chrono::steady_clock::now();
+        Pager::CheckpointSnapshot snap;
         std::unique_lock<std::mutex> seq_lk(seq_mu_); // no index update can start
         CheckpointReport rep = tree_->withExclusiveLock([&] {
             const auto t1 = std::chrono::steady_clock::now();
@@ -409,7 +415,8 @@ public:
             r.replay_offset = last_applied_end_;
             const bool auto_trigger =
                 trigger == CheckpointTrigger::Bytes || trigger == CheckpointTrigger::Timer;
-            if (auto_trigger && last_applied_seq_ == last_cp_seq_) {
+            // GC relocations and retired segments also need checkpoints (epochs) to move on.
+            if (auto_trigger && last_applied_seq_ == last_cp_seq_ && !gcPending()) {
                 r.skipped = true;
                 r.epoch = pager_->committedEpoch();
                 return r;
@@ -436,35 +443,44 @@ public:
                 std::lock_guard<std::mutex> gl(gc_mu_);
                 ci.condemned = condemned_;
             }
-            std::function<void()> hook;
-            if (trigger == CheckpointTrigger::Close && opts_.hooks.on_close_after_flush) {
-                hook = opts_.hooks.on_close_after_flush;
-            } else if (opts_.on_checkpoint_after_index_fsync) {
-                hook = [this, trigger] { opts_.on_checkpoint_after_index_fsync(trigger); };
-            }
-            Pager::CheckpointStats cs = pager_->checkpoint(*sbm_, ci, hook);
+            snap = pager_->captureCheckpoint(ci);
             last_cp_seq_ = last_applied_seq_;
-            {
-                std::lock_guard<std::mutex> gl(gc_mu_);
-                for (uint32_t id : ci.condemned) {
-                    auto it = segs_.find(id);
-                    if (it != segs_.end() && it->second.condemned_epoch == 0)
-                        it->second.condemned_epoch = cs.epoch;
-                }
-                cp_has_older_ = true;
-                cp_replay_older_ = cp_replay_cur_;
-                cp_replay_cur_ = ci.replay_segment;
-            }
-            r.epoch = cs.epoch;
-            r.pages_written = cs.pages_written;
-            r.bytes_written = cs.bytes_written;
-            r.page_count = cs.page_count;
             r.stall_ms =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1)
                     .count();
             return r;
         });
         seq_lk.unlock();
+        if (!rep.skipped) {
+            // Writers and readers continue while the captured pages are written.
+            const auto t2 = std::chrono::steady_clock::now();
+            if (opts_.on_checkpoint_after_capture) opts_.on_checkpoint_after_capture(trigger);
+            std::function<void()> hook;
+            if (trigger == CheckpointTrigger::Close && opts_.hooks.on_close_after_flush) {
+                hook = opts_.hooks.on_close_after_flush;
+            } else if (opts_.on_checkpoint_after_index_fsync) {
+                hook = [this, trigger] { opts_.on_checkpoint_after_index_fsync(trigger); };
+            }
+            Pager::CheckpointStats cs = pager_->writeCheckpoint(*sbm_, snap, hook);
+            {
+                std::lock_guard<std::mutex> gl(gc_mu_);
+                for (uint32_t id : snap.ci.condemned) {
+                    auto it = segs_.find(id);
+                    if (it != segs_.end() && it->second.condemned_epoch == 0)
+                        it->second.condemned_epoch = cs.epoch;
+                }
+                cp_has_older_ = true;
+                cp_replay_older_ = cp_replay_cur_;
+                cp_replay_cur_ = snap.ci.replay_segment;
+            }
+            rep.epoch = cs.epoch;
+            rep.pages_written = cs.pages_written;
+            rep.bytes_written = cs.bytes_written;
+            rep.page_count = cs.page_count;
+            rep.write_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2)
+                    .count();
+        }
         {
             std::lock_guard<std::mutex> lk(cp_mu_);
             last_cp_time_ = std::chrono::steady_clock::now();
@@ -676,8 +692,11 @@ private:
     void retireSegment(uint32_t id) {
         uint64_t e;
         {
-            std::lock_guard<std::mutex> lk(seq_mu_); // checkpoint() holds it for its whole run
-            e = pager_->committedEpoch();
+            // A checkpoint captures under seq_mu_; one captured before the last relocation was
+            // applied (in flight or committed) does not contain it, so count from the newest
+            // captured epoch: E + 1 is the first checkpoint that contains every relocation.
+            std::lock_guard<std::mutex> lk(seq_mu_);
+            e = pager_->capturedEpoch();
         }
         const uint64_t retire_epoch = readers_.retire();
         std::lock_guard<std::mutex> lk(gc_mu_);
@@ -1025,11 +1044,11 @@ private:
                             [&] { return gc_stop_; });
             if (gc_stop_) break;
             lk.unlock();
+            // Retired segments wait for the normal checkpoint triggers (bytes or timer); GC
+            // never forces a checkpoint.
             for (int i = 0; i < 64; ++i) {
                 GcReport r = runGcPass();
-                const bool pending = gcPending();
-                if (r.action == GcReport::Action::None && !pending) break;
-                if (pending) checkpoint(CheckpointTrigger::Manual);
+                if (r.action == GcReport::Action::None) break;
                 std::lock_guard<std::mutex> g(gc_thread_mu_);
                 if (gc_stop_) break;
             }

@@ -14,6 +14,13 @@
 // - Page reuse: a frozen page freed while the last committed epoch is E stays reserved until
 //   epoch E + 2 commits. Until then one of the two superblock slots can still name a tree that
 //   uses it. At open the free list is rebuilt by walking the committed trees (IndexRecovery.hpp).
+// - Checkpoints in two steps: captureCheckpoint() (tree's exclusive lock held) copies every dirty
+//   page into the snapshot, marks those frames clean and freezes every existing page, so a later
+//   change copies the page instead of modifying it; writeCheckpoint() (no tree lock) writes the
+//   captured pages, F_FULLFSYNCs, and commits the superblock. While a checkpoint is in flight
+//   (epoch E + 1 captured, E committed), a captured page that is no longer cached is read from
+//   the snapshot, and a page freed is tagged E + 1, so it is reused only after E + 3 commits:
+//   the in-flight tree still uses it.
 // - Load: pread 4096 bytes, then check CRC/magic/page_id/type. Any failure aborts.
 // - Write-back: recompute CRC, pwrite 4096 bytes. No fsync on eviction.
 // - Every syscall return value is checked. A failed fsync aborts and is never retried.
@@ -171,6 +178,16 @@ public:
         std::vector<uint32_t> condemned;  // segments GC decided to unlink (<= kMaxCondemned)
     };
 
+    // A checkpoint captured under the tree's exclusive lock, written without it.
+    struct CheckpointSnapshot {
+        uint64_t epoch = 0; // the epoch its superblock gets
+        page_id_t root = kNoPage;
+        uint32_t page_count = 0;
+        CommitInfo ci;
+        std::vector<page_id_t> ids; // captured dirty pages
+        std::vector<uint8_t> bytes; // their images (CRC set): ids.size() x kPageSize
+    };
+
     struct CheckpointStats {
         uint64_t epoch = 0;
         uint64_t pages_written = 0; // dirty pages written back by this checkpoint
@@ -277,9 +294,15 @@ public:
         }
         uint32_t f = takeVictimLocked();
         uint8_t* buf = frameData(f);
-        ssize_t r = ::pread(fd_, buf, kPageSize, static_cast<off_t>(id) * kPageSize);
-        if (r != static_cast<ssize_t>(kPageSize)) {
-            fatal("pread of page " + std::to_string(id) + " returned " + std::to_string(r));
+        auto snap = inflight_pages_.find(id);
+        if (snap != inflight_pages_.end()) {
+            // Captured by the checkpoint in flight and not on disk yet: its image is the page.
+            std::memcpy(buf, snap->second, kPageSize);
+        } else {
+            ssize_t r = ::pread(fd_, buf, kPageSize, static_cast<off_t>(id) * kPageSize);
+            if (r != static_cast<ssize_t>(kPageSize)) {
+                fatal("pread of page " + std::to_string(id) + " returned " + std::to_string(r));
+            }
         }
         std::string why;
         if (!checkPage(buf, id, &why)) {
@@ -341,7 +364,8 @@ public:
             fatal("freePage of invalid page id " + std::to_string(id));
         stats_.frees++;
         if (isFrozenLocked(id)) {
-            pending_.push_back({epoch_, id});
+            // A checkpoint in flight (epoch_ + 1) may name this page: count from that epoch.
+            pending_.push_back({inflight_ ? epoch_ + 1 : epoch_, id});
         } else {
             reused_.erase(id);
             free_now_.push_back(id);
@@ -381,27 +405,94 @@ public:
         fsyncOrDie("F_FULLFSYNC of " + path_);
     }
 
-    // Makes the current tree durable: write back dirty frames, F_FULLFSYNC index.db,
-    // (after_index_fsync hook), then commit superblock epoch+1. The caller must hold the tree's
-    // exclusive lock (or be the only user). No page may be pinned.
+    // Makes the current tree durable (single-threaded callers): capture, then write.
     CheckpointStats checkpoint(SuperblockManager& sbm, const CommitInfo& ci,
                                const std::function<void()>& after_index_fsync = nullptr) {
+        CheckpointSnapshot snap = captureCheckpoint(ci);
+        return writeCheckpoint(sbm, snap, after_index_fsync);
+    }
+
+    // Step 1. The caller holds the tree's exclusive lock (or is the only user); no page may be
+    // pinned; one checkpoint at a time. Copies every dirty frame into the snapshot and marks it
+    // clean, records the root and page count, and freezes every page that exists now.
+    CheckpointSnapshot captureCheckpoint(const CommitInfo& ci) {
         std::lock_guard<std::mutex> lk(mu_);
         if (fd_ < 0) fatal("checkpoint on a closed pager");
+        if (inflight_) fatal("captureCheckpoint while another checkpoint is in flight");
+        CheckpointSnapshot snap;
+        size_t dirty = 0;
         for (const Frame& fr : frames_) {
             if (fr.pins != 0) fatal("checkpoint with a pinned page " + std::to_string(fr.page_id));
+            if (fr.page_id != kNoPage && fr.dirty) dirty++;
         }
-        const uint64_t writes0 = stats_.page_writes;
-        flushDirtyLocked();
-        fsyncOrDie("F_FULLFSYNC of index pages during checkpoint of " + path_);
+        snap.ids.reserve(dirty);
+        snap.bytes.resize(dirty * kPageSize);
+        size_t i = 0;
+        for (uint32_t f = 0; f < frames_.size(); ++f) {
+            Frame& fr = frames_[f];
+            if (fr.page_id == kNoPage || !fr.dirty) continue;
+            uint8_t* buf = frameData(f);
+            uint32_t crc = computePageCrc(buf);
+            std::memcpy(buf, &crc, sizeof(crc));
+            std::memcpy(snap.bytes.data() + i * kPageSize, buf, kPageSize);
+            snap.ids.push_back(fr.page_id);
+            fr.dirty = false; // the snapshot holds the image until it is written
+            i++;
+        }
+        for (size_t j = 0; j < snap.ids.size(); ++j)
+            inflight_pages_[snap.ids[j]] = snap.bytes.data() + j * kPageSize;
+        snap.epoch = epoch_ + 1;
+        snap.root = root_;
+        snap.page_count = page_count_;
+        snap.ci = ci;
+        // Freeze everything that exists now: a later change copies the page (copy-on-write).
+        checkpoint_page_count_ = page_count_;
+        reused_.clear();
+        inflight_ = true;
+        return snap;
+    }
+
+    // Step 2, without the tree lock: write the captured pages, F_FULLFSYNC index.db,
+    // (after_index_fsync hook), commit the superblock, then advance the epoch.
+    CheckpointStats writeCheckpoint(SuperblockManager& sbm, CheckpointSnapshot& snap,
+                                    const std::function<void()>& after_index_fsync = nullptr) {
+        for (size_t j = 0; j < snap.ids.size(); ++j) {
+            const page_id_t id = snap.ids[j];
+            if (opts_.inject_failure && opts_.inject_failure(IoOp::PageWrite, id)) {
+                errno = EIO;
+                fatal("pwrite of page " + std::to_string(id) + " failed [injected failure]");
+            }
+            ssize_t w = ::pwrite(fd_, snap.bytes.data() + j * kPageSize, kPageSize,
+                                 static_cast<off_t>(id) * kPageSize);
+            if (w != static_cast<ssize_t>(kPageSize))
+                fatal("pwrite of page " + std::to_string(id) + " returned " + std::to_string(w));
+            if (opts_.on_write) opts_.on_write(kPageSize);
+        }
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stats_.page_writes += snap.ids.size();
+            inflight_pages_.clear(); // the pages are in the file now
+        }
+        if (opts_.inject_failure && opts_.inject_failure(IoOp::Fsync, kNoPage)) {
+            errno = EIO;
+            fatal("F_FULLFSYNC of index pages during checkpoint of " + path_ +
+                  " [injected failure]");
+        }
+        if (vlog::full_fsync(fd_) != 0)
+            fatal("F_FULLFSYNC of index pages during checkpoint of " + path_); // never retried
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stats_.fsyncs++;
+        }
         if (after_index_fsync) after_index_fsync();
+        const CommitInfo& ci = snap.ci;
         SuperblockRecord rec;
-        rec.sb.epoch = epoch_ + 1;
+        rec.sb.epoch = snap.epoch;
         rec.sb.checkpoint_seq = ci.checkpoint_seq;
         rec.sb.replay_segment_id = ci.replay_segment;
         rec.sb.replay_offset = ci.replay_offset;
-        rec.sb.index_root_page = root_;
-        rec.sb.index_page_count = page_count_;
+        rec.sb.index_root_page = snap.root;
+        rec.sb.index_page_count = snap.page_count;
         rec.sb.oldest_live_segment =
             ci.oldest_live_segment ? ci.oldest_live_segment : ci.vlog_first_segment;
         rec.ext.index_nonce = nonce_;
@@ -415,10 +506,9 @@ public:
         rec.gc.count = static_cast<uint32_t>(ci.condemned.size());
         for (size_t i = 0; i < ci.condemned.size(); ++i) rec.gc.ids[i] = ci.condemned[i];
         sbm.commit(rec);
-        epoch_++;
-        // Everything allocated so far is now part of a committed tree.
-        checkpoint_page_count_ = page_count_;
-        reused_.clear();
+        std::lock_guard<std::mutex> lk(mu_);
+        epoch_ = snap.epoch;
+        inflight_ = false;
         // Pages freed in epoch e are no longer referenced by either slot once epoch e + 2 commits.
         size_t keep = 0;
         for (size_t i = 0; i < pending_.size(); ++i) {
@@ -430,10 +520,10 @@ public:
         pending_.resize(keep);
         CheckpointStats cs;
         cs.epoch = epoch_;
-        cs.pages_written = stats_.page_writes - writes0;
+        cs.pages_written = snap.ids.size();
         cs.bytes_written = cs.pages_written * kPageSize + kSuperSlotSize;
-        cs.page_count = page_count_;
-        cs.root = root_;
+        cs.page_count = snap.page_count;
+        cs.root = snap.root;
         return cs;
     }
 
@@ -472,6 +562,11 @@ public:
     uint64_t committedEpoch() const {
         std::lock_guard<std::mutex> lk(mu_);
         return epoch_;
+    }
+    // Epoch of the last captured checkpoint: committedEpoch() + 1 while one is in flight.
+    uint64_t capturedEpoch() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return inflight_ ? epoch_ + 1 : epoch_;
     }
     // After index.db.rebuild is renamed to index.db (the open fd stays valid).
     void setPath(const std::string& p) { path_ = p; }
@@ -671,6 +766,8 @@ private:
     std::unordered_set<page_id_t> reused_; // free-list ids handed out in this epoch (writable)
     std::vector<page_id_t> free_now_;      // reusable now
     std::vector<std::pair<uint64_t, page_id_t>> pending_; // (epoch freed in, id)
+    bool inflight_ = false; // a captured checkpoint is being written (epoch_ + 1)
+    std::unordered_map<page_id_t, const uint8_t*> inflight_pages_; // into the snapshot's bytes
     std::vector<Frame> frames_;
     std::unique_ptr<uint8_t[]> buffer_;
     std::vector<uint32_t> free_frames_;

@@ -161,6 +161,7 @@ uint64_t knobCheckpointBytes() {
 }
 double knobGcThreshold() { return envNum("STRESS_GC_THRESHOLD", IndexedStore::Options().gc_threshold); }
 bool knobSkipChaos() { return envNum("STRESS_SKIP_CHAOS", 0) != 0; }
+bool knobOnlyChaos() { return envNum("STRESS_ONLY_CHAOS", 0) != 0; }
 
 IndexedStore::Options storeOpts(bool gc) {
     IndexedStore::Options o;
@@ -436,6 +437,7 @@ struct ChaosResult {
     uint64_t rebuild_checks = 0, keys_compared = 0;
     double recover_ms_sum = 0, recover_ms_max = 0, rebuild_ms_sum = 0;
     uint64_t gc_unlinked_seen = 0;
+    uint64_t vlog_bytes_end = 0; // chaos store's vLog on disk after the last crash
 };
 
 std::map<int, std::optional<std::string>> readAll(IndexedStore& st) {
@@ -570,6 +572,7 @@ ChaosResult chaos(const std::string& dir) {
         st->close();
         cr.crashes++;
     }
+    cr.vlog_bytes_end = vlogDiskBytes(dir + "/vlog");
     std::filesystem::remove_all(dir);
     return cr;
 }
@@ -612,6 +615,16 @@ int main() {
                 knobWindowUs(), knobCheckpointBytes() / 1048576.0, knobGcThreshold());
     std::fflush(stdout);
 
+    if (knobOnlyChaos()) {
+        ChaosResult c = chaos(dir + "/chaos");
+        std::printf("METRIC chaos recover_ms %.2f\nMETRIC chaos rebuild_ms %.2f\nMETRIC chaos "
+                    "vlog_mb_end %.2f\nMETRIC chaos acked %llu verified %llu\n",
+                    c.recover_ms_sum / std::max(1, c.crashes), c.rebuild_ms_sum / std::max(1, c.crashes),
+                    c.vlog_bytes_end / 1e6, (unsigned long long)c.acked, (unsigned long long)c.verified);
+        std::printf("[Budget] bytes written: %llu of %llu\n", (unsigned long long)bytesWritten(),
+                    (unsigned long long)kBenchBudget);
+        return 0;
+    }
     RunResult off = run(dir + "/off", false);
     std::printf("GC-off run done (%.0f s)\n", off.load_s + off.mixed_s + off.compact_s);
     std::fflush(stdout);
@@ -751,6 +764,7 @@ int main() {
     }
     std::printf("METRIC chaos recover_ms %.2f\n", cr.recover_ms_sum / std::max(1, cr.crashes));
     std::printf("METRIC chaos rebuild_ms %.2f\n", cr.rebuild_ms_sum / std::max(1, cr.crashes));
+    std::printf("METRIC chaos vlog_mb_end %.2f\n", cr.vlog_bytes_end / 1e6);
     std::printf("METRIC chaos acked %llu verified %llu\n", (unsigned long long)cr.acked,
                 (unsigned long long)cr.verified);
     std::printf("[Budget] bytes written: %llu of %llu\n", (unsigned long long)bytesWritten(),
