@@ -166,8 +166,10 @@ std::string hardware() {
 #if defined(__APPLE__)
     const std::string cpu = shell("sysctl -n machdep.cpu.brand_string");
     const std::string mem = shell("sysctl -n hw.memsize");
-    const std::string disk = shell("system_profiler SPNVMeDataType 2>/dev/null | awk -F': ' '/Model:/ {print $2; exit}'");
-    const std::string fs = shell("diskutil info / | awk -F: '/File System Personality/ {gsub(/^ +/,\"\",$2); print $2}'");
+    const std::string disk = shell(
+        "system_profiler SPNVMeDataType 2>/dev/null | awk -F': ' '/Model:/ {print $2; exit}'");
+    const std::string fs = shell(
+        "diskutil info / | awk -F: '/File System Personality/ {gsub(/^ +/,\"\",$2); print $2}'");
     const std::string os = "macOS " + shell("sw_vers -productVersion");
 #else
     const std::string cpu = shell("grep -m1 'model name' /proc/cpuinfo | cut -d: -f2");
@@ -307,9 +309,15 @@ int shimClose(sqlite3_file* f) {
     s->fd = -1;
     return rc;
 }
-int shimRead(sqlite3_file* f, void* b, int n, sqlite3_int64 o) { return REAL(f)->pMethods->xRead(REAL(f), b, n, o); }
-int shimWrite(sqlite3_file* f, const void* b, int n, sqlite3_int64 o) { return REAL(f)->pMethods->xWrite(REAL(f), b, n, o); }
-int shimTruncate(sqlite3_file* f, sqlite3_int64 n) { return REAL(f)->pMethods->xTruncate(REAL(f), n); }
+int shimRead(sqlite3_file* f, void* b, int n, sqlite3_int64 o) {
+    return REAL(f)->pMethods->xRead(REAL(f), b, n, o);
+}
+int shimWrite(sqlite3_file* f, const void* b, int n, sqlite3_int64 o) {
+    return REAL(f)->pMethods->xWrite(REAL(f), b, n, o);
+}
+int shimTruncate(sqlite3_file* f, sqlite3_int64 n) {
+    return REAL(f)->pMethods->xTruncate(REAL(f), n);
+}
 int shimSync(sqlite3_file* f, int flags) {
     ShimFile* s = reinterpret_cast<ShimFile*>(f);
     int rc = s->real->pMethods->xSync(s->real, flags);
@@ -322,19 +330,45 @@ int shimSync(sqlite3_file* f, int flags) {
     g_shim_fullfsyncs++;
     return SQLITE_OK;
 }
-int shimFileSize(sqlite3_file* f, sqlite3_int64* n) { return REAL(f)->pMethods->xFileSize(REAL(f), n); }
-int shimLock(sqlite3_file* f, int l) { return REAL(f)->pMethods->xLock(REAL(f), l); }
-int shimUnlock(sqlite3_file* f, int l) { return REAL(f)->pMethods->xUnlock(REAL(f), l); }
-int shimCheckReserved(sqlite3_file* f, int* r) { return REAL(f)->pMethods->xCheckReservedLock(REAL(f), r); }
-int shimFileControl(sqlite3_file* f, int op, void* a) { return REAL(f)->pMethods->xFileControl(REAL(f), op, a); }
-int shimSectorSize(sqlite3_file* f) { return REAL(f)->pMethods->xSectorSize(REAL(f)); }
-int shimDevChar(sqlite3_file* f) { return REAL(f)->pMethods->xDeviceCharacteristics(REAL(f)); }
-int shimShmMap(sqlite3_file* f, int pg, int sz, int ext, void volatile** pp) { return REAL(f)->pMethods->xShmMap(REAL(f), pg, sz, ext, pp); }
-int shimShmLock(sqlite3_file* f, int o, int n, int fl) { return REAL(f)->pMethods->xShmLock(REAL(f), o, n, fl); }
-void shimShmBarrier(sqlite3_file* f) { REAL(f)->pMethods->xShmBarrier(REAL(f)); }
-int shimShmUnmap(sqlite3_file* f, int del) { return REAL(f)->pMethods->xShmUnmap(REAL(f), del); }
-int shimFetch(sqlite3_file* f, sqlite3_int64 o, int n, void** pp) { return REAL(f)->pMethods->xFetch(REAL(f), o, n, pp); }
-int shimUnfetch(sqlite3_file* f, sqlite3_int64 o, void* p) { return REAL(f)->pMethods->xUnfetch(REAL(f), o, p); }
+int shimFileSize(sqlite3_file* f, sqlite3_int64* n) {
+    return REAL(f)->pMethods->xFileSize(REAL(f), n);
+}
+int shimLock(sqlite3_file* f, int l) {
+    return REAL(f)->pMethods->xLock(REAL(f), l);
+}
+int shimUnlock(sqlite3_file* f, int l) {
+    return REAL(f)->pMethods->xUnlock(REAL(f), l);
+}
+int shimCheckReserved(sqlite3_file* f, int* r) {
+    return REAL(f)->pMethods->xCheckReservedLock(REAL(f), r);
+}
+int shimFileControl(sqlite3_file* f, int op, void* a) {
+    return REAL(f)->pMethods->xFileControl(REAL(f), op, a);
+}
+int shimSectorSize(sqlite3_file* f) {
+    return REAL(f)->pMethods->xSectorSize(REAL(f));
+}
+int shimDevChar(sqlite3_file* f) {
+    return REAL(f)->pMethods->xDeviceCharacteristics(REAL(f));
+}
+int shimShmMap(sqlite3_file* f, int pg, int sz, int ext, void volatile** pp) {
+    return REAL(f)->pMethods->xShmMap(REAL(f), pg, sz, ext, pp);
+}
+int shimShmLock(sqlite3_file* f, int o, int n, int fl) {
+    return REAL(f)->pMethods->xShmLock(REAL(f), o, n, fl);
+}
+void shimShmBarrier(sqlite3_file* f) {
+    REAL(f)->pMethods->xShmBarrier(REAL(f));
+}
+int shimShmUnmap(sqlite3_file* f, int del) {
+    return REAL(f)->pMethods->xShmUnmap(REAL(f), del);
+}
+int shimFetch(sqlite3_file* f, sqlite3_int64 o, int n, void** pp) {
+    return REAL(f)->pMethods->xFetch(REAL(f), o, n, pp);
+}
+int shimUnfetch(sqlite3_file* f, sqlite3_int64 o, void* p) {
+    return REAL(f)->pMethods->xUnfetch(REAL(f), o, p);
+}
 #undef REAL
 
 int shimOpen(sqlite3_vfs*, sqlite3_filename name, sqlite3_file* f, int flags, int* out_flags) {
@@ -368,11 +402,25 @@ void registerShimVfs() {
         g_shim_vfs.zName = "fullfsync_shim";
         g_shim_vfs.szOsFile = static_cast<int>(sizeof(ShimFile)) + g_real_vfs->szOsFile;
         g_shim_vfs.xOpen = shimOpen;
-        g_shim_io = sqlite3_io_methods{3,           shimClose,     shimRead,       shimWrite,
-                                       shimTruncate, shimSync,     shimFileSize,   shimLock,
-                                       shimUnlock,  shimCheckReserved, shimFileControl,
-                                       shimSectorSize, shimDevChar, shimShmMap,   shimShmLock,
-                                       shimShmBarrier, shimShmUnmap, shimFetch,   shimUnfetch};
+        g_shim_io = sqlite3_io_methods{3,
+                                       shimClose,
+                                       shimRead,
+                                       shimWrite,
+                                       shimTruncate,
+                                       shimSync,
+                                       shimFileSize,
+                                       shimLock,
+                                       shimUnlock,
+                                       shimCheckReserved,
+                                       shimFileControl,
+                                       shimSectorSize,
+                                       shimDevChar,
+                                       shimShmMap,
+                                       shimShmLock,
+                                       shimShmBarrier,
+                                       shimShmUnmap,
+                                       shimFetch,
+                                       shimUnfetch};
         if (sqlite3_vfs_register(&g_shim_vfs, 0) != SQLITE_OK) {
             errno = 0;
             bpt::fatal("sqlite3_vfs_register failed");
@@ -459,7 +507,8 @@ public:
     }
     size_t scan_100(const std::string& start) override {
         Conn& c = conn();
-        sqlite3_bind_text(c.scan, 1, start.data(), static_cast<int>(start.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text(c.scan, 1, start.data(), static_cast<int>(start.size()),
+                          SQLITE_TRANSIENT);
         size_t n = 0;
         int rc;
         while ((rc = stepRetry(c.db, c.scan, "scan")) == SQLITE_ROW) {
@@ -499,9 +548,9 @@ private:
                               "fullfsync_shim"),
               c.db, "open");
         sqlite3_busy_timeout(c.db, 10000);
-        for (const char* p : {"PRAGMA journal_mode = WAL", "PRAGMA synchronous = FULL",
-                              "PRAGMA fullfsync = ON", "PRAGMA checkpoint_fullfsync = ON",
-                              "PRAGMA cache_size = -4096"})
+        for (const char* p :
+             {"PRAGMA journal_mode = WAL", "PRAGMA synchronous = FULL", "PRAGMA fullfsync = ON",
+              "PRAGMA checkpoint_fullfsync = ON", "PRAGMA cache_size = -4096"})
             exec(c.db, p);
         exec(c.db, "CREATE TABLE IF NOT EXISTS docs(key TEXT PRIMARY KEY, doc TEXT)");
         auto prep = [&](const char* sql, sqlite3_stmt** s) {
@@ -612,9 +661,7 @@ public:
     }
 
 private:
-    bool exists(const std::string& k) {
-        return db_->findOne(k) != "null (Document not found)";
-    }
+    bool exists(const std::string& k) { return db_->findOne(k) != "null (Document not found)"; }
     std::mutex mu_;
     std::unique_ptr<MongoLite> db_;
     int wal_fd_ = -1, data_fd_ = -1;
@@ -633,7 +680,9 @@ std::unique_ptr<BenchStore> openStore(Engine e, const std::string& dir) {
     }
     return nullptr;
 }
-bool supports(Engine e, size_t doc_bytes) { return !(e == kMongo && doc_bytes > 4000); }
+bool supports(Engine e, size_t doc_bytes) {
+    return !(e == kMongo && doc_bytes > 4000);
+}
 
 // ------------------------------------------------------------------------------------------
 // Results: every measurement stored per run; tables print the median of the runs
@@ -714,7 +763,8 @@ template <typename F> Bytes measure(BenchStore& st, const std::string& dir, F fn
 // ------------------------------------------------------------------------------------------
 // Workloads
 // ------------------------------------------------------------------------------------------
-void loadDocs(BenchStore& st, size_t size, int threads, Lat* lat = nullptr, double* secs = nullptr) {
+void loadDocs(BenchStore& st, size_t size, int threads, Lat* lat = nullptr,
+              double* secs = nullptr) {
     auto [l, s] = runOps(kDocs, threads, [&](int, int i) {
         if (!st.put(key(i), makeDoc(i, size))) {
             errno = 0;
@@ -729,7 +779,8 @@ void loadDocs(BenchStore& st, size_t size, int threads, Lat* lat = nullptr, doub
 void workloadA(Engine e, const std::string& base) {
     for (int threads : {1, kThreads}) {
         const std::string dir = base + "/A" + std::to_string(threads);
-        const std::string w = "A load 1 KB, " + std::to_string(threads) + (threads == 1 ? " thread" : " threads");
+        const std::string w =
+            "A load 1 KB, " + std::to_string(threads) + (threads == 1 ? " thread" : " threads");
         auto st = openStore(e, dir);
         Lat l;
         double secs = 0;
@@ -753,7 +804,8 @@ void workloadBCD(Engine e, const std::string& base, size_t size, uint32_t seed) 
     loadDocs(*st, size, kThreads);
     st->checkpoint();
     for (int threads : {1, kThreads}) {
-        const std::string w = "B update " + sz + ", " + std::to_string(threads) + (threads == 1 ? " thread" : " threads");
+        const std::string w = "B update " + sz + ", " + std::to_string(threads) +
+                              (threads == 1 ? " thread" : " threads");
         std::vector<int> keys(kUpdates);
         std::mt19937 rng(seed + threads);
         for (int& k : keys) k = static_cast<int>(rng() % kDocs);
@@ -959,7 +1011,9 @@ void row(const std::string& w, const std::string& label, const std::string& m, b
 }
 
 void opsTable(const std::string& w, bool updates) {
-    std::printf("\n#### %s\n\n| Metric | IndexedStore | SQLite | MongoLite | Winner |\n|---|---:|---:|---:|---|\n", w.c_str());
+    std::printf("\n#### %s\n\n| Metric | IndexedStore | SQLite | MongoLite | Winner "
+                "|\n|---|---:|---:|---:|---|\n",
+                w.c_str());
     row(w, "ops/s", "ops_s", true, 0);
     row(w, "p50 latency (µs)", "p50", false, 0);
     row(w, "p99 latency (µs)", "p99", false, 0);
@@ -989,14 +1043,16 @@ int main() {
     });
     const std::string hw = hardware();
     std::printf("Hardware: %s\n", hw.c_str());
-    std::printf("Scale: %d docs per dataset, %d updates, %d gets, %d scans, %d threads, %d run(s)\n",
-                kDocs, kUpdates, kGets, kScans, kThreads, kRuns);
+    std::printf(
+        "Scale: %d docs per dataset, %d updates, %d gets, %d scans, %d threads, %d run(s)\n", kDocs,
+        kUpdates, kGets, kScans, kThreads, kRuns);
     // Planned bytes, from the pilot: one run of all workloads and engines at 5,000 documents and
     // 2,000 updates per dataset wrote 1.27 GB (OS counter); writes scale with the document and
     // update counts (reads write nothing).
     const double planned = kRuns * 1.27e9 * (double(kDocs) / 5000.0);
-    std::printf("Planned: about %.2f GB written in total (cap %.1f GB); free disk checked >= 10 GB.\n",
-                planned / 1e9, kWriteBudgetBytes / 1e9);
+    std::printf(
+        "Planned: about %.2f GB written in total (cap %.1f GB); free disk checked >= 10 GB.\n",
+        planned / 1e9, kWriteBudgetBytes / 1e9);
     std::fflush(stdout);
     if (planned > double(kWriteBudgetBytes)) {
         std::printf("STOP: planned bytes exceed the cap.\n");
@@ -1026,7 +1082,8 @@ int main() {
     std::printf("\n### A. Bulk load (%d documents of 1 KB)\n", kDocs);
     opsTable("A load 1 KB, 1 thread", false);
     opsTable("A load 1 KB, 16 threads", false);
-    std::printf("\n### B. Small updates (%d updates of profile.score + 1 on %d documents)\n", kUpdates, kDocs);
+    std::printf("\n### B. Small updates (%d updates of profile.score + 1 on %d documents)\n",
+                kUpdates, kDocs);
     for (size_t size : kSizes)
         for (const char* t : {"1 thread", "16 threads"})
             opsTable("B update " + std::to_string(size / 1024) + " KB, " + t, true);
@@ -1034,7 +1091,8 @@ int main() {
     opsTable("C point get (1 KB, 1 thread)", false);
     opsTable("C range scan 100 (1 KB, 1 thread)", false);
     std::printf("\n### D. Disk footprint after B (live data = documents x document size)\n\n"
-                "| Dataset | Metric | IndexedStore | SQLite | MongoLite | Winner |\n|---|---|---:|---:|---:|---|\n");
+                "| Dataset | Metric | IndexedStore | SQLite | MongoLite | Winner "
+                "|\n|---|---|---:|---:|---:|---|\n");
     for (size_t size : kSizes) {
         const std::string w = "D footprint " + std::to_string(size / 1024) + " KB";
         auto r = [&](const char* label, const char* m, int prec) {
@@ -1050,8 +1108,7 @@ int main() {
             std::printf("| %zu KB | %s |", size / 1024, label);
             for (int e = 0; e < kNumEngines; ++e)
                 std::printf(" %s%s |",
-                            v[e] ? fmt(*v[e], prec).c_str()
-                                 : (n > 1 ? "not supported" : "-"),
+                            v[e] ? fmt(*v[e], prec).c_str() : (n > 1 ? "not supported" : "-"),
                             n > 1 && v[e] && e == best ? " **(best)**" : "");
             std::printf(" %s |\n", n > 1 ? kEngineName[best] : "n/a");
         };
@@ -1062,7 +1119,8 @@ int main() {
         r("GC MB written while settling", "gc_mb_settle", 1);
     }
     std::printf("\n### E. kill -9 during 16-thread 1 KB updates (killed after %d acks)\n\n"
-                "| Engine | Run | Acked updates | Acked updates lost | In flight at the kill | Reopened |\n|---|---:|---:|---:|---:|---|\n",
+                "| Engine | Run | Acked updates | Acked updates lost | In flight at the kill | "
+                "Reopened |\n|---|---:|---:|---:|---:|---|\n",
                 kUpdates / 4);
     for (int e = 0; e < kNumEngines; ++e)
         for (size_t i = 0; i < crashes[e].size(); ++i) {
