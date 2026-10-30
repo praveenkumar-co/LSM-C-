@@ -2,7 +2,8 @@
 // per key) and an in-memory model. SC1 random ranges and edge cases, SC2 entries relocated by GC,
 // SC3 checkpoint, reopen and a range ending in the active segment, SC4 kill -9 and recovery,
 // SC5 corruption and a missing segment (same VLogReadError as get()), SC6 scans while 8 writer
-// threads and GC run, SC7 the pin is held for the whole call.
+// threads and GC run, SC7 the pin is held for the whole call, SC8 a CRC-valid entry whose key_len
+// is larger than the entry.
 //
 // The guarantee both scans give (and SC6 checks): every returned document is a complete,
 // committed version of its key that was the key's current version at some instant during the
@@ -13,6 +14,8 @@
 #include "doc/Json.hpp"
 #include "doc/Update.hpp"
 #include "index/IndexedStore.hpp"
+#include "vlog/CRC32.hpp"
+#include "vlog/VLogFormat.hpp"
 
 #include <fcntl.h>
 #include <signal.h>
@@ -628,6 +631,47 @@ static void testSC7PinHeld(const std::string& dir) {
          "returns the versions of its tree walk; unlinked afterwards");
 }
 
+// ------------------------------------------------------------------------------------------
+// SC8 a CRC-valid entry whose key_len does not fit inside the entry
+// ------------------------------------------------------------------------------------------
+static void testSC8KeyLenTooLarge(const std::string& dir) {
+    banner("SC8 CRC-valid entry with key_len larger than the entry");
+    Fixture f;
+    f.st = IndexedStore::open(dir, storeOpts());
+    for (int i = 0; i < 10; ++i) f.put(i, 0, 200);
+    compareRange(f, key(0), key(10), 100, "before the crafted entry");
+    // Rewrite key 5's entry in place: same total_len and seq, key_len = total_len (the key would
+    // end past the entry), CRC recomputed so the CRC check passes.
+    const vlog::VPtr p = f.st->tree().get(key(5))->vptr;
+    const std::string path = segPath(*f.st, p.segment_id);
+    const int fd = ::open(path.c_str(), O_RDWR);
+    CHECK(fd >= 0);
+    std::vector<uint8_t> e(p.length);
+    CHECK(::pread(fd, e.data(), e.size(), p.offset) == static_cast<ssize_t>(e.size()));
+    vlog::EntryHeader h;
+    std::memcpy(&h, e.data(), sizeof(h));
+    CHECK(h.total_len == p.length && h.key_len == key(5).size());
+    h.key_len = static_cast<uint16_t>(h.total_len);
+    std::memcpy(e.data(), &h, sizeof(h));
+    const uint32_t crc = vlog::crc32c(e.data() + 4, e.size() - 4);
+    std::memcpy(e.data(), &crc, sizeof(crc));
+    CHECK(::pwrite(fd, e.data(), e.size(), p.offset) == static_cast<ssize_t>(e.size()));
+    CHECK(::close(fd) == 0);
+    accountBytes(e.size(), "crafted entry");
+    // get() rejects it before copying the key (under ASan a copy past the buffer would abort).
+    const std::string err = readErrorOf([&] { (void)f.st->get(key(5)); });
+    CHECK(err.find("vLog entry unreadable") == 0);
+    CHECK(readErrorOf([&] { (void)f.st->scanSlow(key(0), key(10), 100); }) == err);
+    CHECK(readErrorOf([&] { (void)f.st->scanDocuments(key(0), key(10), 100); }) == err);
+    f.model.erase(key(5)); // the ranges below exclude it
+    compareRange(f, key(0), key(5), 100, "range before the crafted entry");
+    compareRange(f, key(6), key(10), 100, "range after the crafted entry");
+    accountBytes(f.st->vlogBytesWritten(), "vLog");
+    f.st.reset(); // damaged on purpose: no close()
+    pass("SC8 CRC-valid entry with key_len past its end: get(), scanSlow() and scanDocuments() "
+         "report the same VLogReadError (unreadable), nothing read past the entry");
+}
+
 int main() {
     std::string dir = setupRun("scan_test");
     Cleaner cleaner{dir};
@@ -638,6 +682,7 @@ int main() {
     testSC5Corruption(dir + "/sc5");
     testSC6Concurrent(dir + "/sc6");
     testSC7PinHeld(dir + "/sc7");
+    testSC8KeyLenTooLarge(dir + "/sc8");
     printBudget();
     return 0;
 }

@@ -78,8 +78,10 @@ public:
     }
 
     // Reads the entry at vptr from an open descriptor of its segment with a single pread of
-    // vptr.length bytes, then the same checks as readEntry (header bounds, length, CRC). A short
-    // read (the entry would end past the end of the file) fails.
+    // vptr.length bytes, then the same checks as readEntry (header bounds, length, CRC) plus one:
+    // the key must lie inside the entry (a CRC-valid entry with a larger key_len would otherwise
+    // make the key copy read past the buffer). A short read (the entry would end past the end of
+    // the file) fails.
     static bool readEntryAt(int fd, const VPtr& vptr, EntryHeader& out_hdr, std::string& out_key,
                             std::vector<uint8_t>& out_payload) {
         if (vptr.length < sizeof(EntryHeader) || vptr.length > kMaxEntryLen) return false;
@@ -95,7 +97,8 @@ public:
         EntryHeader hdr;
         std::memcpy(&hdr, buf.data(), sizeof(hdr));
         if (!validateHeaderBounds(hdr, vptr.offset, uint64_t(vptr.offset) + vptr.length) ||
-            hdr.total_len != vptr.length)
+            hdr.total_len != vptr.length ||
+            sizeof(EntryHeader) + static_cast<uint64_t>(hdr.key_len) > hdr.total_len)
             return false;
         SCAN_PROF_T0(prof_crc);
         const uint32_t prof_crc_value = crc32c(buf.data() + 4, hdr.total_len - 4);
@@ -109,6 +112,7 @@ public:
         std::memcpy(&hdr, buf.data(), sizeof(hdr));
         if (!validateHeaderBounds(hdr, vptr.offset, uint64_t(vptr.offset) + vptr.length) ||
             hdr.total_len != vptr.length ||
+            sizeof(EntryHeader) + static_cast<uint64_t>(hdr.key_len) > hdr.total_len ||
             crc32c(buf.data() + 4, hdr.total_len - 4) != hdr.crc32c)
             return false;
 #endif
