@@ -6,6 +6,7 @@
 #   make bench       delta-update and GC benchmarks (not part of any test mode)
 #   make bench-stress  100,000-key, 16-thread stress benchmark with GC and 50 kill -9 crashes
 #   make bench-compare IndexedStore vs SQLite vs legacy MongoLite (links -lsqlite3)
+#   make bench-scan  range scans of 100 keys, 1 and 4 threads (normal build + -DSCAN_PROFILE build)
 #   make clean
 #
 # Each test binary prints one "[PASS] ..." line per test (TEST_VERBOSE=1 adds measurements) and
@@ -34,7 +35,7 @@ LIMIT_asan  := 536870912
 LIMIT_tsan  := 536870912
 LIMIT_quick := 33554432
 
-.PHONY: test asan tsan quick test-quick bench bench-stress bench-compare clean check-deps
+.PHONY: test asan tsan quick test-quick bench bench-stress bench-compare bench-scan clean check-deps
 
 # vlog/ and doc/ are bottom layers: vlog/ must not depend on index/, doc/ or legacy/, and doc/
 # (JSON and update ops) must not depend on vlog/, index/ or legacy/.
@@ -101,6 +102,20 @@ build/bench/bench_compare: bench/bench_compare.cpp $(HEADERS) Makefile
 KEEP_AWAKE := $(shell command -v caffeinate >/dev/null 2>&1 && echo "caffeinate -dims")
 bench-compare: check-deps build/bench/bench_compare
 	$(KEEP_AWAKE) ./build/bench/bench_compare
+
+# Range scan benchmark: write cap 256 MiB per binary; each binary checks free disk >= 10 GB at
+# start. bench_scan_profile is the same program with -DSCAN_PROFILE (timers in the read path).
+build/bench/bench_scan: bench/bench_scan.cpp $(HEADERS) Makefile
+	@mkdir -p build/bench
+	$(CXX) $(CXXSTD) $(WARN) -O2 -DBENCH_BUDGET_BYTES=268435456ULL $(INCLUDES) $(LDFLAGS) $< -o $@
+
+build/bench/bench_scan_profile: bench/bench_scan.cpp $(HEADERS) Makefile
+	@mkdir -p build/bench
+	$(CXX) $(CXXSTD) $(WARN) -O2 -DSCAN_PROFILE -DBENCH_BUDGET_BYTES=268435456ULL $(INCLUDES) $(LDFLAGS) $< -o $@
+
+bench-scan: check-deps build/bench/bench_scan build/bench/bench_scan_profile
+	$(KEEP_AWAKE) ./build/bench/bench_scan
+	$(KEEP_AWAKE) ./build/bench/bench_scan_profile
 
 clean:
 	rm -rf build

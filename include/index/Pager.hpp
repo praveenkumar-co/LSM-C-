@@ -28,6 +28,7 @@
 #include "index/BPTreeFormat.hpp"
 #include "index/IndexCommon.hpp"
 #include "index/SuperblockManager.hpp"
+#include "vlog/ScanProfile.hpp"
 #include "vlog/VLogReader.hpp" // vlog::full_fsync
 
 #include <cerrno>
@@ -281,7 +282,9 @@ public:
     }
 
     PageGuard fetch(page_id_t id) {
+        SCAN_PROF_T0(prof_lock);
         std::lock_guard<std::mutex> lk(mu_);
+        SCAN_PROF_ADD_NS(lock_pager_ns, prof_lock);
         if (id == kMetaPageId || id >= page_count_) {
             fatal("fetch of invalid page id " + std::to_string(id) + " (page_count " +
                   std::to_string(page_count_) + ")");
@@ -300,6 +303,8 @@ public:
             std::memcpy(buf, snap->second, kPageSize);
         } else {
             ssize_t r = ::pread(fd_, buf, kPageSize, static_cast<off_t>(id) * kPageSize);
+            SCAN_PROF_COUNT(index_preads, 1);
+            SCAN_PROF_COUNT(index_pread_bytes, r > 0 ? r : 0);
             if (r != static_cast<ssize_t>(kPageSize)) {
                 fatal("pread of page " + std::to_string(id) + " returned " + std::to_string(r));
             }
@@ -690,7 +695,9 @@ private:
     }
 
     void unpin(uint32_t f) {
+        SCAN_PROF_T0(prof_lock);
         std::lock_guard<std::mutex> lk(mu_);
+        SCAN_PROF_ADD_NS(lock_pager_ns, prof_lock);
         Frame& fr = frames_[f];
         if (fr.pins == 0) fatal("unpin of an unpinned frame");
         if (--fr.pins == 0) {

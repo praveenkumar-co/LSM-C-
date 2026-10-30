@@ -12,6 +12,7 @@
 
 #include "index/BPTreeFormat.hpp"
 #include "index/Pager.hpp"
+#include "vlog/ScanProfile.hpp"
 #include "vlog/VLogFormat.hpp"
 
 #include <algorithm>
@@ -208,7 +209,11 @@ public:
 
     std::optional<Ref> get(std::string_view key) const {
         if (!validKeyLen(key.size())) return std::nullopt;
+        SCAN_PROF_SCOPE(prof_tree, tree_ns);
+        SCAN_PROF_COUNT(tree_calls, 1);
+        SCAN_PROF_T0(prof_lock);
         std::shared_lock<std::shared_mutex> lk(mu_);
+        SCAN_PROF_ADD_NS(lock_tree_ns, prof_lock);
         return getLocked(key);
     }
 
@@ -224,7 +229,11 @@ public:
     ScanResult scan(std::string_view start, std::string_view end, size_t limit) const {
         ScanResult out;
         if (limit == 0 || compareKeys(start, end) >= 0) return out;
+        SCAN_PROF_SCOPE(prof_tree, tree_ns);
+        SCAN_PROF_COUNT(tree_calls, 1);
+        SCAN_PROF_T0(prof_lock);
         std::shared_lock<std::shared_mutex> lk(mu_);
+        SCAN_PROF_ADD_NS(lock_tree_ns, prof_lock);
         scanLocked(start, &end, limit, &out);
         return out;
     }

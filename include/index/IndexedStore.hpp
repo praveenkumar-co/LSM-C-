@@ -185,6 +185,7 @@ public:
         std::function<void(uint32_t victim, size_t entries)> on_gc_after_append;
         std::function<void(uint32_t victim)> on_gc_after_apply;
         std::function<void(std::string_view key)> on_get_after_index_read;
+        std::function<void()> on_scan_after_index_read; // scanDocuments, after its tree walk
         std::function<void(uint32_t segment)> on_gc_before_unlink;
         std::function<void(uint32_t segment)> on_gc_after_unlink_before_dirsync;
         std::function<void(uint32_t victim, size_t stripes)> on_gc_batch_stripes;
@@ -386,6 +387,8 @@ public:
         if (stats) *stats = ReadStats{v.reads, v.depth};
         if (seq_out) *seq_out = ref->seq;
         if (v.deltas.empty()) return std::string(v.full_payload.begin(), v.full_payload.end());
+        SCAN_PROF_SCOPE(prof_delta, delta_ns);
+        SCAN_PROF_COUNT(delta_resolves, 1);
         return doc::serialize(materialize(v, key, *ref));
     }
 
@@ -396,6 +399,98 @@ public:
 
     // Keeps every segment the index references now on disk until the guard is released.
     ReadGuard pin() const { return ReadGuard(&readers_); }
+
+    using DocScanResult = std::vector<std::pair<std::string, std::string>>;
+
+    // Documents of the keys with start <= key < end, ascending, at most `limit` (the keys scan()
+    // returns). One point in time: a pin, then one tree walk under the tree's shared lock; each
+    // document is the version the index named at that moment, returned as get() returns it (a
+    // Full entry byte for byte, a Delta chain as canonical JSON). The vLog entries are read in
+    // batches sorted by (segment, offset): entries of one segment at most kScanMaxGap apart share
+    // one pread of at most kScanMaxRead bytes; Delta bases are read in further rounds (at most
+    // kMaxDeltaChain). A read never extends past the end of the last entry it covers. Every entry
+    // gets get()'s checks; if any key cannot be read, this throws the VLogReadError get() would
+    // throw for the first such key in key order, and returns nothing.
+    DocScanResult scanDocuments(std::string_view start, std::string_view end,
+                                size_t limit) const {
+        ReadGuard guard(&readers_); // before the index read, held for the whole call
+        const BPTree::ScanResult refs = tree_->scan(start, end, limit);
+        if (opts_.on_scan_after_index_read) opts_.on_scan_after_index_read();
+        struct KeyRead {
+            ChainCursor c;
+            Version v;
+            bool done = false;
+            bool failed = false;
+            std::string error;
+        };
+        std::vector<KeyRead> kr(refs.size());
+        for (size_t i = 0; i < refs.size(); ++i) {
+            kr[i].c.at = refs[i].second.vptr;
+            kr[i].c.want_seq = refs[i].second.seq;
+        }
+        BatchReader br(*this); // one lease per segment and one buffer for the whole call
+        std::vector<BatchReader::Req> reqs;
+        for (int round = 0;; ++round) {
+            reqs.clear();
+            for (size_t i = 0; i < kr.size(); ++i)
+                if (!kr[i].done && !kr[i].failed) reqs.push_back(BatchReader::Req{kr[i].c.at, i});
+            if (reqs.empty()) break;
+            // Every round either ends a chain or lowers its expected depth (chainStep checks it),
+            // so a chain of at most kMaxDeltaChain Deltas needs at most kMaxDeltaChain + 1 rounds.
+            if (round > vlog::kMaxDeltaChain) {
+                errno = 0;
+                fatal("scanDocuments: chain walk did not end");
+            }
+            br.read(&reqs, [&](size_t i, bool ok, const vlog::EntryHeader& h, const std::string& k,
+                               std::vector<uint8_t>& payload) {
+                KeyRead& r = kr[i];
+                const ChainCursor at = r.c; // chainStep moves r.c on; messages name this entry
+                const auto where = [&at] { return chainWhere(at); };
+                if (!ok) {
+                    r.failed = true;
+                    r.error = unreadableMessage(where());
+                    return;
+                }
+                try {
+                    r.done = chainStep(refs[i].first, r.c, h, k, payload, r.v, where);
+                } catch (const VLogReadError& e) {
+                    r.failed = true;
+                    r.error = e.what();
+                }
+            });
+        }
+        DocScanResult out;
+        out.reserve(refs.size());
+        for (size_t i = 0; i < kr.size(); ++i) {
+            if (kr[i].failed) throw VLogReadError(kr[i].error);
+            const Version& v = kr[i].v;
+            if (v.deltas.empty()) {
+                out.emplace_back(refs[i].first,
+                                 std::string(v.full_payload.begin(), v.full_payload.end()));
+                continue;
+            }
+            SCAN_PROF_SCOPE(prof_delta, delta_ns);
+            SCAN_PROF_COUNT(delta_resolves, 1);
+            out.emplace_back(refs[i].first,
+                             doc::serialize(materialize(v, refs[i].first, refs[i].second)));
+        }
+        return out;
+    }
+
+    // Test-only: the per-key path scanDocuments replaces (pin, scan(), then get() per key; a key
+    // erased between the scan and its get() is skipped).
+    DocScanResult scanSlow(std::string_view start, std::string_view end, size_t limit) const {
+        ReadGuard guard(&readers_);
+        DocScanResult out;
+        for (const auto& kv : tree_->scan(start, end, limit)) {
+            std::optional<std::string> d = get(kv.first);
+            if (d) out.emplace_back(kv.first, std::move(*d));
+        }
+        return out;
+    }
+
+    static constexpr uint32_t kScanMaxGap = 4 * 1024;     // largest gap inside one batched read
+    static constexpr uint32_t kScanMaxRead = 1024 * 1024; // largest batched read (bytes)
 
     // Makes the index durable up to the last applied entry. Safe to call while other threads use
     // the store. Timer/bytes triggers skip the write if nothing was applied since the last one.
@@ -1105,57 +1200,80 @@ private:
         return std::min(vlog_max, opt);
     }
 
+    // Position in a chain walk: the next entry to read and what it must hold.
+    struct ChainCursor {
+        vlog::VPtr at{};
+        uint64_t want_seq = 0;
+        int want_depth = -1; // depth of the next entry; -1 = whatever the first entry says
+    };
+
+    static std::string chainWhere(const ChainCursor& c) {
+        return "segment " + std::to_string(c.at.segment_id) + " offset " +
+               std::to_string(c.at.offset) + " (expected seq " + std::to_string(c.want_seq) + ")";
+    }
+    static std::string unreadableMessage(const std::string& where) {
+        return "vLog entry unreadable (missing segment, bad bounds, or CRC mismatch) at " + where;
+    }
+
+    // One step of a chain walk (readVersion and scanDocuments): the entry at c.at was read and
+    // passed its bounds and CRC checks. It must carry this key and c.want_seq, and the depth must
+    // fall by one per hop until a Full entry. Returns true at the Full base (v complete), false
+    // after a Delta (c now names its base). Throws VLogReadError otherwise.
+    template <typename WhereFn>
+    bool chainStep(std::string_view key, ChainCursor& c, const vlog::EntryHeader& h,
+                   const std::string& k, std::vector<uint8_t>& payload, Version& v,
+                   WhereFn where) const {
+        v.reads++;
+        v.chain.push_back(c.at);
+        const uint64_t seq = h.seq;
+        if (seq != c.want_seq || k != key)
+            throw VLogReadError("vLog entry does not match (seq " + std::to_string(seq) + ") at " +
+                                where());
+        if (h.type == static_cast<uint8_t>(vlog::EntryType::Full)) {
+            if (c.want_depth > 0)
+                throw VLogReadError("Delta chain reached a Full entry early at " + where());
+            v.full_payload = std::move(payload);
+            return true;
+        }
+        if (h.type != static_cast<uint8_t>(vlog::EntryType::Delta))
+            throw VLogReadError("index or Delta points at a non-document entry at " + where());
+        DecodedDelta d;
+        try {
+            SCAN_PROF_SCOPE(prof_decode, delta_ns);
+            d = decodeDelta(payload);
+        } catch (const DeltaFormatError& e) {
+            throw VLogReadError(std::string("malformed Delta entry at ") + where() + ": " +
+                                e.what());
+        }
+        const int depth = d.prefix.chain_depth;
+        if (depth < 1 || depth > vlog::kMaxDeltaChain ||
+            (c.want_depth >= 0 && depth != c.want_depth) || d.prefix.base_seq >= seq)
+            throw VLogReadError("Delta entry with a bad chain depth or base at " + where());
+        if (c.want_depth < 0) v.depth = static_cast<uint16_t>(depth);
+        c.want_seq = d.prefix.base_seq;
+        c.at = d.prefix.base;
+        c.want_depth = depth - 1;
+        v.deltas.push_back(std::move(d));
+        return false;
+    }
+
     // Reads the chain starting at ref. Each entry must pass its CRC, carry this key and the
     // expected seq (the index seq, then each Delta's base_seq), and the depth must fall by one per
     // hop until a Full entry. Throws VLogReadError otherwise.
     Version readVersion(std::string_view key, const vlog::IndexValueRef& ref) const {
         Version v;
-        uint64_t want_seq = ref.seq;
-        vlog::VPtr at = ref.vptr;
-        int want_depth = -1; // depth of the next entry; -1 = whatever the first entry says
+        ChainCursor c;
+        c.want_seq = ref.seq;
+        c.at = ref.vptr;
         while (true) {
             vlog::EntryHeader h;
             std::string k;
             std::vector<uint8_t> payload;
-            const std::string where = "segment " + std::to_string(at.segment_id) + " offset " +
-                                      std::to_string(at.offset) + " (expected seq " +
-                                      std::to_string(want_seq) + ")";
-            SegmentFdCache::Lease lease = fds_.acquire(at.segment_id);
-            if (!lease || !vlog::VLogReader::readEntryAt(lease.fd(), at, h, k, payload)) {
-                throw VLogReadError(
-                    "vLog entry unreadable (missing segment, bad bounds, or CRC mismatch) at " +
-                    where);
-            }
-            v.reads++;
-            v.chain.push_back(at);
-            const uint64_t seq = h.seq;
-            if (seq != want_seq || k != key)
-                throw VLogReadError("vLog entry does not match (seq " + std::to_string(seq) +
-                                    ") at " + where);
-            if (h.type == static_cast<uint8_t>(vlog::EntryType::Full)) {
-                if (want_depth > 0)
-                    throw VLogReadError("Delta chain reached a Full entry early at " + where);
-                v.full_payload = std::move(payload);
-                return v;
-            }
-            if (h.type != static_cast<uint8_t>(vlog::EntryType::Delta))
-                throw VLogReadError("index or Delta points at a non-document entry at " + where);
-            DecodedDelta d;
-            try {
-                d = decodeDelta(payload);
-            } catch (const DeltaFormatError& e) {
-                throw VLogReadError(std::string("malformed Delta entry at ") + where + ": " +
-                                    e.what());
-            }
-            const int depth = d.prefix.chain_depth;
-            if (depth < 1 || depth > vlog::kMaxDeltaChain ||
-                (want_depth >= 0 && depth != want_depth) || d.prefix.base_seq >= seq)
-                throw VLogReadError("Delta entry with a bad chain depth or base at " + where);
-            if (want_depth < 0) v.depth = static_cast<uint16_t>(depth);
-            want_seq = d.prefix.base_seq;
-            at = d.prefix.base;
-            want_depth = depth - 1;
-            v.deltas.push_back(std::move(d));
+            const std::string where = chainWhere(c);
+            SegmentFdCache::Lease lease = fds_.acquire(c.at.segment_id);
+            if (!lease || !vlog::VLogReader::readEntryAt(lease.fd(), c.at, h, k, payload))
+                throw VLogReadError(unreadableMessage(where));
+            if (chainStep(key, c, h, k, payload, v, [&] { return where; })) return v;
         }
     }
 
@@ -1324,6 +1442,116 @@ private:
     private:
         const IndexedStore& st_;
         std::map<uint32_t, int> fds_;
+    };
+
+    // Batched vLog reads for scanDocuments. Requests are sorted by (segment, offset); requests of
+    // one segment whose entries are at most kScanMaxGap apart are read with one pread of at most
+    // kScanMaxRead bytes (a longer entry is read alone), into one buffer reused for every read.
+    // A read covers [first entry's offset, end of the last entry it covers): no byte past an
+    // entry the index named, so never past a segment's valid end or past the last acked entry of
+    // the active segment (group commit writes batches in order and an entry reaches the index
+    // only after its write + F_FULLFSYNC returned). Leases are held until the reader is
+    // destroyed. Each entry gets VLogReader::checkEntryInBuffer (readEntryAt's checks).
+    class BatchReader {
+    public:
+        struct Req {
+            vlog::VPtr p;
+            size_t key; // caller's index
+        };
+        explicit BatchReader(const IndexedStore& st) : st_(st) {}
+
+        // deliver(key, ok, header, key bytes, payload) once per request; ok == false: missing
+        // segment, short read, bad bounds or CRC mismatch (get() reports all as unreadable).
+        template <typename F> void read(std::vector<Req>* reqs, F&& deliver) {
+            std::vector<Req>& r = *reqs;
+            std::sort(r.begin(), r.end(), [](const Req& a, const Req& b) {
+                if (a.p.segment_id != b.p.segment_id) return a.p.segment_id < b.p.segment_id;
+                if (a.p.offset != b.p.offset) return a.p.offset < b.p.offset;
+                return a.key < b.key;
+            });
+            vlog::EntryHeader h{};
+            std::string k;
+            std::vector<uint8_t> payload;
+            auto fail = [&](const Req& q) {
+                k.clear();
+                payload.clear();
+                deliver(q.key, false, h, k, payload);
+            };
+            size_t i = 0;
+            while (i < r.size()) {
+                const uint32_t seg = r[i].p.segment_id;
+                size_t seg_end = i;
+                while (seg_end < r.size() && r[seg_end].p.segment_id == seg) ++seg_end;
+                const int fd = fdFor(seg);
+                size_t j = i;
+                while (j < seg_end) {
+                    if (fd < 0 || !lengthOk(r[j].p)) {
+                        fail(r[j++]);
+                        continue;
+                    }
+                    const uint64_t run_start = r[j].p.offset;
+                    uint64_t run_end = run_start + r[j].p.length;
+                    size_t m = j + 1;
+                    for (; m < seg_end; ++m) {
+                        const vlog::VPtr& q = r[m].p;
+                        if (!lengthOk(q)) break; // handled alone (it fails) next
+                        const uint64_t q_end = uint64_t(q.offset) + q.length;
+                        if (q.offset > run_end + kScanMaxGap) break;
+                        if (std::max(run_end, q_end) - run_start > kScanMaxRead) break;
+                        run_end = std::max(run_end, q_end);
+                    }
+                    const uint64_t got = readRun(fd, run_start, run_end - run_start);
+                    for (size_t x = j; x < m; ++x) {
+                        const vlog::VPtr& q = r[x].p;
+                        const uint64_t rel = q.offset - run_start;
+                        if (rel + q.length > got ||
+                            !vlog::VLogReader::checkEntryInBuffer(buf_.data() + rel, q, h, k,
+                                                                 payload)) {
+                            fail(r[x]);
+                            continue;
+                        }
+                        deliver(r[x].key, true, h, k, payload);
+                    }
+                    j = m;
+                }
+                i = seg_end;
+            }
+        }
+
+    private:
+        static bool lengthOk(const vlog::VPtr& p) {
+            return p.length >= sizeof(vlog::EntryHeader) && p.length <= vlog::kMaxEntryLen;
+        }
+
+        // The segment's descriptor for the rest of this reader's life; -1 if it does not exist.
+        int fdFor(uint32_t seg) {
+            for (auto& [id, lease] : leases_)
+                if (id == seg) return lease ? lease.fd() : -1;
+            leases_.emplace_back(seg, st_.fds_.acquire(seg));
+            return leases_.back().second ? leases_.back().second.fd() : -1;
+        }
+
+        // Reads len bytes at off into buf_; returns the bytes read (fewer at end of file or on a
+        // read error, so the entries past that point fail their check).
+        uint64_t readRun(int fd, uint64_t off, uint64_t len) {
+            if (buf_.size() < len) buf_.resize(len);
+            uint64_t done = 0;
+            while (done < len) {
+                SCAN_PROF_T0(prof_read);
+                const ssize_t n = ::pread(fd, buf_.data() + done, len - done,
+                                          static_cast<off_t>(off + done));
+                SCAN_PROF_ADD_NS(vlog_pread_ns, prof_read);
+                SCAN_PROF_COUNT(vlog_preads, 1);
+                SCAN_PROF_COUNT(vlog_pread_bytes, n > 0 ? n : 0);
+                if (n <= 0) break;
+                done += static_cast<uint64_t>(n);
+            }
+            return done;
+        }
+
+        const IndexedStore& st_;
+        std::vector<std::pair<uint32_t, SegmentFdCache::Lease>> leases_;
+        std::vector<uint8_t> buf_;
     };
 
     struct CounterScan {

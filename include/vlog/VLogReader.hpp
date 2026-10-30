@@ -4,10 +4,12 @@
 // on anything that looks like corruption in the middle of the log.
 
 #include "CRC32.hpp"
+#include "ScanProfile.hpp"
 #include "VLogFormat.hpp"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -82,6 +84,25 @@ public:
                             std::vector<uint8_t>& out_payload) {
         if (vptr.length < sizeof(EntryHeader) || vptr.length > kMaxEntryLen) return false;
         std::vector<uint8_t> buf(vptr.length);
+#if defined(SCAN_PROFILE)
+        // Same checks as below, timed (benchmark build only).
+        SCAN_PROF_T0(prof_read);
+        const ssize_t got = pread(fd, buf.data(), vptr.length, vptr.offset);
+        SCAN_PROF_ADD_NS(vlog_pread_ns, prof_read);
+        SCAN_PROF_COUNT(vlog_preads, 1);
+        SCAN_PROF_COUNT(vlog_pread_bytes, got > 0 ? got : 0);
+        if (got != static_cast<ssize_t>(vptr.length)) return false;
+        EntryHeader hdr;
+        std::memcpy(&hdr, buf.data(), sizeof(hdr));
+        if (!validateHeaderBounds(hdr, vptr.offset, uint64_t(vptr.offset) + vptr.length) ||
+            hdr.total_len != vptr.length)
+            return false;
+        SCAN_PROF_T0(prof_crc);
+        const uint32_t prof_crc_value = crc32c(buf.data() + 4, hdr.total_len - 4);
+        SCAN_PROF_ADD_NS(crc_ns, prof_crc);
+        SCAN_PROF_COUNT(crc_bytes, hdr.total_len - 4);
+        if (prof_crc_value != hdr.crc32c) return false;
+#else
         if (pread(fd, buf.data(), vptr.length, vptr.offset) != static_cast<ssize_t>(vptr.length))
             return false;
         EntryHeader hdr;
@@ -90,8 +111,40 @@ public:
             hdr.total_len != vptr.length ||
             crc32c(buf.data() + 4, hdr.total_len - 4) != hdr.crc32c)
             return false;
+#endif
         out_hdr = hdr;
         extractKeyAndPayload(hdr, buf, &out_key, &out_payload);
+        return true;
+    }
+
+    // Checks one entry that a batched read placed at p (vptr.length bytes, already read from
+    // vptr.offset of its segment): the same checks readEntryAt makes after its pread (length,
+    // header bounds, total_len == vptr.length, CRC). The key must also lie inside the entry.
+    // Never returns unchecked bytes.
+    static bool checkEntryInBuffer(const uint8_t* p, const VPtr& vptr, EntryHeader& out_hdr,
+                                   std::string& out_key, std::vector<uint8_t>& out_payload) {
+        if (vptr.length < sizeof(EntryHeader) || vptr.length > kMaxEntryLen) return false;
+        EntryHeader hdr;
+        std::memcpy(&hdr, p, sizeof(hdr));
+        if (!validateHeaderBounds(hdr, vptr.offset, uint64_t(vptr.offset) + vptr.length) ||
+            hdr.total_len != vptr.length ||
+            sizeof(EntryHeader) + static_cast<uint64_t>(hdr.key_len) > hdr.total_len)
+            return false;
+#if defined(SCAN_PROFILE)
+        SCAN_PROF_T0(prof_crc);
+        const uint32_t crc = crc32c(p + 4, hdr.total_len - 4);
+        SCAN_PROF_ADD_NS(crc_ns, prof_crc);
+        SCAN_PROF_COUNT(crc_bytes, hdr.total_len - 4);
+#else
+        const uint32_t crc = crc32c(p + 4, hdr.total_len - 4);
+#endif
+        if (crc != hdr.crc32c) return false;
+        out_hdr = hdr;
+        out_key.assign(reinterpret_cast<const char*>(p + sizeof(EntryHeader)), hdr.key_len);
+        out_payload.clear();
+        const uint32_t p_off = payload_offset(hdr.key_len);
+        if (hdr.payload_len > 0 && p_off + uint64_t(hdr.payload_len) <= hdr.total_len)
+            out_payload.assign(p + p_off, p + p_off + hdr.payload_len);
         return true;
     }
 

@@ -8,10 +8,12 @@
 //   outside) is dropped and the path is opened again, so a deleted segment reads as missing.
 // - invalidate(seg): GC calls it before unlinking a segment; the descriptor closes once no lease
 //   holds it. Reader pins (ReaderRegistry) still decide when a segment may be unlinked.
-// All state is behind one mutex (no lock-free code). Closing a read-only descriptor cannot lose
-// data, so a failing close() is not fatal here (as in VLogReader).
+// All state is behind one mutex (no lock-free code); the syscalls (fstat, open, close) run with
+// the mutex released, so one slow syscall does not make every other reader wait. Closing a
+// read-only descriptor cannot lose data, so a failing close() is not fatal here (as in VLogReader).
 
 #include "index/IndexCommon.hpp"
+#include "vlog/ScanProfile.hpp"
 
 #include <cstdint>
 #include <iterator>
@@ -20,6 +22,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -79,58 +82,104 @@ public:
         map_.clear();
     }
 
-    // An empty lease if the segment does not exist.
+    // An empty lease if the segment does not exist. Syscalls (fstat, open, close) run outside the
+    // mutex: a lease taken under the mutex keeps the descriptor open while fstat checks it.
     Lease acquire(uint32_t seg) {
-        std::lock_guard<std::mutex> lk(mu_);
-        auto it = map_.find(seg);
-        if (it != map_.end()) {
-            struct stat st;
-            if (::fstat(it->second->fd, &st) == 0 && st.st_nlink > 0) {
-                std::shared_ptr<Entry> e = it->second;
+        std::shared_ptr<Entry> e;
+        {
+            SCAN_PROF_T0(prof_lock);
+            std::lock_guard<std::mutex> lk(mu_);
+            SCAN_PROF_ADD_NS(lock_fdcache_ns, prof_lock);
+            auto it = map_.find(seg);
+            if (it != map_.end()) {
+                e = it->second;
+                e->refs++; // keeps e->fd open until this lease is released
                 lru_.erase(e->lru_it);
                 lru_.push_front(seg);
                 e->lru_it = lru_.begin();
-                e->refs++;
-                hits_++;
-                return Lease(this, e);
+                hits_++; // taken back below if the file turns out to be unlinked
             }
-            dropLocked(it); // unlinked (or fstat failed): open the path again
         }
-        misses_++;
+        if (e) {
+            SCAN_PROF_COUNT(fstat_calls, 1);
+            struct stat st;
+            SCAN_PROF_T0(prof_fstat);
+            const int rc = ::fstat(e->fd, &st);
+            SCAN_PROF_ADD_NS(fstat_ns, prof_fstat);
+            if (rc == 0 && st.st_nlink > 0) return Lease(this, e);
+            // Unlinked (or fstat failed): drop this descriptor and open the path again.
+            int to_close = -1;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                hits_--;
+                auto it = map_.find(seg);
+                if (it != map_.end() && it->second == e) to_close = dropLocked(it);
+                if (e->refs == 0) fatal("SegmentFdCache: release without a lease");
+                if (--e->refs == 0 && e->dead) {
+                    to_close = e->fd;
+                    e->fd = -1;
+                }
+            }
+            closeFd(to_close);
+            e.reset();
+        }
         char name[32];
         std::snprintf(name, sizeof(name), "/vlog_%08u.log", seg);
         const int fd = ::open((dir_ + name).c_str(), O_RDONLY);
         if (fd < 0) {
-            if (errno == ENOENT) return Lease();
-            fatal("open failed for vLog segment " + std::to_string(seg));
+            if (errno != ENOENT) fatal("open failed for vLog segment " + std::to_string(seg));
+            std::lock_guard<std::mutex> lk(mu_);
+            misses_++;
+            return Lease();
         }
-        auto e = std::make_shared<Entry>();
-        e->seg = seg;
-        e->fd = fd;
-        e->refs = 1;
-        lru_.push_front(seg);
-        e->lru_it = lru_.begin();
-        map_[seg] = e;
-        // Evict least recently used descriptors no lease holds.
-        // lit marks the first entry already passed over; dropping the one before it leaves lit
-        // valid (std::list iterators survive erasing other elements).
-        for (auto lit = lru_.end(); map_.size() > cap_ && lit != lru_.begin();) {
-            auto cur = std::prev(lit);
-            auto mit = map_.find(*cur);
-            if (mit->second->refs != 0) {
-                lit = cur;
-                continue;
+        std::vector<int> to_close;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            misses_++;
+            auto it = map_.find(seg);
+            if (it != map_.end()) {
+                // Another thread opened it meanwhile: use that descriptor, close ours.
+                e = it->second;
+                e->refs++;
+                lru_.erase(e->lru_it);
+                lru_.push_front(seg);
+                e->lru_it = lru_.begin();
+                to_close.push_back(fd);
+            } else {
+                e = std::make_shared<Entry>();
+                e->seg = seg;
+                e->fd = fd;
+                e->refs = 1;
+                lru_.push_front(seg);
+                e->lru_it = lru_.begin();
+                map_[seg] = e;
+                // Evict least recently used descriptors no lease holds.
+                // lit marks the first entry already passed over; dropping the one before it
+                // leaves lit valid (std::list iterators survive erasing other elements).
+                for (auto lit = lru_.end(); map_.size() > cap_ && lit != lru_.begin();) {
+                    auto cur = std::prev(lit);
+                    auto mit = map_.find(*cur);
+                    if (mit->second->refs != 0) {
+                        lit = cur;
+                        continue;
+                    }
+                    to_close.push_back(dropLocked(mit));
+                }
             }
-            dropLocked(mit);
         }
+        for (int f : to_close) closeFd(f);
         return Lease(this, e);
     }
 
     // Before a segment is unlinked.
     void invalidate(uint32_t seg) {
-        std::lock_guard<std::mutex> lk(mu_);
-        auto it = map_.find(seg);
-        if (it != map_.end()) dropLocked(it);
+        int to_close = -1;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto it = map_.find(seg);
+            if (it != map_.end()) to_close = dropLocked(it);
+        }
+        closeFd(to_close);
     }
 
     bool contains(uint32_t seg) const {
@@ -153,25 +202,32 @@ public:
 private:
     using Map = std::unordered_map<uint32_t, std::shared_ptr<Entry>>;
 
-    // Removes the entry from the map and LRU; closes it now if no lease holds it.
-    void dropLocked(Map::iterator it) {
+    // Removes the entry from the map and LRU. Returns its descriptor if no lease holds it (the
+    // caller closes it after releasing the mutex), else -1 (the last lease closes it).
+    int dropLocked(Map::iterator it) {
         std::shared_ptr<Entry> e = it->second;
         lru_.erase(e->lru_it);
         map_.erase(it);
         e->dead = true;
-        if (e->refs == 0) {
-            closeFd(e->fd);
-            e->fd = -1;
-        }
+        if (e->refs != 0) return -1;
+        const int fd = e->fd;
+        e->fd = -1;
+        return fd;
     }
 
     void unref(const std::shared_ptr<Entry>& e) {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (e->refs == 0) fatal("SegmentFdCache: release without a lease");
-        if (--e->refs == 0 && e->dead) {
-            closeFd(e->fd);
-            e->fd = -1;
+        int to_close = -1;
+        {
+            SCAN_PROF_T0(prof_lock);
+            std::lock_guard<std::mutex> lk(mu_);
+            SCAN_PROF_ADD_NS(lock_fdcache_ns, prof_lock);
+            if (e->refs == 0) fatal("SegmentFdCache: release without a lease");
+            if (--e->refs == 0 && e->dead) {
+                to_close = e->fd;
+                e->fd = -1;
+            }
         }
+        closeFd(to_close);
     }
 
     static void closeFd(int fd) {

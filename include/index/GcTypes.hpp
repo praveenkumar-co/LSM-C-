@@ -4,6 +4,7 @@
 // (docs/PHASE5_PLAN.md sections 1, 2, 4).
 
 #include "index/IndexCommon.hpp"
+#include "vlog/ScanProfile.hpp"
 
 #include <array>
 #include <cstdint>
@@ -126,10 +127,14 @@ public:
 
     Pin pin() {
         const size_t sh = std::hash<std::thread::id>{}(std::this_thread::get_id()) % kShards;
+        SCAN_PROF_T0(prof_lock);
         std::lock_guard<std::mutex> lk(shards_[sh].mu);
+        SCAN_PROF_ADD_NS(lock_registry_ns, prof_lock);
         uint64_t e;
         {
+            SCAN_PROF_T0(prof_lock2);
             std::lock_guard<std::mutex> el(epoch_mu_);
+            SCAN_PROF_ADD_NS(lock_registry_ns, prof_lock2);
             e = epoch_;
         }
         shards_[sh].pins[e]++; // recorded before the shard lock is released
@@ -137,7 +142,9 @@ public:
     }
 
     void unpin(const Pin& p) {
+        SCAN_PROF_T0(prof_lock);
         std::lock_guard<std::mutex> lk(shards_[p.shard].mu);
+        SCAN_PROF_ADD_NS(lock_registry_ns, prof_lock);
         auto it = shards_[p.shard].pins.find(p.epoch);
         if (it == shards_[p.shard].pins.end()) {
             errno = 0;
