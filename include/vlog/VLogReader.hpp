@@ -48,7 +48,8 @@ public:
     explicit VLogReader(const std::string& dir_path) : dir_path_(dir_path) {}
 
     // Reads the entry at vptr. False if the segment is missing, the bounds or length do not match,
-    // or the CRC fails. Never returns unchecked bytes.
+    // the CRC fails, or the key or payload does not fit inside the entry. Never returns unchecked
+    // bytes.
     bool readEntry(const VPtr& vptr, EntryHeader& out_hdr, std::string& out_key,
                    std::vector<uint8_t>& out_payload) {
         int fd = open(getSegmentPath(vptr.segment_id).c_str(), O_RDONLY);
@@ -71,17 +72,27 @@ public:
         const bool full = pread(fd, entry_buf.data(), hdr.total_len, vptr.offset) ==
                           static_cast<ssize_t>(hdr.total_len);
         (void)close(fd);
-        if (!full || crc32c(entry_buf.data() + 4, hdr.total_len - 4) != hdr.crc32c) return false;
+        if (!full || crc32c(entry_buf.data() + 4, hdr.total_len - 4) != hdr.crc32c ||
+            !lengthsFit(hdr))
+            return false;
         out_hdr = hdr;
         extractKeyAndPayload(hdr, entry_buf, &out_key, &out_payload);
         return true;
     }
 
+    // True if the key and the payload lie inside the entry: 32 + align8(key_len) + payload_len <=
+    // total_len. Every entry the writer produces passes (its total_len is exactly
+    // 32 + align8(key_len) + align8(payload_len)); one with a valid CRC that fails is corruption.
+    static bool lengthsFit(const EntryHeader& hdr) {
+        return static_cast<uint64_t>(payload_offset(hdr.key_len)) + hdr.payload_len <=
+               hdr.total_len;
+    }
+
     // Reads the entry at vptr from an open descriptor of its segment with a single pread of
-    // vptr.length bytes, then the same checks as readEntry (header bounds, length, CRC) plus one:
-    // the key must lie inside the entry (a CRC-valid entry with a larger key_len would otherwise
-    // make the key copy read past the buffer). A short read (the entry would end past the end of
-    // the file) fails.
+    // vptr.length bytes, then the same checks as readEntry (header bounds, length, CRC, key and
+    // payload inside the entry: a CRC-valid entry with a larger key_len would otherwise make the
+    // key copy read past the buffer). A short read (the entry would end past the end of the file)
+    // fails.
     static bool readEntryAt(int fd, const VPtr& vptr, EntryHeader& out_hdr, std::string& out_key,
                             std::vector<uint8_t>& out_payload) {
         if (vptr.length < sizeof(EntryHeader) || vptr.length > kMaxEntryLen) return false;
@@ -97,8 +108,7 @@ public:
         EntryHeader hdr;
         std::memcpy(&hdr, buf.data(), sizeof(hdr));
         if (!validateHeaderBounds(hdr, vptr.offset, uint64_t(vptr.offset) + vptr.length) ||
-            hdr.total_len != vptr.length ||
-            sizeof(EntryHeader) + static_cast<uint64_t>(hdr.key_len) > hdr.total_len)
+            hdr.total_len != vptr.length || !lengthsFit(hdr))
             return false;
         SCAN_PROF_T0(prof_crc);
         const uint32_t prof_crc_value = crc32c(buf.data() + 4, hdr.total_len - 4);
@@ -111,8 +121,7 @@ public:
         EntryHeader hdr;
         std::memcpy(&hdr, buf.data(), sizeof(hdr));
         if (!validateHeaderBounds(hdr, vptr.offset, uint64_t(vptr.offset) + vptr.length) ||
-            hdr.total_len != vptr.length ||
-            sizeof(EntryHeader) + static_cast<uint64_t>(hdr.key_len) > hdr.total_len ||
+            hdr.total_len != vptr.length || !lengthsFit(hdr) ||
             crc32c(buf.data() + 4, hdr.total_len - 4) != hdr.crc32c)
             return false;
 #endif
@@ -123,16 +132,15 @@ public:
 
     // Checks one entry that a batched read placed at p (vptr.length bytes, already read from
     // vptr.offset of its segment): the same checks readEntryAt makes after its pread (length,
-    // header bounds, total_len == vptr.length, CRC). The key must also lie inside the entry.
-    // Never returns unchecked bytes.
+    // header bounds, total_len == vptr.length, key and payload inside the entry, CRC). Never
+    // returns unchecked bytes.
     static bool checkEntryInBuffer(const uint8_t* p, const VPtr& vptr, EntryHeader& out_hdr,
                                    std::string& out_key, std::vector<uint8_t>& out_payload) {
         if (vptr.length < sizeof(EntryHeader) || vptr.length > kMaxEntryLen) return false;
         EntryHeader hdr;
         std::memcpy(&hdr, p, sizeof(hdr));
         if (!validateHeaderBounds(hdr, vptr.offset, uint64_t(vptr.offset) + vptr.length) ||
-            hdr.total_len != vptr.length ||
-            sizeof(EntryHeader) + static_cast<uint64_t>(hdr.key_len) > hdr.total_len)
+            hdr.total_len != vptr.length || !lengthsFit(hdr))
             return false;
 #if defined(SCAN_PROFILE)
         SCAN_PROF_T0(prof_crc);
@@ -147,8 +155,7 @@ public:
         out_key.assign(reinterpret_cast<const char*>(p + sizeof(EntryHeader)), hdr.key_len);
         out_payload.clear();
         const uint32_t p_off = payload_offset(hdr.key_len);
-        if (hdr.payload_len > 0 && p_off + uint64_t(hdr.payload_len) <= hdr.total_len)
-            out_payload.assign(p + p_off, p + p_off + hdr.payload_len);
+        if (hdr.payload_len > 0) out_payload.assign(p + p_off, p + p_off + hdr.payload_len);
         return true;
     }
 
@@ -157,6 +164,8 @@ public:
     //    The same damage in a non-last segment throws (acked data would be lost).
     //  - A bad CRC or impossible bounds with a valid entry somewhere after it is mid-log
     //    corruption, not a torn tail: it throws instead of truncating valid entries.
+    //  - An entry with a valid CRC whose key or payload does not fit inside total_len throws in
+    //    every segment, the last one included (corruption: a torn write cannot pass the CRC).
     //  - Last segment with a short or corrupt segment header (torn creation): truncated to 0.
     ScanResult scanSegment(uint32_t segment_id, bool is_last_segment = true,
                            uint32_t start_offset = kBlockSize) {
@@ -236,6 +245,16 @@ public:
                 }
                 tornOrFatal(offset, "Corrupted CRC");
                 break;
+            }
+            // A valid CRC means the bytes are what was written: lengths that do not fit are
+            // corruption (never a torn tail), fatal in every segment, nothing truncated.
+            if (!lengthsFit(hdr)) {
+                (void)close(fd);
+                throw std::runtime_error(
+                    "Fatal: corrupt entry at segment " + seg + " offset " + std::to_string(offset) +
+                    ": valid CRC, but key_len " + std::to_string(hdr.key_len) + " and payload_len " +
+                    std::to_string(hdr.payload_len) + " do not fit inside total_len " +
+                    std::to_string(hdr.total_len));
             }
             RecoveredEntry rec;
             rec.vptr = VPtr{segment_id, static_cast<uint32_t>(offset), hdr.total_len};

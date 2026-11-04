@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <random>
@@ -770,6 +771,126 @@ static void case9IoFailure(const std::string& base) {
     }
 }
 
+// ------------------------------------------------------------------------------------------
+// E10: an entry with a valid CRC whose key or payload does not fit inside total_len
+// ------------------------------------------------------------------------------------------
+// Every file under dir: relative path -> bytes.
+static std::map<std::string, std::string> snapshotFiles(const std::string& dir) {
+    std::map<std::string, std::string> files;
+    for (const auto& e : std::filesystem::recursive_directory_iterator(dir)) {
+        if (!e.is_regular_file()) continue;
+        std::ifstream in(e.path(), std::ios::binary);
+        CHECK(in.good());
+        files[std::filesystem::relative(e.path(), dir).string()] =
+            std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    return files;
+}
+
+// Rewrites the entry at p in place with one header field changed and the CRC recomputed, so the
+// CRC check passes.
+static void craftEntry(const std::string& vdir, const vlog::VPtr& p,
+                       const std::function<void(vlog::EntryHeader&)>& mutate) {
+    const int fd = open(segPath(vdir, p.segment_id).c_str(), O_RDWR);
+    CHECK(fd >= 0);
+    std::vector<uint8_t> e(p.length);
+    CHECK(pread(fd, e.data(), e.size(), p.offset) == static_cast<ssize_t>(e.size()));
+    vlog::EntryHeader h;
+    std::memcpy(&h, e.data(), sizeof(h));
+    CHECK(h.total_len == p.length);
+    mutate(h);
+    std::memcpy(e.data(), &h, sizeof(h));
+    const uint32_t crc = vlog::crc32c(e.data() + 4, e.size() - 4);
+    std::memcpy(e.data(), &crc, sizeof(crc));
+    CHECK(pwrite(fd, e.data(), e.size(), p.offset) == static_cast<ssize_t>(e.size()));
+    accountBytes(e.size(), "test pwrite (crafted entry)");
+    CHECK(vlog::full_fsync(fd) == 0);
+    CHECK(close(fd) == 0);
+}
+
+// 24 documents of ~2 KB in 16 KiB segments (5 per segment after the 4 KiB header), never
+// checkpointed: an open scans every segment. Returns each key's VPtr.
+static std::map<std::string, vlog::VPtr> writeE10Store(const std::string& dir) {
+    IndexedStore::Options o = storeOpts();
+    o.vlog_opts = vlog::VLogWriter::Options(
+        16 * 1024, std::min<uint64_t>(64ULL * 1024 * 1024, remainingBudget()));
+    o.auto_checkpoint = false;
+    auto st = IndexedStore::open(dir, o);
+    std::map<std::string, vlog::VPtr> at;
+    for (int i = 0; i < 24; ++i) {
+        const std::string k = "k" + std::to_string(100 + i);
+        st->put(k, "{\"i\":" + std::to_string(i) + ",\"p\":\"" + std::string(2000, 'a' + i % 26) +
+                       "\"}");
+        at[k] = st->tree().get(k)->vptr;
+    }
+    finishStore(st, /*clean=*/false); // no close(): no checkpoint, the next open scans it all
+    return at;
+}
+
+// open() must fail with recovery's fatal error naming the entry's segment and offset, and must
+// leave every file exactly as it was. readEntry() must refuse the entry too.
+static void expectFatalOpen(const std::string& dir, const vlog::VPtr& p, const char* what) {
+    const auto before = snapshotFiles(dir);
+    std::string msg;
+    try {
+        auto st = IndexedStore::open(dir, storeOpts());
+        finishStore(st, true);
+    } catch (const std::runtime_error& e) {
+        msg = e.what();
+    }
+    detail() << what << ": " << msg << "\n";
+    const std::string where =
+        "segment " + std::to_string(p.segment_id) + " offset " + std::to_string(p.offset);
+    if (msg.find("Fatal: corrupt entry at " + where) != 0)
+        std::cerr << what << ": open gave \"" << msg << "\", expected the entry at " << where
+                  << "\n";
+    CHECK(msg.find("Fatal: corrupt entry at " + where) == 0);
+    CHECK(msg.find("do not fit inside total_len") != std::string::npos);
+    CHECK(snapshotFiles(dir) == before); // nothing truncated, created or changed
+    vlog::VLogReader reader(dir + "/vlog");
+    vlog::EntryHeader h;
+    std::string k;
+    std::vector<uint8_t> pl;
+    CHECK(!reader.readEntry(p, h, k, pl));
+}
+
+static void case10LengthsDoNotFit(const std::string& dir) {
+    std::filesystem::create_directories(dir);
+    // (a) key_len too large, mid-log: valid entries follow in the same segment and later ones.
+    {
+        const std::string d = dir + "/a";
+        auto at = writeE10Store(d);
+        const vlog::VPtr p = at["k106"];
+        const vlog::VPtr next = at["k107"]; // a valid entry right after it, same segment
+        CHECK(next.segment_id == p.segment_id && next.offset == p.offset + p.length);
+        CHECK(p.offset > vlog::kBlockSize); // and one before it
+        CHECK(p.segment_id < at["k123"].segment_id);
+        craftEntry(d + "/vlog", p, [](vlog::EntryHeader& h) { h.key_len = h.total_len; });
+        expectFatalOpen(d, p, "E10a key_len mid-log");
+    }
+    // (b) key_len too large in the last entry of the last segment (where a torn tail would be
+    // truncated): still fatal, nothing truncated.
+    {
+        const std::string d = dir + "/b";
+        auto at = writeE10Store(d);
+        const vlog::VPtr p = at["k123"];
+        const std::vector<uint32_t> segs = bpt::listVLogSegments(d + "/vlog");
+        CHECK(!segs.empty() && p.segment_id == segs.back());
+        CHECK(p.offset + p.length == fileSize(segPath(d + "/vlog", p.segment_id)));
+        craftEntry(d + "/vlog", p, [](vlog::EntryHeader& h) { h.key_len = h.total_len; });
+        expectFatalOpen(d, p, "E10b key_len last entry of the last segment");
+    }
+    // (c) payload_len too large (the key fits), mid-log.
+    {
+        const std::string d = dir + "/c";
+        auto at = writeE10Store(d);
+        const vlog::VPtr p = at["k111"];
+        CHECK(at["k112"].segment_id == p.segment_id); // valid entries follow in its segment
+        craftEntry(d + "/vlog", p, [](vlog::EntryHeader& h) { h.payload_len = h.total_len; });
+        expectFatalOpen(d, p, "E10c payload_len mid-log");
+    }
+}
+
 int main() {
     std::string dir = setupRun("edge_test");
     Cleaner cleaner{dir};
@@ -791,6 +912,10 @@ int main() {
             [&] { case8Height4(dir + "/c8"); });
     runCase("E9 index.db pwrite/fsync failure aborts; reopen loses no acked write",
             [&] { case9IoFailure(dir + "/c9"); });
+    runCase("E10 CRC-valid entry whose key or payload does not fit: open fails with a fatal error "
+            "naming segment and offset (mid-log and last entry of the last segment); no file "
+            "changed",
+            [&] { case10LengthsDoNotFit(dir + "/c10"); });
 
     printBudget();
     int failed = 0;
