@@ -7,6 +7,7 @@
 #   make bench-stress  100,000-key, 16-thread stress benchmark with GC and 50 kill -9 crashes
 #   make bench-compare IndexedStore vs SQLite vs legacy MongoLite (links -lsqlite3)
 #   make bench-scan  range scans of 100 keys, 1 and 4 threads (normal build + -DSCAN_PROFILE build)
+#   make bench-reality  builds bench_reality and bench_crash (macOS only; run via scripts/reality/run_safe.sh)
 #   make clean
 #
 # Each test binary prints one "[PASS] ..." line per test (TEST_VERBOSE=1 adds measurements) and
@@ -35,7 +36,7 @@ LIMIT_asan  := 536870912
 LIMIT_tsan  := 536870912
 LIMIT_quick := 33554432
 
-.PHONY: test asan tsan quick test-quick bench bench-stress bench-compare bench-scan clean check-deps
+.PHONY: test asan tsan quick test-quick bench bench-stress bench-compare bench-scan bench-reality clean check-deps
 
 # vlog/ and doc/ are bottom layers: vlog/ must not depend on index/, doc/ or legacy/, and doc/
 # (JSON and update ops) must not depend on vlog/, index/ or legacy/.
@@ -116,6 +117,27 @@ build/bench/bench_scan_profile: bench/bench_scan.cpp $(HEADERS) Makefile
 bench-scan: check-deps build/bench/bench_scan build/bench/bench_scan_profile
 	$(KEEP_AWAKE) ./build/bench/bench_scan
 	$(KEEP_AWAKE) ./build/bench/bench_scan_profile
+
+# Reality-check tools (Phase 7): build only, macOS only. They use macOS APIs (libproc's
+# proc_pid_rusage, mach task_info) and the scripts use pmset/hdiutil/caffeinate, so on any other
+# OS bench-reality prints a message and builds nothing. No test or CI target depends on it.
+# Runs go through scripts/reality/run_safe.sh (AC power, free disk, swap, thermal, run time and
+# a total write budget) with an explicit write cap.
+UNAME_S ?= $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+build/bench/bench_reality: bench/bench_reality.cpp bench/reality_common.hpp $(HEADERS) Makefile
+	@mkdir -p build/bench
+	$(CXX) $(CXXSTD) $(WARN) -O2 $(INCLUDES) $(LDFLAGS) $< -o $@
+
+build/bench/bench_crash: bench/bench_crash.cpp bench/reality_common.hpp $(HEADERS) Makefile
+	@mkdir -p build/bench
+	$(CXX) $(CXXSTD) $(WARN) -O2 $(INCLUDES) $(LDFLAGS) $< -o $@
+
+bench-reality: check-deps build/bench/bench_reality build/bench/bench_crash
+else
+bench-reality:
+	@echo "bench-reality: skipped on $(UNAME_S) (macOS only: uses libproc/mach APIs); nothing built"
+endif
 
 clean:
 	rm -rf build

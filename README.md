@@ -85,6 +85,7 @@ make clean
 - `include/doc/`: JSON parser and serializer, `$set` / `$unset` / `$inc` update operators.
 - `tests/`: test binaries, built and run by the Makefile.
 - `bench/`: benchmarks (`make bench`, `bench-stress`, `bench-compare`).
+- `scripts/reality/`: reality-check runs under machine-safety limits (macOS only; `make bench-reality`).
 - `legacy/`: the earlier MongoLite engine, used only by the comparison benchmark.
 
 ## Known limitations
@@ -96,6 +97,13 @@ make clean
 - Single-threaded writes are slower than SQLite (257 vs 340 updates per second, 1 KB).
 - Writes to one key are serialized, so one key takes at most about one write per F_FULLFSYNC.
 - `index.db` never shrinks; freed pages are reused.
+- Reopen time grows with the number of keys (one read per key): 15.5 s at 2.5M keys, 53.9 s at 9.1M.
+- Reads slow down sharply once data exceeds the OS page cache: on 9.1M documents, 10,698 gets/s
+  and 165 scans/s (1 thread), vs 341,734 and 6,523 on a warm 25k-document store.
+- A single writer is expensive: 17,046 OS bytes written per 1 KB put (16.5x) at 1 thread, vs 1,685
+  (1.63x) at 64 threads.
+- Large documents use a lot of memory: peak RSS 317 MB while handling 16 MB documents.
+- Disk full aborts the process instead of returning an error; reopen needs free space first.
 
 ---
 
@@ -865,6 +873,55 @@ over many writes when 16 threads write together.
 | MongoLite | 3 | 2,500 | 859 of 2,500 | 16 | yes |
 
 
+### Reality check (macOS, Apple M5)
+
+Tests under real conditions on a MacBook Air M5 (16 GB RAM, 512 GB SSD, fanless, macOS 27.0), run
+with `bench/bench_reality.cpp`, `bench/bench_crash.cpp` and `scripts/reality/` (macOS only:
+`make bench-reality`). Every run went through `scripts/reality/run_safe.sh`: AC power only, free disk
+>= 80 GB to start and >= 50 GB during a run, process RSS <= 4 GiB, swap growth <= 1 GB, CPU speed
+limit 100, at most 70 minutes per run, and a 40 GB total write budget measured by the OS
+(`proc_pid_rusage` `ri_diskio_byteswritten`). Disk-full tests ran only inside a 512 MB APFS disk
+image. Total written: 38.94 GB of 40 GB. Every dataset was deleted afterwards.
+
+| Test | Expected | Result | Pass/fail |
+|---|---|---|---|
+| R0 write amplification (1 KB documents) | Measure | 1 thread 16.5x (17,046 OS bytes per put), 16 threads 2.09x (2,160), 64 threads 1.63x (1,685) | Measured |
+| R1 load, 10M x 1 KB, 64 threads | Under the run's 19 GB write cap | Stopped by the cap at 9,095,650 documents (OS bytes per put grew from 1,762 to 2,474) | Partial (sizing, not an engine failure) |
+| R1 recovery after that stop | Every acked document present | 9,095,712 present, 0 holes in any of the 64 threads' key runs, 0 content mismatches; reopen 53.9 s | Pass |
+| R1 gets / batched scans / updates, 1 and 4 threads, 3 runs each (medians) | Work on data larger than the page cache | gets 10,698/s and 41,798/s; scans of 100 keys 165/s and 643/s; updates 250/s and 769/s | Pass |
+| R2 peak RSS at 25k / 250k / 2.5M / 9.1M documents | Report growth | 10.0 / 16.8 / 42.5 / 18.5 MB; grows with keys whose head is a Delta (about 120 bytes each), not with total keys | Pass |
+| R3 soak, 60 min planned (8 writers, 4 readers, GC, checkpoints, kill -9 every 5 min) | Every acked write present, index == full log replay | 7 kills, 524,968 acked writes, all present; stopped by a checker bug (a GC copy left unapplied by a kill was compared as raw bytes); fixed checker re-run on the saved store: OK | Pass after checker fix |
+| R3 soak, 30 min (fixed checker, 100 writes/s) | Same | 6 kills, 179,480 acked writes, 61,880,000 reads, every check OK, child RSS <= 59.6 MB | Pass |
+| R4 vLog fills the volume | Clean stop, acked data safe after space is freed | Commit got ENOSPC and the process aborted; reopen while full aborted with no file changed; after freeing space all 20,366 documents present, index == log, new writes work | Pass |
+| R4 index.db fills the volume (2 attempts) | Same, with an index.db write failing | Recovery correct both times, but index.db never got ENOSPC: the vLog failed first, then a checkpoint of 1,007 pages succeeded on the full volume | Not reproduced |
+| R5 documents of 64 KB, 1 MB, 4 MB, 16,000,000 B and the maximum (16,777,168 B with a 10-byte key) | put, get, update, scan, checkpoint, GC, kill -9 work | All pass; 16,000,000 B: put 44.2 ms, get 36.8 ms, update 75.0 ms; 3 kill -9 rounds during 16 MB puts recovered | Pass |
+| R5 just above the maximum | Clear error, nothing written | put of 16,777,169 B: `std::invalid_argument: document of 16777169 bytes exceeds the 16777168-byte limit`; update growing a maximum document: `doc::RangeError` | Pass |
+
+Weaknesses found:
+
+1. **Single writers are expensive**: 17,046 OS bytes per 1 KB put at 1 thread (16.5x), and 16-21 KB
+   per update; every acked write has its own F_FULLFSYNC unless other writers share the batch.
+2. **Bytes per put grow with store size**: 1,762 to 2,474 over the R1 load. vLog bytes stay at
+   1,072 per put; index.db checkpoint bytes grew 55 to 197 per put (61 to 190 pages per checkpoint)
+   and file-system overhead 434 to 712 per put.
+3. **Random updates on a large store**: 7.5-9.2 KB written per update at 4 threads on 9.1M
+   documents, vs 4.2 KB on a 50k-document store.
+4. **Reads beyond the page cache**: gets 10,698/s vs 341,734/s on a warm 25k store (1 thread);
+   batched scans 165/s vs 6,523/s, reading about 1.3 MB of disk per 100 KB returned, because 64
+   concurrent loaders left neighbouring keys far apart in the log.
+5. **Reopen time grows with the key count** (one head read per key): 15.5 s at 2.5M keys, 53.9 s
+   (10.7 GB read) at 9.1M.
+6. **Memory has no bound for keys whose head is a Delta**: about 120 bytes each (250k such keys:
+   about 30 MB).
+7. **Large documents use a lot of memory**: peak RSS 317 MB while handling 16 MB documents.
+8. **Disk full aborts the process** instead of returning an error; with the vLog full, reopen also
+   aborts until space is freed. APFS refused new appends while reporting about 10-11 MB free.
+9. **index.db running out of space is not tested on real hardware**, only by fault injection.
+10. **A GC pass cut short by a crash leaves an extra copy** of a document (8 keys in R3); it costs
+    space until GC runs again.
+11. **Few kills landed during a write** (10 in the 60-minute soak, 0 in the 30-minute soak), because
+    the writers were idle most of the time at those rates.
+
 ### Known limitations
 
 
@@ -900,6 +957,8 @@ over many writes when 16 threads write together.
 - **Crash tests use kill -9**, not power loss. The Linux `fdatasync` path is covered only by the
   CI runs (quick and asan modes); the measurements above are from macOS.
 - **ThreadSanitizer builds skip the fork + kill -9 tests.**
+- **Reality check weaknesses** (reopen time, reads beyond the page cache, single-writer cost,
+  large-document memory, disk full): see the Reality check section above.
 
 ---
 
